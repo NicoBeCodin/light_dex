@@ -23,7 +23,7 @@ pub struct Node<C: Consensus> {
     pid: u32,
     network: Network,
     state: BlockchainState,
-    consensus_started: bool,
+    // consensus_started: bool,
 
     consensus: C,
 }
@@ -80,7 +80,7 @@ impl<C: Consensus> Node<C> {
             network,
             state,
             consensus,
-            consensus_started: false,
+            // consensus_started: false,
         })
     }
     //After initializeation for communicating with parent
@@ -167,8 +167,9 @@ impl<C: Consensus> Node<C> {
             ConsensusAction::Commit(proposal) => {
                 let node_id = self.node_id;
                 println!("Commited {proposal:?} node {node_id}");
-                self.state.add_block(proposal.get_block());
-
+                self.state.commit_block(&proposal.get_block());
+                self.state
+                    .remove_included_txs_from_mempool(&proposal.get_block());
             }
         }
         Ok(())
@@ -184,11 +185,32 @@ impl<C: Consensus> Node<C> {
         return Ok(());
     }
 
+    fn maybe_propose(&mut self) -> std::io::Result<()> {
+
+        if !self.consensus.can_propose() {
+            return Ok(());
+        }
+
+        let Some(block) = self.state.build_block() else {
+            return Ok(());
+        };
+
+        let actions = self.consensus.on_event(ConsensusEvent::Proposal(block));
+
+        if !actions.is_empty() {
+        }
+
+        self.execute_consensus_actions(&actions)?;
+
+        Ok(())
+    }
+
     pub fn run(&mut self) -> Result<(), std::io::Error> {
         //initial action to start the network
 
         //Start the sender/receiver
         let (node_tx, node_rx) = mpsc::channel::<NodeEvent>();
+        let network_node_tx = node_tx.clone();
         let _ = self.network.start();
         let network_rx = self
             .network
@@ -206,16 +228,18 @@ impl<C: Consensus> Node<C> {
                 NetworkEvent::Message { from, message } => match message {
                     Message::Consensus(consensus_message) => match consensus_message {
                         _ => {
-                            let _ = node_tx.send(NodeEvent::Consensus(ConsensusEvent::Message {
-                                from: from,
-                                message: consensus_message,
-                            }));
+                            let _ = network_node_tx.send(NodeEvent::Consensus(
+                                ConsensusEvent::Message {
+                                    from: from,
+                                    message: consensus_message,
+                                },
+                            ));
                         }
                     },
                     Message::Control(_) => {}
                 },
                 NetworkEvent::IncomingPeer { node_id, stream } => {
-                    let _ = node_tx.send(NodeEvent::Control(ControlEvent::PeerConnected {
+                    let _ = network_node_tx.send(NodeEvent::Control(ControlEvent::PeerConnected {
                         node_id,
                         tcp_stream: stream,
                     }));
@@ -224,7 +248,29 @@ impl<C: Consensus> Node<C> {
             };
         });
 
+        //Start consensus check
         self.maybe_start_consensus()?;
+
+        if self.node_id == 0 {
+            let tx_sender = node_tx.clone();
+            thread::spawn(move || {
+                let mut counter = 0;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    let tx_payload = format!("Dummy tx {counter}");
+                    let transaction = Transaction::new_with(tx_payload);
+
+                    if tx_sender
+                        .send(NodeEvent::NewTransaction(transaction))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    counter += 1;
+                }
+            });
+        }
+
         loop {
             let node_event = node_rx.recv().expect("Node event channel closed");
 
@@ -238,23 +284,27 @@ impl<C: Consensus> Node<C> {
                 NodeEvent::Control(control_event) => {
                     let _ = self.handle_control_event(control_event);
                 }
+                NodeEvent::NewTransaction(tx) => {
+                    self.state.add_transaction(tx);
+                }
+                NodeEvent::Timeout => {}
                 _ => {
                     break;
                 }
             }
             self.maybe_start_consensus()?;
+            self.maybe_propose();
         }
         Ok(())
     }
 
-    pub fn maybe_start_consensus(&mut self)->Result<(), std::io::Error>{
-        
-        if !self.consensus_started && self.network.is_ready() {
+    pub fn maybe_start_consensus(&mut self) -> Result<(), std::io::Error> {
+        if !self.consensus.consensus_started(false) && self.network.is_ready() {
             let actions = self.consensus.on_start();
             self.execute_consensus_actions(&actions)?;
             let node_id = self.node_id;
             println!("READY node {node_id}");
-            self.consensus_started = true;
+            let _ = self.consensus.consensus_started(true);
         }
         Ok(())
     }

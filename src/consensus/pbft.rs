@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    blockchain::{Block, Digest, Proposal},
+    blockchain::{Block, Digest, Proposal, Transaction},
     node::NodeId,
 };
 
@@ -11,10 +11,12 @@ pub trait Consensus {
     fn on_start(&mut self) -> Vec<ConsensusAction>;
     fn on_event(&mut self, node_event: ConsensusEvent) -> Vec<ConsensusAction>;
     fn primary_for_view(&self, view: u64) -> u64;
-    fn quorum_size(&self) -> u64;
     fn prepare_quorum(&self) -> u64;
     fn commit_quorum(&self) -> u64;
     fn f(&self)->u64;
+    fn can_propose(&self)->bool;
+    fn consensus_started(&mut self, turn_on: bool)->bool;
+
     
 }
 
@@ -66,6 +68,9 @@ pub struct Pbft {
     prepares: HashMap<ProposalKey, HashSet<NodeId>>,
     commits: HashMap<ProposalKey, HashSet<NodeId>>,
     committed: HashSet<ProposalKey>,
+
+    active_proposal: Option<ProposalKey>,
+    consensus_started: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -109,6 +114,8 @@ impl Pbft {
             prepares: HashMap::new(),
             commits: HashMap::new(),
             committed: HashSet::new(),
+            active_proposal: None,
+            consensus_started: false,
         }
     }
 
@@ -141,6 +148,7 @@ impl Pbft {
         }
 
         self.proposals.insert(proposal_key.clone(), proposal);
+        // self.active_proposal = Some(proposal_key.clone());
         let message = PbftMessage::Prepare {
             view,
             sequence,
@@ -232,10 +240,13 @@ impl Pbft {
 
             self.committed.insert(key.clone());
             
-            self.last_committed_sequence = Some(self.next_sequence);
-            self.next_sequence +=1;
+            self.last_committed_sequence = Some(key.sequence);
+            self.next_sequence = self.next_sequence.max(key.sequence + 1);
+            
             
             let commit_action = ConsensusAction::Commit(self.proposals.get(key).unwrap().clone());
+            self.active_proposal = None;
+
             
             actions.push(commit_action);
         }
@@ -250,11 +261,12 @@ impl Consensus for Pbft {
     }
     fn on_start(&mut self) -> Vec<ConsensusAction> {
         if self.node_id == 0 {
-            let block = Block::new_initial_block_with(vec!["INITIAL BLOCK".to_string()]);
+            let block = Block::new_initial_block_with(vec![Transaction::new_with("INITIAL BLOCK".to_string())]);
             let proposal = Proposal { block };
             
-            let proposal_key = ProposalKey { view: self.view, sequence: self.next_sequence, digest: proposal.to_digest() };
             
+            let proposal_key = ProposalKey { view: self.view, sequence: self.next_sequence, digest: proposal.to_digest() };
+            self.active_proposal = Some(proposal_key.clone());
             self.proposals.insert(proposal_key, proposal.clone());
             return vec![ConsensusAction::Broadcast(ConsensusMessage::Pbft(
                 PbftMessage::PrePrepare {
@@ -280,6 +292,8 @@ impl Consensus for Pbft {
                         sequence: self.next_sequence,
                         digest: proposal_digest,
                     };
+                    
+                    self.active_proposal = Some(proposal_key.clone());
                     self.proposals.insert(proposal_key, proposal.clone());
 
                     let pbft_message = PbftMessage::PrePrepare {
@@ -321,11 +335,6 @@ impl Consensus for Pbft {
     fn primary_for_view(&self, view: u64) -> u64 {
          view % self.node_count
     }
-    fn quorum_size(&self) -> u64 {
-        let f = (self.node_count - 1) / 3;
-        let quorum = 2 * f + 1;
-        quorum
-    }
 
     fn prepare_quorum(&self) -> u64 {
         2 * self.f()
@@ -335,5 +344,20 @@ impl Consensus for Pbft {
     }
     fn f(&self)->u64{
         (self.node_count - 1) / 3
+    }
+
+    fn can_propose(&self)->bool {
+        self.node_id == self.primary_for_view(self.view) && self.active_proposal.is_none()
+    }
+
+    fn consensus_started(&mut self, turn_on: bool)->bool{
+
+        if turn_on {
+            self.consensus_started =true;
+        }
+        return self.consensus_started
+        
+        
+        
     }
 }

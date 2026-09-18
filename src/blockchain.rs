@@ -1,3 +1,5 @@
+use std::arch::naked_asm;
+
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest as ShaDigest;
@@ -7,15 +9,43 @@ pub type Digest = [u8; 32];
 #[derive(Debug)]
 pub struct BlockchainState {
     pub blocks: Vec<Block>,
-    pub mempool: Vec<Transaction>
+    pub mempool: Vec<Transaction>,
 }
 
 impl BlockchainState {
     pub fn new() -> Self {
-        BlockchainState { blocks: Vec::new(), mempool: Vec::new() }
+        BlockchainState {
+            blocks: Vec::new(),
+            mempool: Vec::new(),
+        }
     }
-    pub fn add_block(&mut self, block: Block) {
-        self.blocks.push(block)
+    pub fn commit_block(&mut self, block: &Block) {
+        self.blocks.push(block.clone())
+    }
+    pub fn remove_included_txs_from_mempool(&mut self, committed_block: &Block) {
+        self.mempool = self
+            .mempool
+            .drain(..)
+            .filter(|tx| !committed_block.transactions.contains(tx))
+            .collect();
+    }
+    pub fn add_transaction(&mut self, tx: Transaction){
+        self.mempool.push(tx);
+    }
+    pub fn build_block(&self)->Option<Block>{
+        if self.mempool.is_empty() {
+            return None
+        }
+        let previous_block = self.blocks.last()?;
+        
+        let block = Block {
+            transactions: self.mempool.clone(),
+            sequence: previous_block.sequence +1,
+            previous_hash: previous_block.to_digest()
+        };
+        
+        Some(block)
+        
     }
 }
 
@@ -23,10 +53,8 @@ impl BlockchainState {
 pub struct Block {
     pub sequence: u64,
     pub previous_hash: Digest,
-    pub transactions: Vec<String>,
+    pub transactions: Vec<Transaction>,
 }
-
-
 
 impl Block {
     pub fn new() -> Block {
@@ -36,11 +64,23 @@ impl Block {
             previous_hash: Digest::default(),
         }
     }
-    pub fn new_initial_block_with(txs: Vec<String>) -> Block {
+    pub fn new_initial_block_with(txs: Vec<Transaction>) -> Block {
         let mut block = Block::new();
         block.transactions = txs;
         block
     }
+
+        pub fn to_digest(&self) -> Digest {
+        let mut hasher = Sha256::new();
+        hasher.update(&self.sequence.to_le_bytes());
+        hasher.update(&self.previous_hash);
+        for tx in &self.transactions {
+            hasher.update(tx.payload.as_bytes());
+        }
+        hasher.finalize().into()
+    }
+
+
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -50,19 +90,26 @@ pub struct Proposal {
 
 impl Proposal {
     pub fn to_digest(&self) -> Digest {
-        let mut hasher = Sha256::new();
-        for tx in &self.block.transactions {
-            hasher.update(tx.as_bytes());
-        }
-        hasher.finalize().into()
+        self.block.to_digest()
     }
 
-    pub fn get_block(&self)->Block {
+    pub fn get_block(&self) -> Block {
         self.block.clone()
     }
- }
+}
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Transaction {
     payload: String,
+}
+
+impl Transaction {
+    pub fn new() -> Transaction {
+        return Transaction {
+            payload: String::new(),
+        };
+    }
+    pub fn new_with(payload: String) -> Transaction {
+        Transaction { payload }
+    }
 }
