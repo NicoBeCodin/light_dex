@@ -1,20 +1,34 @@
 use node::Node;
+use rand::Rng;
 use std::collections::HashMap;
-use std::env;
+use std::time::Duration;
+use std::{env, thread};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::*;
 
-use crate::blockchain::BlockchainState;
+use crate::blockchain::{BlockchainState, Transaction};
 use crate::consensus::pbft::Pbft;
+use crate::message::Message;
 use crate::network::Network;
-use crate::node::NodeId;
+use crate::node::{ControlMessage, NodeId};
 
 pub mod blockchain;
 pub mod consensus;
 pub mod message;
 pub mod network;
 pub mod node;
+
+fn send_message_to_node(addr: SocketAddr, message: Message) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect(addr)?;
+
+    let mut serialized = message.to_str()?;
+    serialized.push('\n');
+
+    stream.write_all(serialized.as_bytes())?;
+
+    Ok(())
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -114,6 +128,95 @@ fn main() {
 
     for mut stream in ready_streams {
         stream.write_all(b"START\n").unwrap();
+    }
+
+    let mut rng = rand::rng();
+
+    let mut transaction_counter = 0u64;
+
+    let mut alive = vec![true; children.len()];
+
+    let max_faults = children.len().saturating_sub(1) / 3;
+
+    let mut killed = 0usize;
+
+    loop {
+        thread::sleep(Duration::from_millis(250));
+
+        let alive_nodes: Vec<usize> = alive
+            .iter()
+            .enumerate()
+            .filter_map(
+                |(index, is_alive)| {
+                    if *is_alive {
+                        Some(index)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .collect();
+
+        if alive_nodes.is_empty() {
+            break;
+        }
+
+        // ----------------------
+        // Send random transaction
+        // ----------------------
+
+        let target_index = rng.random_range(0..alive_nodes.len());
+
+        let target_node = alive_nodes[target_index];
+
+        let transaction = Transaction::new_with(format!(
+            "TX {} sent to node {}",
+            transaction_counter, target_node
+        ));
+
+        transaction_counter += 1;
+
+        if let Some(addr) = nodes.get(&(target_node as u32)) {
+            let _ = send_message_to_node(*addr, Message::Transaction(transaction));
+        }
+
+        // ----------------------
+        // Occasionally fault node
+        // ----------------------
+
+        if transaction_counter % 30 == 0 {
+            let victim_index = rng.random_range(0..alive_nodes.len());
+
+            let victim = alive_nodes[victim_index];
+
+            if rng.random_bool(0.8) {
+                // Temporary pause.
+
+                println!("SIMULATION: pausing node {}", victim);
+
+                if let Some(addr) = nodes.get(&(victim as u32)) {
+                    let _ = send_message_to_node(
+                        *addr,
+                        Message::Control(ControlMessage::Pause { millis: 5000 }),
+                    );
+                }
+            } else if killed < max_faults {
+                // Permanent crash.
+
+                println!("SIMULATION: killing node {}", victim);
+
+                match children[victim].kill() {
+                    Ok(_) => {
+                        alive[victim] = false;
+                        killed += 1;
+                    }
+
+                    Err(error) => {
+                        eprintln!("Couldn't kill node {}: {}", victim, error);
+                    }
+                }
+            }
+        }
     }
 
     for child in &mut children {

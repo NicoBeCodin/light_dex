@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::{
+    blockchain::Transaction,
     message::Message,
     node::{ControlMessage, NodeId},
 };
@@ -27,8 +28,9 @@ pub struct Network {
 pub enum NetworkEvent {
     Message { from: NodeId, message: Message },
     PeerConnected { node_id: NodeId },
-
     IncomingPeer { node_id: NodeId, stream: TcpStream },
+    ClientTransaction(Transaction),
+    ClientControl(ControlMessage),
 }
 
 pub fn spawn_reader(peer_id: NodeId, mut reader: BufReader<TcpStream>, tx: Sender<NetworkEvent>) {
@@ -46,6 +48,43 @@ pub fn spawn_reader(peer_id: NodeId, mut reader: BufReader<TcpStream>, tx: Sende
             from: peer_id,
         };
         let _ = tx.send(network_event);
+    }
+}
+
+pub fn spawn_transaction_reader(mut reader: BufReader<TcpStream>, tx: Sender<NetworkEvent>) {
+    loop {
+        let mut buffer = String::new();
+
+        let n = match reader.read_line(&mut buffer) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+
+        if n == 0 {
+            break;
+        }
+
+        let message = match Message::from_str(buffer) {
+            Ok(message) => message,
+            Err(_) => continue,
+        };
+
+        match message {
+            Message::Transaction(transaction) => {
+                if tx
+                    .send(NetworkEvent::ClientTransaction(transaction))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Message::Control(control_message) => {
+                tx.send(NetworkEvent::ClientControl(control_message));
+            }
+            _ => {
+                // Client connections are only expected to send transactions.
+            }
+        }
     }
 }
 impl Network {
@@ -99,40 +138,73 @@ impl Network {
                 });
             }
         }
-
         let listener = self.listener.try_clone()?;
-        let event_tx_clone = self.event_tx.clone();
+        let event_tx = self.event_tx.clone();
 
         thread::spawn(move || loop {
-            let (stream, _) = listener.accept().expect("Failed listening");
-            let write_stream = stream.try_clone().expect("failed cloning stream");
+            let (stream, _) = match listener.accept() {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+
+            let write_stream = match stream.try_clone() {
+                Ok(stream) => stream,
+                Err(_) => continue,
+            };
+
             let mut reader = BufReader::new(stream);
+
             let mut buffer = String::new();
-            let n = reader
-                .read_line(&mut buffer)
-                .expect("Failed reading buffer");
+
+            let n = match reader.read_line(&mut buffer) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
             if n == 0 {
                 continue;
             }
-            let msg = Message::from_str(buffer).expect("Failed reading message");
-            let node_id = match msg {
-                Message::Control(ControlMessage::Hello { node_id }) => node_id,
 
-                _ => {
-                    // invalid first message
-                    continue;
-                }
+            let message = match Message::from_str(buffer) {
+                Ok(message) => message,
+                Err(_) => continue,
             };
-            let _ = event_tx_clone.send(NetworkEvent::IncomingPeer {
-                node_id,
-                stream: write_stream,
-            });
-            let tx_clone = event_tx_clone.clone();
-            thread::spawn(move || {
-                spawn_reader(node_id, reader, tx_clone);
-            });
-        });
 
+            match message {
+                Message::Control(ControlMessage::Hello { node_id }) => {
+                    let _ = event_tx.send(NetworkEvent::IncomingPeer {
+                        node_id,
+                        stream: write_stream,
+                    });
+
+                    let tx = event_tx.clone();
+
+                    thread::spawn(move || {
+                        spawn_reader(node_id, reader, tx);
+                    });
+                }
+
+                Message::Transaction(transaction) => {
+                    // The first transaction was already consumed above.
+                    let _ = event_tx.send(NetworkEvent::ClientTransaction(transaction));
+
+                    // Keep reading more transactions from this same connection.
+                    let tx = event_tx.clone();
+
+                    thread::spawn(move || {
+                        spawn_transaction_reader(reader, tx);
+                    });
+                }
+                Message::Control(control_message) => {
+                    let _ = event_tx.send(NetworkEvent::ClientControl(control_message));
+                }
+
+                Message::Consensus(_) => {
+                    // Invalid: consensus traffic must arrive over an
+                    // established peer connection.
+                }
+            }
+        });
         Ok(())
     }
 

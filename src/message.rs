@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{blockchain::Block, consensus::pbft::ConsensusMessage, node::ControlMessage};
+use crate::{blockchain::{Block, Transaction}, consensus::pbft::ConsensusMessage, node::ControlMessage};
 
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Message {
     Consensus(ConsensusMessage),
     Control(ControlMessage),
+    Transaction(Transaction),
+    
 
 }
 

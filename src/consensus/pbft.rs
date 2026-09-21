@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use crate::{
     blockchain::{Block, Digest, Proposal, Transaction},
@@ -13,19 +16,21 @@ pub trait Consensus {
     fn primary_for_view(&self, view: u64) -> u64;
     fn prepare_quorum(&self) -> u64;
     fn commit_quorum(&self) -> u64;
-    fn f(&self)->u64;
-    fn can_propose(&self)->bool;
-    fn consensus_started(&mut self, turn_on: bool)->bool;
-
-    
+    fn f(&self) -> u64;
+    fn can_propose(&self) -> bool;
+    fn consensus_started(&mut self, turn_on: bool) -> bool;
+    fn current_primary(&self) -> NodeId;
+    fn set_timeout(&mut self, timeout: u64);
+    fn get_timeout(&self) -> u64;
 }
+
+const TIMEOUT: u64 = 1000;
 
 //for future implemenations
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub enum ConsensusMessage {
     Pbft(PbftMessage),
 }
-
 
 impl ConsensusMessage {
     pub fn to_vec(&self) -> Result<Vec<u8>, std::io::Error> {
@@ -44,6 +49,12 @@ pub enum ConsensusAction {
         message: ConsensusMessage,
     },
     Commit(Proposal),
+
+    ScheduleTimeout {
+        view: u64,
+        sequence: u64,
+        duration: Duration,
+    },
 }
 
 pub enum ConsensusEvent {
@@ -51,7 +62,10 @@ pub enum ConsensusEvent {
         from: NodeId,
         message: ConsensusMessage,
     },
-    Timeout,
+    Timeout {
+        view: u64,
+        sequence: u64,
+    },
     Proposal(Block),
 }
 
@@ -60,7 +74,7 @@ pub struct Pbft {
     view: u64,
     next_sequence: u64,
     last_committed_sequence: Option<u64>,
-    
+
     node_id: NodeId,
     node_count: u64,
 
@@ -71,6 +85,10 @@ pub struct Pbft {
 
     active_proposal: Option<ProposalKey>,
     consensus_started: bool,
+
+    view_changes: HashMap<u64, HashSet<NodeId>>,
+
+    timeout: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -92,6 +110,15 @@ pub enum PbftMessage {
         sequence: u64,
         digest: Digest,
         // from: NodeId,
+    },
+
+    ViewChange {
+        new_view: u64,
+        sequence: u64,
+    },
+    NewView {
+        view: u64,
+        sequence: u64,
     },
 }
 
@@ -116,6 +143,8 @@ impl Pbft {
             committed: HashSet::new(),
             active_proposal: None,
             consensus_started: false,
+            view_changes: HashMap::new(),
+            timeout: TIMEOUT,
         }
     }
 
@@ -155,14 +184,25 @@ impl Pbft {
             digest,
             // from,
         };
-        
-        let mut actions: Vec<ConsensusAction> =Vec::new();
-        let already_sent_prepare = self.prepares.get(&proposal_key).is_some_and(|votes| votes.contains(&self.node_id));
+
+        let mut actions: Vec<ConsensusAction> = Vec::new();
+        let already_sent_prepare = self
+            .prepares
+            .get(&proposal_key)
+            .is_some_and(|votes| votes.contains(&self.node_id));
         if !already_sent_prepare {
-            self.prepares.entry(proposal_key.clone()).or_default().insert(self.node_id);
+            self.prepares
+                .entry(proposal_key.clone())
+                .or_default()
+                .insert(self.node_id);
+            ConsensusAction::ScheduleTimeout {
+                view,
+                sequence,
+                duration: Duration::from_millis(self.get_timeout()),
+            };
             actions.push(ConsensusAction::Broadcast(ConsensusMessage::Pbft(message)));
         }
-        
+
         actions.extend(self.reevaluate(&proposal_key));
         actions
     }
@@ -212,46 +252,144 @@ impl Pbft {
 
         let prepared = have_proposal && prepare_count >= self.prepare_quorum();
 
-        let already_sent_commit = self.commits.get(key).is_some_and(|votes| votes.contains(&self.node_id));
+        let already_sent_commit = self
+            .commits
+            .get(key)
+            .is_some_and(|votes| votes.contains(&self.node_id));
 
         //Quorum on prepare and haven't seen commit yet
-        if prepared && !already_sent_commit{
+        if prepared && !already_sent_commit {
             // let already_sent_commit = self.commits.get(key).is_some_and(|votes| votes.contains(&self.node_id));
-            
+
             // if !already_sent_commit {
-            self.commits.entry(key.clone()).or_default().insert(self.node_id);
-                
+            self.commits
+                .entry(key.clone())
+                .or_default()
+                .insert(self.node_id);
+
             let broadcast_message = ConsensusMessage::Pbft(PbftMessage::Commit {
                 view: key.view,
                 sequence: key.sequence,
                 digest: key.digest,
                 // from: self.node_id,
             });
-            
+
             let broadcast_commit = ConsensusAction::Broadcast(broadcast_message);
             actions.push(broadcast_commit);
-            // }            
+            // }
         }
 
         let commit_count = self.commits.get(key).map(|votes| votes.len()).unwrap_or(0) as u64;
         let committed = prepared && commit_count >= self.commit_quorum();
 
-        if committed && !self.committed.contains(key){
-
+        if committed && !self.committed.contains(key) {
             self.committed.insert(key.clone());
-            
+
             self.last_committed_sequence = Some(key.sequence);
             self.next_sequence = self.next_sequence.max(key.sequence + 1);
-            
-            
+
             let commit_action = ConsensusAction::Commit(self.proposals.get(key).unwrap().clone());
             self.active_proposal = None;
 
-            
             actions.push(commit_action);
         }
-        
+
         actions
+    }
+    fn handle_timeout(&mut self, view: u64, sequence: u64) -> Vec<ConsensusAction> {
+        if view != self.view {
+            return vec![];
+        }
+
+        if self
+            .last_committed_sequence
+            .is_some_and(|last| last >= sequence)
+        {
+            return vec![];
+        }
+
+        let new_view = self.view + 1;
+
+        let already_voted = self
+            .view_changes
+            .get(&new_view)
+            .is_some_and(|votes| votes.contains(&self.node_id));
+
+        if already_voted {
+            return vec![];
+        }
+
+        self.view_changes
+            .entry(new_view)
+            .or_default()
+            .insert(self.node_id);
+
+        println!(
+            "Node {} timeout view {} -> requesting view {}",
+            self.node_id, self.view, new_view
+        );
+
+        vec![ConsensusAction::Broadcast(ConsensusMessage::Pbft(
+            PbftMessage::ViewChange { new_view, sequence },
+        ))]
+    }
+    fn handle_view_change(
+        &mut self,
+        from: NodeId,
+        new_view: u64,
+        sequence: u64,
+    ) -> Vec<ConsensusAction> {
+        if new_view <= self.view {
+            return vec![];
+        }
+
+        self.view_changes.entry(new_view).or_default().insert(from);
+
+        let count = self
+            .view_changes
+            .get(&new_view)
+            .map(|votes| votes.len())
+            .unwrap_or(0) as u64;
+
+        if count < self.commit_quorum() {
+            return vec![];
+        }
+
+        // Only the new primary announces NEW_VIEW.
+        if self.node_id != self.primary_for_view(new_view) {
+            return vec![];
+        }
+
+        self.view = new_view;
+        self.active_proposal = None;
+
+        vec![ConsensusAction::Broadcast(ConsensusMessage::Pbft(
+            PbftMessage::NewView {
+                view: new_view,
+                sequence,
+            },
+        ))]
+    }
+    fn handle_new_view(&mut self, from: NodeId, view: u64, _sequence: u64) -> Vec<ConsensusAction> {
+        if from != self.primary_for_view(view) {
+            return vec![];
+        }
+
+        if view <= self.view {
+            return vec![];
+        }
+
+        println!(
+            "Node {} entering view {}. Primary = {}",
+            self.node_id,
+            view,
+            self.primary_for_view(view)
+        );
+
+        self.view = view;
+        self.active_proposal = None;
+
+        vec![]
     }
 }
 
@@ -261,11 +399,16 @@ impl Consensus for Pbft {
     }
     fn on_start(&mut self) -> Vec<ConsensusAction> {
         if self.node_id == 0 {
-            let block = Block::new_initial_block_with(vec![Transaction::new_with("INITIAL BLOCK".to_string())]);
+            let block = Block::new_initial_block_with(vec![Transaction::new_with(
+                "INITIAL BLOCK".to_string(),
+            )]);
             let proposal = Proposal { block };
-            
-            
-            let proposal_key = ProposalKey { view: self.view, sequence: self.next_sequence, digest: proposal.to_digest() };
+
+            let proposal_key = ProposalKey {
+                view: self.view,
+                sequence: self.next_sequence,
+                digest: proposal.to_digest(),
+            };
             self.active_proposal = Some(proposal_key.clone());
             self.proposals.insert(proposal_key, proposal.clone());
             return vec![ConsensusAction::Broadcast(ConsensusMessage::Pbft(
@@ -292,7 +435,7 @@ impl Consensus for Pbft {
                         sequence: self.next_sequence,
                         digest: proposal_digest,
                     };
-                    
+
                     self.active_proposal = Some(proposal_key.clone());
                     self.proposals.insert(proposal_key, proposal.clone());
 
@@ -303,12 +446,21 @@ impl Consensus for Pbft {
                         proposal,
                     };
                     let consensus_message = ConsensusMessage::Pbft(pbft_message);
-                    vec![ConsensusAction::Broadcast(consensus_message)]
+
+                    let timeout = ConsensusAction::ScheduleTimeout {
+                        view: self.view,
+                        sequence: self.next_sequence,
+                        duration: Duration::from_millis(self.get_timeout()),
+                    };
+                    vec![ConsensusAction::Broadcast(consensus_message), timeout]
                 } else {
                     return vec![];
                 }
             }
-            ConsensusEvent::Message { from: from_node, message } => match message {
+            ConsensusEvent::Message {
+                from: from_node,
+                message,
+            } => match message {
                 ConsensusMessage::Pbft(pbft_message) => match pbft_message {
                     PbftMessage::PrePrepare {
                         view,
@@ -326,14 +478,20 @@ impl Consensus for Pbft {
                         sequence,
                         digest,
                     } => self.handle_commit(from_node, view, sequence, digest),
+                    PbftMessage::ViewChange { new_view, sequence } => {
+                        self.handle_view_change(from_node, new_view, sequence)
+                    }
+                    PbftMessage::NewView { view, sequence } => {
+                        self.handle_new_view(from_node, view, sequence)
+                    }
                 },
             },
-            ConsensusEvent::Timeout => todo!(),
+            ConsensusEvent::Timeout { view, sequence } => self.handle_timeout(view, sequence),
         }
     }
 
     fn primary_for_view(&self, view: u64) -> u64 {
-         view % self.node_count
+        view % self.node_count
     }
 
     fn prepare_quorum(&self) -> u64 {
@@ -342,22 +500,27 @@ impl Consensus for Pbft {
     fn commit_quorum(&self) -> u64 {
         2 * self.f() + 1
     }
-    fn f(&self)->u64{
+    fn f(&self) -> u64 {
         (self.node_count - 1) / 3
     }
 
-    fn can_propose(&self)->bool {
+    fn can_propose(&self) -> bool {
         self.node_id == self.primary_for_view(self.view) && self.active_proposal.is_none()
     }
 
-    fn consensus_started(&mut self, turn_on: bool)->bool{
-
+    fn consensus_started(&mut self, turn_on: bool) -> bool {
         if turn_on {
-            self.consensus_started =true;
+            self.consensus_started = true;
         }
-        return self.consensus_started
-        
-        
-        
+        return self.consensus_started;
+    }
+    fn current_primary(&self) -> NodeId {
+        self.primary_for_view(self.view)
+    }
+    fn set_timeout(&mut self, timeout: u64) {
+        self.timeout = timeout;
+    }
+    fn get_timeout(&self) -> u64 {
+        self.timeout
     }
 }

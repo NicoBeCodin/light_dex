@@ -1,4 +1,5 @@
-use std::arch::naked_asm;
+
+use std::collections::HashSet;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -10,6 +11,7 @@ pub type Digest = [u8; 32];
 pub struct BlockchainState {
     pub blocks: Vec<Block>,
     pub mempool: Vec<Transaction>,
+    pub seen_transactions: HashSet<Digest>,
 }
 
 impl BlockchainState {
@@ -17,6 +19,7 @@ impl BlockchainState {
         BlockchainState {
             blocks: Vec::new(),
             mempool: Vec::new(),
+            seen_transactions: HashSet::new(),
         }
     }
     pub fn commit_block(&mut self, block: &Block) {
@@ -29,8 +32,14 @@ impl BlockchainState {
             .filter(|tx| !committed_block.transactions.contains(tx))
             .collect();
     }
-    pub fn add_transaction(&mut self, tx: Transaction){
-        self.mempool.push(tx);
+    pub fn add_transaction(&mut self, tx: &Transaction)->bool{
+        if self.seen_transactions.insert(tx.to_digest()) {
+            self.mempool.push(tx.clone());
+            return true
+        } else {
+            false
+        }
+        
     }
     pub fn build_block(&self)->Option<Block>{
         if self.mempool.is_empty() {
@@ -111,5 +120,10 @@ impl Transaction {
     }
     pub fn new_with(payload: String) -> Transaction {
         Transaction { payload }
+    }
+    pub fn to_digest(&self)->Digest{
+        let mut hasher = Sha256::new();
+        hasher.update(self.payload.as_bytes());
+        hasher.finalize().into()
     }
 }
