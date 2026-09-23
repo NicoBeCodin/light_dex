@@ -1,0 +1,17 @@
+{
+    "name": "burst_load",
+    "description": "Large transaction bursts separated by idle periods",
+    "duration_seconds": 30,
+    "network": {
+        "nodes": 7,
+        "block_time_ms": 500,
+        "consensus_timeout_ms": 1500
+    },
+    "traffic": {
+        "type": "burst",
+        "burst_size": 1000,
+        "every_seconds": 5,
+        "target": "random"
+    },
+    "faults": []
+}

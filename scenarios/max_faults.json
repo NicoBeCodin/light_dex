@@ -1,0 +1,27 @@
+{
+    "name": "max_faults",
+    "description": "Kill two backup nodes, the maximum faults tolerated by a seven-node PBFT cluster",
+    "duration_seconds": 30,
+    "network": {
+        "nodes": 7,
+        "block_time_ms": 500,
+        "consensus_timeout_ms": 1500
+    },
+    "traffic": {
+        "type": "steady",
+        "tps": 100,
+        "target": "random"
+    },
+    "faults": [
+        {
+            "at_seconds": 10,
+            "action": "kill_node",
+            "node_id": 5
+        },
+        {
+            "at_seconds": 15,
+            "action": "kill_node",
+            "node_id": 6
+        }
+    ]
+}

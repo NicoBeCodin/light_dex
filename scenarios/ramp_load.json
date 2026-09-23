@@ -1,0 +1,23 @@
+{
+    "name": "ramp_load",
+    "description": "Increase offered load until throughput stops keeping up",
+
+    "duration_seconds": 60,
+
+    "network": {
+        "nodes": 7,
+        "block_time_ms": 500,
+        "consensus_timeout_ms": 1500
+    },
+
+    "traffic": {
+        "type": "ramp",
+        "start_tps": 50,
+        "increase_tps": 50,
+        "every_seconds": 5,
+        "max_tps": 1000,
+        "target": "random"
+    },
+
+    "faults": []
+}
