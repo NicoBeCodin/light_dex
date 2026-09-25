@@ -1,17 +1,10 @@
 use std::{env, net::SocketAddr};
-
-use crate::{
+use light_dex::{
     blockchain::BlockchainState,
     consensus::pbft::{Consensus, Pbft},
     network::Network,
     node::{Node, NodeId},
 };
-
-pub mod blockchain;
-pub mod consensus;
-pub mod message;
-pub mod network;
-pub mod node;
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.windows(2)

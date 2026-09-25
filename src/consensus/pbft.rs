@@ -558,11 +558,7 @@ impl Consensus for Pbft {
             return vec![];
         }
 
-        let block = Block::new_initial_block_with(vec![
-            Transaction::new_with(
-                "INITIAL BLOCK".to_string()
-            ),
-        ]);
+        let block = Block::new_initial_block();
 
         let proposal = Proposal { block };
 

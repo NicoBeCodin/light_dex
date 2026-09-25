@@ -33,14 +33,14 @@ struct NodeMetrics {
     transaction_received_at: HashMap<Digest, Instant>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BlockSummary {
     pub sequence: u64,
     pub transaction_count: usize,
     pub digest: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NodeStatus {
     pub node_id: NodeId,
     pub pid: u32,

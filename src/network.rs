@@ -321,11 +321,8 @@ impl Network {
         if let Err(error) = result {
         self.peers_stream.remove(peer);
         return Err(error);
-    
-            
         }
         Ok(())
-
     }
 
     pub fn broadcast(
