@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default permissions for the Light DEX control plane",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

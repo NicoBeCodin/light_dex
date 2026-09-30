@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, path::PathBuf};
 use light_dex::{
     blockchain::BlockchainState,
     consensus::pbft::{Consensus, Pbft},
@@ -37,10 +37,15 @@ fn main() {
 
     let pid = std::process::id();
 
-    let network =
-        Network::new(node_id, parent_addr).expect("failed creating network");
+    let auth_key = light_dex::message::hex_decode::<32>(&env::var("LIGHT_DEX_AUTH_KEY")
+        .expect("missing cluster authentication key")).expect("invalid cluster authentication key");
+    let network = Network::new(node_id, parent_addr, auth_key).expect("failed creating network");
 
-    let state = BlockchainState::new();
+    let state = match arg_value(&args, "--data-dir") {
+        Some(directory) => BlockchainState::load(PathBuf::from(directory).join(format!("node-{node_id}.json")))
+            .expect("failed recovering persisted chain"),
+        None => BlockchainState::new(),
+    };
 
     let mut consensus = Pbft::new(node_id, 1);
     consensus.set_timeout(timeout_ms);

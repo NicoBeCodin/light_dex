@@ -1,2 +1,11 @@
-/target
+/target/
+/benchmark_results/control-plane-state/
+
+# Keep local screenshots untracked, but commit the icons Tauri needs to build.
 *.png
+!/control-plane/src-tauri/icons/*.png
+
+# Generated frontend build metadata.
+/control-plane/*.tsbuildinfo
+/control-plane/vite.config.js
+/control-plane/vite.config.d.ts

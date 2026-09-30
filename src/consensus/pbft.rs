@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    blockchain::{Block, Digest, Proposal, Transaction},
+    blockchain::{Block, Digest, Proposal},
     node::NodeId,
 };
 
@@ -14,6 +14,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 1000;
 
 pub trait Consensus {
     fn set_node_count(&mut self, count: u64);
+    fn restore_from_height(&mut self, height: u64);
 
     fn on_start(&mut self) -> Vec<ConsensusAction>;
 
@@ -199,7 +200,8 @@ impl Pbft {
         //
         // Check correct view + correct primary.
         //
-        if view != self.view
+        if sequence != self.next_sequence
+            || view != self.view
             || from != self.primary_for_view(view)
         {
             return vec![];
@@ -550,7 +552,13 @@ impl Consensus for Pbft {
         self.node_count = count;
     }
 
+    fn restore_from_height(&mut self, height: u64) {
+        self.next_sequence = height;
+        self.last_committed_sequence = height.checked_sub(1);
+    }
+
     fn on_start(&mut self) -> Vec<ConsensusAction> {
+        if self.next_sequence > 0 { return vec![]; }
         //
         // View 0 primary creates genesis block.
         //

@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     blockchain::Transaction,
-    message::Message,
+    message::{Message, sign_line, verify_line},
     node::{ControlMessage, NodeId},
 };
 
@@ -17,6 +17,7 @@ pub struct Network {
     pub node_id: NodeId,
     pub parent_address: SocketAddr,
     pub listener: TcpListener,
+    pub auth_key: [u8; 32],
 
     pub peers_address: HashMap<NodeId, SocketAddr>,
     pub peers_stream: HashMap<NodeId, TcpStream>,
@@ -53,6 +54,7 @@ pub fn spawn_reader(
     peer_id: NodeId,
     mut reader: BufReader<TcpStream>,
     tx: Sender<NetworkEvent>,
+    auth_key: [u8; 32],
 ) {
     loop {
         let mut buffer = String::new();
@@ -69,7 +71,7 @@ pub fn spawn_reader(
             break;
         }
 
-        let message = match Message::from_str(buffer) {
+        let message = match verify_line::<Message>(&buffer, &auth_key) {
             Ok(message) => message,
 
             Err(error) => {
@@ -95,6 +97,7 @@ pub fn spawn_reader(
 pub fn spawn_client_reader(
     mut reader: BufReader<TcpStream>,
     tx: Sender<NetworkEvent>,
+    auth_key: [u8; 32],
 ) {
     loop {
         let mut buffer = String::new();
@@ -108,7 +111,7 @@ pub fn spawn_client_reader(
             break;
         }
 
-        let message = match Message::from_str(buffer) {
+        let message = match verify_line::<Message>(&buffer, &auth_key) {
             Ok(message) => message,
             Err(_) => continue,
         };
@@ -152,6 +155,7 @@ impl Network {
     pub fn new(
         node_id: NodeId,
         parent_address: SocketAddr,
+        auth_key: [u8; 32],
     ) -> Result<Network, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
 
@@ -161,6 +165,7 @@ impl Network {
             node_id,
             parent_address,
             listener,
+            auth_key,
 
             peers_address: HashMap::new(),
             peers_stream: HashMap::new(),
@@ -183,13 +188,7 @@ impl Network {
 
                 let mut write_stream = peer_stream.try_clone()?;
 
-                let mut hello =
-                    Message::Control(ControlMessage::Hello {
-                        node_id: self.node_id,
-                    })
-                    .to_str()?;
-
-                hello.push('\n');
+                let hello = sign_line(&Message::Control(ControlMessage::Hello { node_id: self.node_id }), &self.auth_key)?;
 
                 write_stream.write_all(hello.as_bytes())?;
 
@@ -204,16 +203,18 @@ impl Network {
                 let tx = self.event_tx.clone();
                 let peer_id = *peer_id;
 
+                let auth_key = self.auth_key;
                 thread::spawn(move || {
                     let reader = BufReader::new(peer_stream);
 
-                    spawn_reader(peer_id, reader, tx);
+                    spawn_reader(peer_id, reader, tx, auth_key);
                 });
             }
         }
 
         let listener = self.listener.try_clone()?;
         let event_tx = self.event_tx.clone();
+        let auth_key = self.auth_key;
 
         thread::spawn(move || loop {
             let (stream, _) = match listener.accept() {
@@ -238,7 +239,7 @@ impl Network {
                 continue;
             }
 
-            let message = match Message::from_str(buffer) {
+            let message = match verify_line::<Message>(&buffer, &auth_key) {
                 Ok(message) => message,
                 Err(error) => {
                     eprintln!("Invalid initial message: {error}");
@@ -261,7 +262,7 @@ impl Network {
 
                     // Important: continue using the SAME BufReader.
                     thread::spawn(move || {
-                        spawn_reader(node_id, reader, tx);
+                        spawn_reader(node_id, reader, tx, auth_key);
                     });
                 }
 
@@ -276,7 +277,7 @@ impl Network {
                     let tx = event_tx.clone();
 
                     thread::spawn(move || {
-                        spawn_client_reader(reader, tx);
+                        spawn_client_reader(reader, tx, auth_key);
                     });
                 }
 

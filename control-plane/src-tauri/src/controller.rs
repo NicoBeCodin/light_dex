@@ -1,0 +1,1704 @@
+use crate::types::{
+    ControlSnapshot, LaunchConfig, LoadConfig, LoadPreset, LoadSnapshot, MarketMakerConfig,
+    MarketMakerSnapshot, MetricsSnapshot,
+    NodeRuntimeSnapshot, TargetNode,
+};
+use crate::binance_depth::{PartialDepth, STREAM_URL, desired_book};
+use light_dex::{
+    blockchain::Transaction,
+    message::Message,
+    message::{hex_encode, sign_line, verify_line},
+    node::{ControlMessage, NodeId, NodeStatus},
+    participants::market_maker::{DesiredBook, QuoteAction, plan_actions},
+};
+use rand::Rng;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    io::{self, BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::{Duration, Instant},
+};
+
+type Shared = Arc<Mutex<ControllerInner>>;
+
+struct RuntimeNode {
+    child: Child,
+    address: Option<SocketAddr>,
+    status: Option<NodeStatus>,
+    state: String,
+    last_sample: Option<(Instant, u64, u64)>,
+    tx_rate: f64,
+    block_rate: f64,
+    paused_until: Option<Instant>,
+}
+
+struct ControllerInner {
+    nodes: BTreeMap<NodeId, RuntimeNode>,
+    running: bool,
+    launching: bool,
+    stopping: bool,
+    submitted: u64,
+    submit_times: VecDeque<Instant>,
+    logs: VecDeque<String>,
+    run_id: u64,
+    load: Option<LoadRuntime>,
+    next_load_id: u64,
+    auth_key: [u8; 32],
+    active_data_dir: Option<String>,
+    market_maker: Option<MarketMakerRuntime>,
+    next_market_maker_id: u64,
+}
+
+struct MarketMakerRuntime {
+    id: u64,
+    config: MarketMakerConfig,
+    active: bool,
+    stopping: bool,
+    latest_depth: Option<PartialDepth>,
+    feed_at: Option<Instant>,
+    desired: DesiredBook,
+    last_applied: Option<Instant>,
+    pending: VecDeque<PendingQuote>,
+    last_error: Option<String>,
+}
+
+struct PendingQuote {
+    action: QuoteAction,
+    transaction: Transaction,
+    digest: String,
+    last_sent: Instant,
+}
+
+struct LoadRuntime {
+    id: u64,
+    config: LoadConfig,
+    cursor: u64,
+    pending: HashMap<u64, PendingLoadTransaction>,
+    failed: HashMap<u64, u64>,
+}
+
+struct PendingLoadTransaction {
+    transaction: Transaction,
+    digest: String,
+    last_sent: Instant,
+}
+
+impl Default for ControllerInner {
+    fn default() -> Self {
+        Self {
+            nodes: BTreeMap::new(),
+            running: false,
+            launching: false,
+            stopping: false,
+            submitted: 0,
+            submit_times: VecDeque::new(),
+            logs: VecDeque::new(),
+            run_id: 0,
+            load: None,
+            next_load_id: 0,
+            auth_key: [0; 32],
+            active_data_dir: None,
+            market_maker: None,
+            next_market_maker_id: 0,
+        }
+    }
+}
+
+impl ControllerInner {
+    fn log(&mut self, message: impl Into<String>) {
+        const MAX_LOGS: usize = 3000;
+        self.logs.push_back(message.into());
+        while self.logs.len() > MAX_LOGS {
+            self.logs.pop_front();
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ControllerState {
+    inner: Shared,
+}
+
+impl ControllerState {
+    pub fn launch(&self, config: LaunchConfig) -> Result<(), String> {
+        if config.node_count == 0 {
+            return Err("node count must be at least one".into());
+        }
+        let run_id = {
+            let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+            if state.running || state.launching || state.stopping {
+                return Err("simulation already running".into());
+            }
+            state.run_id += 1;
+            state.auth_key = rand::random();
+            state.launching = true;
+            state.submitted = 0;
+            state.submit_times.clear();
+            state.nodes.clear();
+            state.load = None;
+            state.market_maker = None;
+            state.logs.clear();
+            state.active_data_dir = None;
+            state.log("Starting simulation...");
+            state.run_id
+        };
+        let shared = self.inner.clone();
+        thread::spawn(move || {
+            if let Err(error) = launch_cluster(shared.clone(), config, run_id) {
+                if shared.lock().unwrap().run_id == run_id {
+                    log(&shared, format!("Launch failed: {error}"));
+                    stop_cluster(shared, true);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    pub fn stop_all(&self) {
+        let shared = self.inner.clone();
+        {
+            let mut state = shared.lock().unwrap();
+            if state.stopping || (!state.running && !state.launching) { return; }
+            state.stopping = true;
+            state.running = false;
+            state.launching = false;
+            state.run_id += 1;
+            state.load = None;
+            state.market_maker = None;
+            state.log("Stopping simulation...");
+        }
+        thread::spawn(move || stop_cluster(shared, false));
+    }
+
+    pub fn submit_transaction(
+        &self,
+        transaction: Transaction,
+        target: TargetNode,
+    ) -> Result<(), String> {
+        let (target, auth_key) = {
+            let state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+            let account_id = transaction.account_id();
+            if state.market_maker.as_ref().is_some_and(|mm| (mm.active || mm.stopping)
+                && mm.config.account_id == account_id) {
+                return Err(format!("account {account_id} is controlled by the market maker"));
+            }
+            if state
+                .load
+                .as_ref()
+                .is_some_and(|load| load.pending.contains_key(&account_id))
+            {
+                return Err(format!(
+                    "account {account_id} already has a load transaction awaiting confirmation"
+                ));
+            }
+            let confirmed_nonce = state
+                .nodes
+                .values()
+                .filter(|node| node.state == "ok")
+                .filter_map(|node| node.status.as_ref())
+                .max_by_key(|status| status.chain_height)
+                .and_then(|status| {
+                    status
+                        .account_nonces
+                        .iter()
+                        .find(|account| account.account_id == account_id)
+                })
+                .map(|account| account.nonce)
+                .ok_or_else(|| format!("no confirmed nonce available for account {account_id}"))?;
+            if transaction.nonce() != confirmed_nonce {
+                return Err(format!(
+                    "account {account_id} needs nonce {confirmed_nonce}; transaction uses {}",
+                    transaction.nonce()
+                ));
+            }
+            (resolve_target(&state, &target), state.auth_key)
+        }
+        ;
+        let target = target.ok_or_else(|| "no available target node".to_string())?;
+        let shared = self.inner.clone();
+        thread::spawn(move || {
+            match send_message(
+                target.1,
+                &Message::Transaction(transaction.clone()),
+                Duration::from_millis(500),
+                &auth_key,
+            ) {
+                Ok(()) => {
+                    let mut state = shared.lock().unwrap();
+                    state.submitted += 1;
+                    state.submit_times.push_back(Instant::now());
+                    state.log(format!("Submitted {transaction:?} to node {}", target.0));
+                }
+                Err(error) => log(
+                    &shared,
+                    format!(
+                        "Transaction submission to node {} failed: {error}",
+                        target.0
+                    ),
+                ),
+            }
+        });
+        Ok(())
+    }
+
+    pub fn pause_node(&self, target: TargetNode, millis: u64) -> Result<(), String> {
+        let (target, auth_key) = {
+            let state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+            (resolve_target(&state, &target), state.auth_key)
+        }
+        ;
+        let target = target.ok_or_else(|| "no available target node".to_string())?;
+        let shared = self.inner.clone();
+        thread::spawn(move || {
+            match send_message(
+                target.1,
+                &Message::Control(ControlMessage::Pause { millis }),
+                Duration::from_millis(500),
+                &auth_key,
+            ) {
+                Ok(()) => {
+                    let mut state = shared.lock().unwrap();
+                    if let Some(node) = state.nodes.get_mut(&target.0) {
+                        node.paused_until = Some(Instant::now() + Duration::from_millis(millis));
+                    }
+                    state.log(format!("Paused node {} for {millis} ms", target.0));
+                }
+                Err(error) => log(&shared, format!("Pause node {} failed: {error}", target.0)),
+            }
+        });
+        Ok(())
+    }
+
+    pub fn start_load(&self, config: LoadConfig) -> Result<(), String> {
+        if !config.tps.is_finite() || config.tps <= 0.0 || config.tps > 10_000.0 {
+            return Err("TPS must be a finite value greater than 0 and at most 10,000".into());
+        }
+        if let LoadPreset::RoundRobinTransfers {
+            first_account,
+            account_count,
+            ..
+        }
+        | LoadPreset::RandomTransfers {
+            first_account,
+            account_count,
+            ..
+        } = &config.preset
+        {
+            if *account_count < 2
+                || *account_count > 1_000
+                || first_account.checked_add(*account_count).is_none()
+            {
+                return Err("transfer presets require 2 to 1,000 accounts in a valid range".into());
+            }
+        }
+        if matches!(&config.preset,
+            LoadPreset::RoundRobinTransfers { amount: 0, .. } | LoadPreset::RandomTransfers { amount: 0, .. }) {
+            return Err("transfer amount must be greater than zero".into());
+        }
+
+        let load_id = {
+            let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+            if !state.running {
+                return Err("start the simulation before starting load generation".into());
+            }
+            let status = state
+                .nodes
+                .values()
+                .filter(|node| node.state == "ok")
+                .filter_map(|node| node.status.as_ref())
+                .max_by_key(|status| status.chain_height)
+                .ok_or_else(|| "wait for a responsive node before starting load".to_string())?;
+            let (first, count) = match &config.preset {
+                LoadPreset::BookTaker { account_id, .. } => (*account_id, 1),
+                LoadPreset::RoundRobinTransfers {
+                    first_account,
+                    account_count,
+                    ..
+                }
+                | LoadPreset::RandomTransfers {
+                    first_account,
+                    account_count,
+                    ..
+                } => (*first_account, *account_count),
+            };
+            let end = first
+                .checked_add(count)
+                .ok_or_else(|| "invalid account range".to_string())?;
+            if (first..end).any(|id| {
+                !status
+                    .account_nonces
+                    .iter()
+                    .any(|account| account.account_id == id)
+            }) {
+                return Err(
+                    "one or more preset accounts do not exist in the current cluster".into(),
+                );
+            }
+            if state.market_maker.as_ref().is_some_and(|mm| (mm.active || mm.stopping)
+                && (first..end).contains(&mm.config.account_id)) {
+                return Err("sender account range overlaps the market maker".into());
+            }
+            state.next_load_id += 1;
+            let load_id = state.next_load_id;
+            let pending = state
+                .load
+                .take()
+                .map(|load| load.pending)
+                .unwrap_or_default();
+            state.load = Some(LoadRuntime {
+                id: load_id,
+                cursor: 0,
+                pending,
+                failed: HashMap::new(),
+                config,
+            });
+            state.log("Load generator started or updated");
+            load_id
+        };
+
+        spawn_load_loop(self.inner.clone(), load_id);
+        Ok(())
+    }
+
+    pub fn stop_load(&self) {
+        let mut state = self.inner.lock().unwrap();
+        if state.load.take().is_some() {
+            state.log("Load generator stopped");
+        }
+    }
+
+    pub fn start_market_maker(&self, config: MarketMakerConfig) -> Result<(), String> {
+        if config.levels == 0 || config.levels > 5 {
+            return Err("market maker levels must be between 1 and 5".into());
+        }
+        if !(250..=60_000).contains(&config.refresh_ms) {
+            return Err("market maker refresh must be between 250 and 60,000 ms".into());
+        }
+        let mut spawn = None;
+        {
+            let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+            if !state.running { return Err("start the simulation first".into()); }
+            let status = best_status(&state).ok_or("wait for a responsive node")?;
+            if !status.account_nonces.iter().any(|account| account.account_id == config.account_id) {
+                return Err("market maker account does not exist".into());
+            }
+            if !state.market_maker.as_ref().is_some_and(|mm| mm.active)
+                && status.open_orders.iter().any(|order| order.account_id == config.account_id) {
+                return Err("market maker account already has open orders; use a clean account".into());
+            }
+            if state.load.as_ref().is_some_and(|load| load_uses_account(&load.config.preset, config.account_id)) {
+                return Err("market maker account is already used by the transaction sender".into());
+            }
+            match state.market_maker.as_mut() {
+                Some(mm) if mm.active => {
+                    if mm.config.account_id != config.account_id {
+                        return Err("stop and clear the old account's quotes before changing accounts".into());
+                    }
+                    mm.config = config;
+                    mm.last_applied = None;
+                    mm.last_error = None;
+                    state.log("Market maker settings updated");
+                }
+                Some(mm) if mm.stopping => return Err("wait for existing quotes to cancel first".into()),
+                _ => {
+                    state.next_market_maker_id += 1;
+                    let id = state.next_market_maker_id;
+                    state.market_maker = Some(MarketMakerRuntime {
+                        id, config, active: true, stopping: false,
+                        latest_depth: None, feed_at: None, desired: DesiredBook::default(),
+                        last_applied: None, pending: VecDeque::new(), last_error: None,
+                    });
+                    state.log("Market maker started; waiting for Binance BTCUSDT depth");
+                    spawn = Some(id);
+                }
+            }
+        }
+        if let Some(id) = spawn {
+            spawn_binance_feed(self.inner.clone(), id);
+            spawn_market_maker_loop(self.inner.clone(), id);
+        }
+        Ok(())
+    }
+
+    pub fn stop_market_maker(&self) {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(mm) = state.market_maker.as_mut() {
+            if mm.active {
+                mm.active = false;
+                mm.stopping = true;
+                mm.desired = DesiredBook::default();
+                state.log("Market maker stopping; cancelling remaining quotes");
+            }
+        }
+    }
+
+    pub fn kill_node(&self, target: TargetNode) -> Result<(), String> {
+        let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+        let node_id = resolve_target_id(&state, &target)
+            .ok_or_else(|| "no available target node".to_string())?;
+        let runtime = state
+            .nodes
+            .get_mut(&node_id)
+            .ok_or_else(|| "node not found".to_string())?;
+        runtime.child.kill().map_err(|error| error.to_string())?;
+        runtime.state = "dead".into();
+        state.log(format!("Killed node {node_id}"));
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> ControlSnapshot {
+        snapshot(&self.inner)
+    }
+}
+
+fn launch_cluster(shared: Shared, config: LaunchConfig, run_id: u64) -> io::Result<()> {
+    let auth_key = shared.lock().unwrap().auth_key;
+    let project = PathBuf::from(&config.project_dir).canonicalize()?;
+    let requested_data = PathBuf::from(&config.data_dir);
+    let base_data = if requested_data.is_absolute() { requested_data } else { project.join(requested_data) };
+    let data_dir = if config.recover_existing {
+        if !base_data.is_dir() { return Err(io::Error::new(io::ErrorKind::NotFound, "recovery directory does not exist")); }
+        let mut expected_tip = None;
+        for node_id in 0..config.node_count {
+            let path = base_data.join(format!("node-{node_id}.json"));
+            if !path.is_file() { return Err(io::Error::new(io::ErrorKind::NotFound, format!("missing recovery file {}", path.display()))); }
+            let chain = light_dex::blockchain::BlockchainState::load(path).map_err(io::Error::other)?;
+            let tip = (chain.blocks.len(), chain.blocks.last().map(|block| block.to_digest()));
+            if let Some(expected) = expected_tip { if expected != tip { return Err(io::Error::other("recovery files have different chain tips; refusing unsafe restart")); } }
+            expected_tip = Some(tip);
+        }
+        base_data
+    } else {
+        let suffix = format!("run-{}-{:08x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(io::Error::other)?.as_millis(), rand::random::<u32>());
+        let path = base_data.join(suffix);
+        std::fs::create_dir_all(&path)?;
+        path
+    };
+    let data_dir = data_dir.canonicalize()?;
+    {
+        let mut state = shared.lock().unwrap();
+        state.active_data_dir = Some(data_dir.display().to_string());
+        state.log(format!("Node data directory: {}", data_dir.display()));
+    }
+    if config.build_before_launch {
+        log(&shared, "Running cargo build --bin light_dex...");
+        let output = Command::new("cargo")
+            .args(["build", "--bin", "light_dex"])
+            .current_dir(&project)
+            .env("LIGHT_DEX_AUTH_KEY", hex_encode(&auth_key))
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+    }
+    let requested_binary = PathBuf::from(&config.binary_path);
+    let binary = if requested_binary.is_absolute() {
+        requested_binary
+    } else {
+        project.join(requested_binary)
+    };
+    if !binary.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("node binary not found: {}", binary.display()),
+        ));
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let parent_address = listener.local_addr()?;
+    log(&shared, format!("Bootstrap listening at {parent_address}"));
+
+    for node_id in 0..config.node_count {
+        let mut state = shared.lock().unwrap();
+        if state.run_id != run_id { return Err(io::Error::new(io::ErrorKind::Interrupted, "launch cancelled")); }
+        let mut child = Command::new(&binary)
+            .args([
+                "--node",
+                &node_id.to_string(),
+                "--parent",
+                &parent_address.to_string(),
+                "--block-time-ms",
+                &config.block_time_ms.to_string(),
+                "--timeout-ms",
+                &config.timeout_ms.to_string(),
+                "--data-dir",
+                &data_dir.display().to_string(),
+            ])
+            .current_dir(&project)
+            .env("LIGHT_DEX_AUTH_KEY", hex_encode(&auth_key))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        state.nodes.insert(
+            node_id,
+            RuntimeNode {
+                child,
+                address: None,
+                status: None,
+                state: "starting".into(),
+                last_sample: None,
+                tx_rate: 0.0,
+                block_rate: 0.0,
+                paused_until: None,
+            },
+        );
+        drop(state);
+        if let Some(reader) = stdout {
+            spawn_output_reader(node_id, reader, shared.clone());
+        }
+        if let Some(reader) = stderr {
+            spawn_output_reader(node_id, reader, shared.clone());
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut addresses = BTreeMap::new();
+    while addresses.len() < config.node_count as usize {
+        let (stream, _) = accept_until(&listener, deadline)?;
+        let parts: Vec<_> = read_line(&stream)?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        if parts.len() != 3 || parts[0] != "REGISTER" {
+            continue;
+        }
+        let node_id = parts[1]
+            .parse::<NodeId>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid node ID"))?;
+        let address = parts[2]
+            .parse::<SocketAddr>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid node address"))?;
+        addresses.insert(node_id, address);
+        let mut state = shared.lock().unwrap();
+        if let Some(node) = state.nodes.get_mut(&node_id) {
+            node.address = Some(address);
+        }
+        state.log(format!("Registered node {node_id} at {address}"));
+    }
+    for (node_id, address) in &addresses {
+        let mut stream = TcpStream::connect_timeout(address, Duration::from_secs(5))?;
+        for (peer_id, peer_address) in &addresses {
+            if node_id != peer_id {
+                writeln!(stream, "REGISTER {peer_id} {peer_address}")?;
+            }
+        }
+        writeln!(stream, "DONE")?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut ready = HashSet::new();
+    let mut ready_streams = Vec::new();
+    while ready.len() < config.node_count as usize {
+        let (stream, _) = accept_until(&listener, deadline)?;
+        let parts: Vec<_> = read_line(&stream)?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        if parts.len() == 2 && parts[0] == "READY" {
+            let node_id = parts[1]
+                .parse::<NodeId>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid READY node"))?;
+            if ready.insert(node_id) {
+                ready_streams.push(stream);
+                log(&shared, format!("Node {node_id} ready"));
+            }
+        }
+    }
+    for mut stream in ready_streams {
+        stream.write_all(b"START\n")?;
+    }
+    {
+        let mut state = shared.lock().unwrap();
+        if state.run_id != run_id {
+            return Ok(());
+        }
+        state.running = true;
+        state.launching = false;
+        state.log(format!(
+            "Simulation started with {} nodes",
+            config.node_count
+        ));
+    }
+    spawn_poll_loop(shared, config.poll_ms, run_id);
+    Ok(())
+}
+
+fn accept_until(listener: &TcpListener, deadline: Instant) -> io::Result<(TcpStream, SocketAddr)> {
+    loop {
+        match listener.accept() {
+            Ok(stream) => return Ok(stream),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "bootstrap timed out",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn spawn_poll_loop(shared: Shared, poll_ms: u64, run_id: u64) {
+    thread::spawn(move || {
+        loop {
+            let started = Instant::now();
+            let (targets, auth_key) = {
+                let mut state = shared.lock().unwrap();
+                if !state.running || state.run_id != run_id {
+                    break;
+                }
+                for node in state.nodes.values_mut() {
+                    if matches!(node.child.try_wait(), Ok(Some(_))) {
+                        node.state = "dead".into();
+                    }
+                }
+                let targets = state
+                    .nodes
+                    .iter()
+                    .filter_map(|(id, node)| (node.state != "dead").then_some((*id, node.address?)))
+                    .collect::<Vec<_>>();
+                (targets, state.auth_key)
+            };
+            let (tx, rx) = mpsc::channel();
+            let count = targets.len();
+            for (id, address) in targets {
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let _ = tx.send((id, request_status(address, &auth_key)));
+                });
+            }
+            drop(tx);
+            for _ in 0..count {
+                let Ok((id, result)) = rx.recv_timeout(Duration::from_millis(700)) else {
+                    break;
+                };
+                update_status(&shared, run_id, id, result);
+            }
+            let delay = Duration::from_millis(poll_ms.max(50));
+            if started.elapsed() < delay {
+                thread::sleep(delay - started.elapsed());
+            }
+        }
+    });
+}
+
+fn update_status(shared: &Shared, run_id: u64, node_id: NodeId, result: io::Result<NodeStatus>) {
+    let now = Instant::now();
+    let mut state = shared.lock().unwrap();
+    if state.run_id != run_id { return; }
+    match result {
+        Ok(status) => {
+            reconcile_load(&mut state, &status);
+            let Some(node) = state.nodes.get_mut(&node_id) else {
+                return;
+            };
+            if let Some((then, txs, blocks)) = node.last_sample {
+                let seconds = now.duration_since(then).as_secs_f64().max(0.000_001);
+                node.tx_rate = status.transactions_committed.saturating_sub(txs) as f64 / seconds;
+                node.block_rate = status.blocks_committed.saturating_sub(blocks) as f64 / seconds;
+            }
+            node.last_sample = Some((now, status.transactions_committed, status.blocks_committed));
+            node.status = Some(status);
+            node.state = "ok".into();
+        }
+        Err(_) => {
+            let Some(node) = state.nodes.get_mut(&node_id) else {
+                return;
+            };
+            node.state = if matches!(node.child.try_wait(), Ok(Some(_))) {
+                "dead"
+            } else if node.paused_until.is_some_and(|until| now < until) {
+                "paused"
+            } else {
+                "unresponsive"
+            }
+            .into();
+        }
+    }
+}
+
+fn reconcile_load(state: &mut ControllerInner, status: &NodeStatus) {
+    let Some(load) = state.load.as_mut() else {
+        return;
+    };
+    let mut completed = Vec::new();
+    let mut failed = Vec::new();
+    for (&account_id, pending) in &load.pending {
+        if let Some(outcome) = status
+            .recent_transaction_outcomes
+            .iter()
+            .find(|outcome| outcome.digest == pending.digest)
+        {
+            let nonce_advanced = status.account_nonces.iter().any(|account| {
+                account.account_id == account_id && account.nonce > pending.transaction.nonce()
+            });
+            if !outcome.success || !nonce_advanced {
+                failed.push((
+                    account_id,
+                    pending.transaction.nonce(),
+                    outcome.error.clone(),
+                ));
+                continue;
+            }
+        }
+        if status.account_nonces.iter().any(|account| {
+            account.account_id == account_id && account.nonce > pending.transaction.nonce()
+        }) {
+            completed.push(account_id);
+        }
+    }
+    for account_id in completed {
+        load.pending.remove(&account_id);
+    }
+    for (account_id, nonce, _) in &failed {
+        load.pending.remove(account_id);
+        load.failed.insert(*account_id, *nonce);
+    }
+    for (account_id, nonce, error) in failed {
+        state.log(format!("Load account {account_id} transaction failed at nonce {nonce} ({}); account paused until load is updated", error.unwrap_or_else(|| "nonce did not advance".into())));
+    }
+}
+
+fn best_status(state: &ControllerInner) -> Option<&NodeStatus> {
+    state.nodes.values().filter(|node| node.state == "ok")
+        .filter_map(|node| node.status.as_ref()).max_by_key(|status| status.chain_height)
+}
+
+fn load_uses_account(preset: &LoadPreset, account_id: u64) -> bool {
+    match *preset {
+        LoadPreset::BookTaker { account_id: taker, .. } => taker == account_id,
+        LoadPreset::RoundRobinTransfers { first_account, account_count, .. }
+        | LoadPreset::RandomTransfers { first_account, account_count, .. } =>
+            account_id >= first_account && account_id < first_account.saturating_add(account_count),
+    }
+}
+
+fn spawn_load_loop(shared: Shared, load_id: u64) {
+    thread::spawn(move || {
+        loop {
+            let started = Instant::now();
+            let (transaction, target, tps) = {
+                let mut state = shared.lock().unwrap();
+                if !state.running {
+                    break;
+                }
+                let status = state
+                    .nodes
+                    .values()
+                    .filter(|node| node.state == "ok")
+                    .filter_map(|node| node.status.as_ref())
+                    .max_by_key(|status| status.chain_height)
+                    .cloned();
+                let Some(load) = state.load.as_mut() else {
+                    break;
+                };
+                if load.id != load_id {
+                    break;
+                }
+                let transaction = status
+                    .as_ref()
+                    .and_then(|status| next_load_transaction(load, status));
+                (transaction, load.config.target.clone(), load.config.tps)
+            };
+
+            if let Some(transaction) = transaction {
+                let (target, auth_key) = {
+                    let state = shared.lock().unwrap();
+                    (resolve_target(&state, &target), state.auth_key)
+                };
+                if let Some((node_id, address)) = target {
+                    match send_message(
+                        address,
+                        &Message::Transaction(transaction),
+                        Duration::from_millis(500),
+                        &auth_key,
+                    ) {
+                        Ok(()) => {
+                            let mut state = shared.lock().unwrap();
+                            if state.load.as_ref().is_some_and(|load| load.id == load_id) {
+                                state.submitted += 1;
+                                state.submit_times.push_back(Instant::now());
+                            }
+                        }
+                        Err(error) => log(
+                            &shared,
+                            format!("Load submission to node {node_id} failed: {error}"),
+                        ),
+                    }
+                }
+            }
+
+            let interval = Duration::from_secs_f64(1.0 / tps);
+            if let Some(remaining) = interval.checked_sub(started.elapsed()) {
+                thread::sleep(remaining);
+            }
+        }
+    });
+}
+
+fn next_load_transaction(load: &mut LoadRuntime, status: &NodeStatus) -> Option<Transaction> {
+    let (first, count) = match load.config.preset {
+        LoadPreset::BookTaker { account_id, .. } => (account_id, 1),
+        LoadPreset::RoundRobinTransfers {
+            first_account,
+            account_count,
+            ..
+        }
+        | LoadPreset::RandomTransfers {
+            first_account,
+            account_count,
+            ..
+        } => (first_account, account_count),
+    };
+    let mut eligible = Vec::new();
+    for offset in 0..count {
+        let account_id = first + offset;
+        if load.failed.contains_key(&account_id) {
+            continue;
+        }
+        if let Some(pending) = load.pending.get_mut(&account_id) {
+            if pending.last_sent.elapsed() >= Duration::from_secs(3) {
+                pending.last_sent = Instant::now();
+                return Some(pending.transaction.clone());
+            }
+            continue;
+        }
+        if let Some(account) = status
+            .account_nonces
+            .iter()
+            .find(|account| account.account_id == account_id)
+        {
+            eligible.push((account_id, account.nonce));
+        }
+    }
+    if eligible.is_empty() {
+        return None;
+    }
+    let (account_id, nonce) = match load.config.preset {
+        LoadPreset::RandomTransfers { .. } => eligible[rand::rng().random_range(0..eligible.len())],
+        _ => {
+            let index = eligible
+                .iter()
+                .position(|(id, _)| *id >= first + load.cursor % count)
+                .unwrap_or(0);
+            let selected = eligible[index];
+            load.cursor = (selected.0 - first + 1) % count;
+            selected
+        }
+    };
+    let transaction = match load.config.preset {
+        LoadPreset::BookTaker { account_id, market_id, side } => {
+            let book = status.order_books.iter().find(|book| book.market_id == market_id)?;
+            let price = match side {
+                light_dex::exchange::order::Side::Buy => book.asks.first()?.price,
+                light_dex::exchange::order::Side::Sell => book.bids.first()?.price,
+            };
+            Transaction::PlaceOrder { account_id, market_id,
+                order_type: light_dex::exchange::order::OrderType::IOC,
+                side, price, quantity: 1, nonce }
+        }
+        LoadPreset::RoundRobinTransfers {
+            first_account,
+            account_count,
+            asset,
+            amount,
+        } => {
+            let to = first_account + (account_id - first_account + 1) % account_count;
+            Transaction::Transfer {
+                from: account_id,
+                to,
+                asset,
+                amount,
+                nonce,
+            }
+        }
+        LoadPreset::RandomTransfers {
+            first_account,
+            account_count,
+            asset,
+            amount,
+        } => {
+            let offset = rand::rng().random_range(1..account_count);
+            let to = first_account + (account_id - first_account + offset) % account_count;
+            Transaction::Transfer {
+                from: account_id,
+                to,
+                asset,
+                amount,
+                nonce,
+            }
+        }
+    };
+    let digest = transaction
+        .to_digest()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    load.pending.insert(
+        account_id,
+        PendingLoadTransaction {
+            transaction: transaction.clone(),
+            digest,
+            last_sent: Instant::now(),
+        },
+    );
+    Some(transaction)
+}
+
+fn spawn_binance_feed(shared: Shared, id: u64) {
+    thread::spawn(move || {
+        loop {
+            let active = shared.lock().unwrap().market_maker.as_ref().is_some_and(|mm| mm.id == id && mm.active);
+            if !active { break; }
+            match tungstenite::connect(STREAM_URL) {
+                Ok((mut socket, _)) => {
+                    use tungstenite::stream::MaybeTlsStream;
+                    let timeout = Some(Duration::from_secs(2));
+                    match socket.get_mut() {
+                        MaybeTlsStream::Plain(stream) => { let _ = stream.set_read_timeout(timeout); }
+                        MaybeTlsStream::NativeTls(stream) => { let _ = stream.get_mut().set_read_timeout(timeout); }
+                        _ => {}
+                    }
+                    loop {
+                        if !shared.lock().unwrap().market_maker.as_ref().is_some_and(|mm| mm.id == id && mm.active) { return; }
+                        match socket.read() {
+                            Ok(tungstenite::Message::Text(text)) => {
+                                if let Ok(depth) = serde_json::from_str::<PartialDepth>(&text) {
+                                    let mut state = shared.lock().unwrap();
+                                    if let Some(mm) = state.market_maker.as_mut().filter(|mm| mm.id == id) {
+                                        mm.feed_at = Some(Instant::now());
+                                        if mm.latest_depth.as_ref().is_none_or(|old| depth.last_update_id >= old.last_update_id) {
+                                            mm.latest_depth = Some(depth);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(tungstenite::Message::Ping(_)) => { let _ = socket.flush(); }
+                            Ok(tungstenite::Message::Close(_)) => break,
+                            Ok(_) => {},
+                            Err(tungstenite::Error::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+                                || error.kind() == io::ErrorKind::TimedOut => {},
+                            Err(error) => {
+                                report_feed_error(&shared, id, format!("Binance depth connection lost: {error}"));
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => report_feed_error(&shared, id, format!("Binance depth connection failed: {error}")),
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
+fn report_feed_error(shared: &Shared, id: u64, message: String) {
+    let mut state = shared.lock().unwrap();
+    if let Some(mm) = state.market_maker.as_mut().filter(|mm| mm.id == id) {
+        mm.last_error = Some(message.clone());
+    }
+    state.log(message);
+}
+
+fn spawn_market_maker_loop(shared: Shared, id: u64) {
+    thread::spawn(move || {
+        loop {
+            if !market_maker_step(&shared, id) { break; }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+}
+
+fn market_maker_step(shared: &Shared, id: u64) -> bool {
+    let dispatch = {
+        let mut state = shared.lock().unwrap();
+        if !state.running { return false; }
+        let Some(status) = best_status(&state).cloned() else { return true; };
+        let auth_key = state.auth_key;
+        let Some(mm) = state.market_maker.as_mut().filter(|mm| mm.id == id) else { return false; };
+        if !mm.active && !mm.stopping { return false; }
+        let Some(nonce) = status.account_nonces.iter().find(|account| account.account_id == mm.config.account_id).map(|account| account.nonce) else { return true; };
+        let now = Instant::now();
+        for pending in &mm.pending {
+            if let Some(outcome) = status.recent_transaction_outcomes.iter().find(|outcome| outcome.digest == pending.digest) {
+                if !outcome.success {
+                    mm.last_error = Some(format!("Quote transaction failed at nonce {}: {}. Check outstanding quotes before restarting.", pending.transaction.nonce(), outcome.error.as_deref().unwrap_or("unknown error")));
+                    mm.active = false;
+                    mm.stopping = false;
+                    mm.pending.clear();
+                    return false;
+                }
+            }
+        }
+        while mm.pending.front().is_some_and(|pending| pending.transaction.nonce() < nonce) {
+            mm.pending.pop_front();
+        }
+        let mut transactions = Vec::new();
+        for pending in &mut mm.pending {
+            if now.duration_since(pending.last_sent) >= Duration::from_secs(3) {
+                pending.last_sent = now;
+                transactions.push(pending.transaction.clone());
+            }
+        }
+        if mm.active {
+            let max_age = Duration::from_millis(mm.config.refresh_ms.saturating_mul(3).max(3_000));
+            if mm.feed_at.is_some_and(|at| now.duration_since(at) <= max_age) {
+                if mm.last_applied.is_none_or(|at| now.duration_since(at) >= Duration::from_millis(mm.config.refresh_ms)) {
+                    if let Some(depth) = &mm.latest_depth { mm.desired = desired_book(depth, mm.config.levels); }
+                    mm.last_applied = Some(now);
+                    mm.last_error = None;
+                }
+            } else {
+                mm.desired = DesiredBook::default();
+                if mm.feed_at.is_some() { mm.last_error = Some("Binance depth feed is stale; quotes are being cancelled".into()); }
+            }
+        } else {
+            mm.desired = DesiredBook::default();
+        }
+        let pending_actions = mm.pending.iter().map(|pending| pending.action).collect::<Vec<_>>();
+        let available = 20usize.saturating_sub(mm.pending.len());
+        let actions = plan_actions(mm.config.account_id, &status.open_orders, &mm.desired, mm.active, &pending_actions);
+        let next_nonce = mm.pending.back().map_or(nonce, |pending| pending.transaction.nonce().saturating_add(1)).max(nonce);
+        for (index, action) in actions.into_iter().take(available).enumerate() {
+            let tx_nonce = next_nonce + index as u64;
+            let tx = match action {
+                QuoteAction::Cancel { order_id } => Transaction::CancelOrder {
+                    account_id: mm.config.account_id, market_id: 0, order_id, nonce: tx_nonce,
+                },
+                QuoteAction::Place { side, price } => Transaction::PlaceOrder {
+                    account_id: mm.config.account_id, market_id: 0,
+                    order_type: light_dex::exchange::order::OrderType::LO,
+                    side, price, quantity: 1, nonce: tx_nonce,
+                },
+            };
+            mm.pending.push_back(PendingQuote {
+                action, digest: hex_encode(&tx.to_digest()), transaction: tx.clone(), last_sent: now,
+            });
+            transactions.push(tx);
+        }
+        if mm.stopping && mm.pending.is_empty() && transactions.is_empty() &&
+            !status.open_orders.iter().any(|order| order.account_id == mm.config.account_id && order.market_id == 0) {
+            mm.stopping = false;
+            state.log("Market maker stopped; all visible quotes cleared");
+            return false;
+        }
+        (transactions, mm.config.target.clone(), auth_key)
+    };
+    let (transactions, target, auth_key) = dispatch;
+    for tx in transactions {
+        let target_address = { resolve_target(&shared.lock().unwrap(), &target) };
+        let result = match target_address {
+            Some((_, address)) => send_message(address, &Message::Transaction(tx), Duration::from_millis(500), &auth_key),
+            None => Err(io::Error::new(io::ErrorKind::NotConnected, "no available target node")),
+        };
+        let mut state = shared.lock().unwrap();
+        if state.market_maker.as_ref().is_some_and(|mm| mm.id == id) {
+            match result {
+                Ok(()) => {
+                    state.submitted += 1;
+                    state.submit_times.push_back(Instant::now());
+                }
+                Err(error) => {
+                    if let Some(mm) = state.market_maker.as_mut() {
+                        mm.last_error = Some(format!("Quote submission failed; retrying: {error}"));
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn snapshot(shared: &Shared) -> ControlSnapshot {
+    let mut state = shared.lock().unwrap();
+    let now = Instant::now();
+    for node in state.nodes.values_mut() {
+        if matches!(node.child.try_wait(), Ok(Some(_))) {
+            node.state = "dead".into();
+        }
+    }
+    while state
+        .submit_times
+        .front()
+        .is_some_and(|time| now.duration_since(*time) > Duration::from_secs(5))
+    {
+        state.submit_times.pop_front();
+    }
+    let mut tx_rates = Vec::new();
+    let mut block_rates = Vec::new();
+    let mut latencies = Vec::new();
+    let mut heights = Vec::new();
+    let mut views = BTreeSet::new();
+    let mut primaries = BTreeSet::new();
+    let mut tips = HashSet::new();
+    let mut responsive = 0;
+    for node in state.nodes.values() {
+        if node.state != "ok" {
+            continue;
+        }
+        let Some(status) = &node.status else { continue };
+        responsive += 1;
+        tx_rates.push(node.tx_rate);
+        block_rates.push(node.block_rate);
+        if status.average_commit_latency_ms > 0.0 {
+            latencies.push(status.average_commit_latency_ms);
+        }
+        heights.push(status.chain_height);
+        views.insert(status.current_view);
+        primaries.insert(status.current_primary);
+        tips.insert((
+            status.chain_height,
+            status
+                .recent_blocks
+                .first()
+                .map(|b| b.digest.clone())
+                .unwrap_or_default(),
+        ));
+    }
+    let alive = state
+        .nodes
+        .values()
+        .filter(|node| node.state != "dead")
+        .count();
+    let nodes = state
+        .nodes
+        .iter()
+        .map(|(id, node)| NodeRuntimeSnapshot {
+            node_id: *id,
+            pid: node.child.id(),
+            state: node.state.clone(),
+            address: node.address.map(|a| a.to_string()),
+            tx_rate: node.tx_rate,
+            block_rate: node.block_rate,
+            status: node.status.clone(),
+        })
+        .collect();
+    let market_maker = match state.market_maker.as_ref() {
+        Some(mm) => MarketMakerSnapshot {
+            running: mm.active, stopping: mm.stopping,
+            account_id: Some(mm.config.account_id), refresh_ms: Some(mm.config.refresh_ms),
+            last_update_id: mm.latest_depth.as_ref().map(|depth| depth.last_update_id),
+            feed_age_ms: mm.feed_at.map(|at| now.duration_since(at).as_millis().min(u64::MAX as u128) as u64),
+            desired_bids: mm.desired.bids.clone(), desired_asks: mm.desired.asks.clone(),
+            own_open_orders: best_status(&state).map_or(0, |status| status.open_orders.iter()
+                .filter(|order| order.account_id == mm.config.account_id && order.market_id == 0).count()),
+            pending: !mm.pending.is_empty(), last_error: mm.last_error.clone(),
+        },
+        None => MarketMakerSnapshot {
+            running: false, stopping: false, account_id: None, refresh_ms: None,
+            last_update_id: None, feed_age_ms: None,
+            desired_bids: vec![], desired_asks: vec![], own_open_orders: 0,
+            pending: false, last_error: None,
+        },
+    };
+    ControlSnapshot {
+        running: state.running,
+        launching: state.launching,
+        stopping: state.stopping,
+        nodes,
+        metrics: MetricsSnapshot {
+            alive_nodes: alive,
+            responsive_nodes: responsive,
+            submitted: state.submitted,
+            submit_tps: state.submit_times.len() as f64 / 5.0,
+            commit_tps: median(tx_rates),
+            blocks_per_second: median(block_rates),
+            commit_latency_ms: median(latencies),
+            height_min: heights.iter().min().copied(),
+            height_max: heights.iter().max().copied(),
+            views: views.into_iter().collect(),
+            primaries: primaries.into_iter().collect(),
+            chain_consistency: if responsive == 0 {
+                "unknown"
+            } else if tips.len() == 1 {
+                "consistent"
+            } else {
+                "split"
+            }
+            .into(),
+        },
+        load: LoadSnapshot {
+            running: state.load.is_some(),
+            kind: state.load.as_ref().map(|load| match load.config.preset {
+                LoadPreset::RandomTransfers { .. } => "random transfers",
+                LoadPreset::RoundRobinTransfers { .. } => "rotating transfers",
+                LoadPreset::BookTaker { .. } => "book taker",
+            }.to_string()),
+            tps: state.load.as_ref().map(|load| load.config.tps),
+            pending_accounts: state.load.as_ref().map_or(0, |load| load.pending.len()),
+            failed_accounts: state.load.as_ref().map_or_else(Vec::new, |load| {
+                let mut accounts = load.failed.keys().copied().collect::<Vec<_>>();
+                accounts.sort_unstable();
+                accounts
+            }),
+        },
+        market_maker,
+        logs: state.logs.iter().cloned().collect(),
+        active_data_dir: state.active_data_dir.clone(),
+    }
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    }
+}
+
+fn stop_cluster(shared: Shared, force: bool) {
+    let (addresses, auth_key) = {
+        let mut state = shared.lock().unwrap();
+        if force && state.stopping { return; }
+        if !state.stopping {
+            state.stopping = true;
+            state.run_id += 1;
+        }
+        state.running = false;
+        state.launching = false;
+        state.load = None;
+        state.market_maker = None;
+        let addresses = state
+            .nodes
+            .values()
+            .filter_map(|node| node.address)
+            .collect::<Vec<_>>();
+        (addresses, state.auth_key)
+    };
+    if !force {
+        for address in addresses {
+            let _ = send_message(
+                address,
+                &Message::Control(ControlMessage::Shutdown),
+                Duration::from_millis(200),
+                &auth_key,
+            );
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    let mut state = shared.lock().unwrap();
+    for node in state.nodes.values_mut() {
+        if !matches!(node.child.try_wait(), Ok(Some(_))) {
+            let _ = node.child.kill();
+            let _ = node.child.wait();
+        }
+        node.state = "dead".into();
+    }
+    state.stopping = false;
+    state.log("Simulation stopped");
+}
+
+fn resolve_target(state: &ControllerInner, target: &TargetNode) -> Option<(NodeId, SocketAddr)> {
+    let id = resolve_target_id(state, target)?;
+    Some((id, state.nodes.get(&id)?.address?))
+}
+fn resolve_target_id(state: &ControllerInner, target: &TargetNode) -> Option<NodeId> {
+    let alive = state
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.state != "dead" && node.address.is_some())
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    if alive.is_empty() {
+        return None;
+    }
+    match target {
+        TargetNode::Node { node_id } => alive.contains(node_id).then_some(*node_id),
+        TargetNode::Random => Some(alive[rand::rng().random_range(0..alive.len())]),
+        TargetNode::Primary => {
+            let mut votes = HashMap::new();
+            for node in state.nodes.values() {
+                if node.state == "ok" {
+                    if let Some(status) = &node.status {
+                        *votes.entry(status.current_primary).or_insert(0usize) += 1;
+                    }
+                }
+            }
+            votes
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(id, _)| id)
+                .filter(|id| alive.contains(id))
+        }
+    }
+}
+
+fn send_message(address: SocketAddr, message: &Message, timeout: Duration, auth_key: &[u8; 32]) -> io::Result<()> {
+    let mut stream = TcpStream::connect_timeout(&address, timeout)?;
+    stream.set_write_timeout(Some(timeout))?;
+    let data = sign_line(message, auth_key)?;
+    stream.write_all(data.as_bytes())
+}
+fn request_status(address: SocketAddr, auth_key: &[u8; 32]) -> io::Result<NodeStatus> {
+    let timeout = Duration::from_millis(400);
+    let mut stream = TcpStream::connect_timeout(&address, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let request = sign_line(&Message::Control(ControlMessage::Status), auth_key)?;
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response)?;
+    verify_line(response.trim(), auth_key)
+}
+fn read_line(stream: &TcpStream) -> io::Result<String> {
+    let mut line = String::new();
+    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    Ok(line)
+}
+fn spawn_output_reader<R: Read + Send + 'static>(node_id: NodeId, reader: R, shared: Shared) {
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => log(&shared, format!("[node {node_id}] {line}")),
+                Err(_) => break,
+            }
+        }
+    });
+}
+fn log(shared: &Shared, message: impl Into<String>) {
+    shared.lock().unwrap().log(message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use light_dex::node::{AccountNonce, TransactionOutcome};
+
+    fn status() -> NodeStatus {
+        NodeStatus {
+            node_id: 0,
+            pid: 0,
+            network_ready: true,
+            peer_count: 0,
+            expected_peers: 0,
+            chain_height: 1,
+            latest_sequence: Some(0),
+            mempool_size: 0,
+            seen_transactions: 0,
+            current_view: 0,
+            current_primary: 0,
+            next_sequence: 1,
+            active_proposal: false,
+            consensus_started: true,
+            transactions_received: 0,
+            blocks_committed: 1,
+            transactions_committed: 0,
+            average_commit_latency_ms: 0.0,
+            last_commit_latency_ms: None,
+            recent_blocks: vec![],
+            account_nonces: vec![
+                AccountNonce {
+                    account_id: 0,
+                    nonce: 0,
+                },
+                AccountNonce {
+                    account_id: 1,
+                    nonce: 0,
+                },
+            ],
+            recent_transaction_outcomes: vec![],
+            order_books: vec![],
+            open_orders: vec![],
+        }
+    }
+
+    #[test]
+    fn failed_sender_keeps_nonce_and_other_sender_can_continue() {
+        let mut state = ControllerInner::default();
+        state.load = Some(LoadRuntime {
+            id: 1,
+            config: LoadConfig {
+                preset: LoadPreset::RoundRobinTransfers {
+                    first_account: 0,
+                    account_count: 2,
+                    asset: 0,
+                    amount: 10,
+                },
+                target: TargetNode::Random,
+                tps: 5.0,
+            },
+            cursor: 0,
+            pending: HashMap::new(),
+            failed: HashMap::new(),
+        });
+        let first = next_load_transaction(state.load.as_mut().unwrap(), &status()).unwrap();
+        assert_eq!(first.account_id(), 0);
+        assert_eq!(first.nonce(), 0);
+        let digest = state.load.as_ref().unwrap().pending[&0].digest.clone();
+        let mut after_failure = status();
+        after_failure
+            .recent_transaction_outcomes
+            .push(TransactionOutcome {
+                digest,
+                account_id: 0,
+                nonce: 0,
+                success: false,
+                error: Some("InsufficientBalance".into()),
+            });
+        reconcile_load(&mut state, &after_failure);
+        assert_eq!(state.load.as_ref().unwrap().failed[&0], 0);
+        let second = next_load_transaction(state.load.as_mut().unwrap(), &after_failure).unwrap();
+        assert_eq!(second.account_id(), 1);
+        assert_eq!(second.nonce(), 0);
+    }
+
+    #[test]
+    fn taker_targets_best_opposite_price() {
+        let mut status = status();
+        status.order_books.push(light_dex::exchange::orderbook::OrderBookSnapshot {
+            market_id: 0,
+            bids: vec![light_dex::exchange::orderbook::BookLevel { price: 98, quantity: 2, order_count: 1 }],
+            asks: vec![light_dex::exchange::orderbook::BookLevel { price: 102, quantity: 2, order_count: 1 }],
+        });
+        let mut load = LoadRuntime {
+            id: 1,
+            config: LoadConfig { preset: LoadPreset::BookTaker {
+                account_id: 1, market_id: 0, side: light_dex::exchange::order::Side::Buy,
+            }, target: TargetNode::Random, tps: 1.0 },
+            cursor: 0, pending: HashMap::new(), failed: HashMap::new(),
+        };
+        assert!(matches!(next_load_transaction(&mut load, &status), Some(Transaction::PlaceOrder {
+            account_id: 1, market_id: 0, price: 102, quantity: 1, nonce: 0,
+            order_type: light_dex::exchange::order::OrderType::IOC, ..
+        })));
+    }
+
+    #[test]
+    #[ignore = "spawns four node processes and requires a built light_dex binary"]
+    fn cluster_commits_order_book_and_recovers_it() {
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let base_data = std::env::temp_dir().join(format!("light-dex-smoke-{}", rand::random::<u64>()));
+        let mut config = LaunchConfig {
+            project_dir: project.display().to_string(),
+            binary_path: "target/debug/light_dex".into(),
+            data_dir: base_data.display().to_string(),
+            recover_existing: false,
+            node_count: 4,
+            block_time_ms: 100,
+            timeout_ms: 800,
+            poll_ms: 100,
+            build_before_launch: false,
+        };
+        let controller = ControllerState::default();
+        controller.launch(config.clone()).unwrap();
+        let ready = wait_for(&controller, |snapshot| snapshot.running && snapshot.metrics.responsive_nodes == 4 && snapshot.metrics.height_min == Some(1));
+        let data_dir = ready.active_data_dir.clone().unwrap();
+        controller.submit_transaction(Transaction::PlaceOrder {
+            account_id: 0, market_id: 0, order_type: light_dex::exchange::order::OrderType::LO,
+            side: light_dex::exchange::order::Side::Sell, price: 100_000, quantity: 1, nonce: 0,
+        }, TargetNode::Random).unwrap();
+        let committed = wait_for(&controller, |snapshot| snapshot.metrics.height_min.unwrap_or_default() >= 2
+            && snapshot.nodes.iter().filter_map(|node| node.status.as_ref())
+                .any(|status| status.order_books.iter().any(|book| book.market_id == 0 && book.asks.first().is_some_and(|level| level.price == 100_000 && level.quantity == 1))));
+        assert_eq!(committed.metrics.chain_consistency, "consistent");
+        controller.stop_all();
+        wait_for(&controller, |snapshot| !snapshot.running && !snapshot.launching && !snapshot.stopping && snapshot.metrics.alive_nodes == 0);
+        config.data_dir = data_dir;
+        config.recover_existing = true;
+        controller.launch(config).unwrap();
+        let recovered = wait_for(&controller, |snapshot| snapshot.running && snapshot.metrics.responsive_nodes == 4
+            && snapshot.metrics.height_min.unwrap_or_default() >= 2
+            && snapshot.nodes.iter().filter_map(|node| node.status.as_ref())
+                .all(|status| status.order_books.iter().any(|book| book.asks.first().is_some_and(|level| level.price == 100_000))));
+        controller.kill_node(TargetNode::Node { node_id: 0 }).unwrap();
+        controller.submit_transaction(Transaction::Transfer {
+            from: 1, to: 2, asset: 0, amount: 5, nonce: 0,
+        }, TargetNode::Node { node_id: 2 }).unwrap();
+        let after_failover = wait_for(&controller, |snapshot| snapshot.metrics.responsive_nodes == 3
+            && snapshot.metrics.views.contains(&1)
+            && snapshot.metrics.height_min.unwrap_or_default() >= 3
+            && snapshot.nodes.iter().filter(|node| node.state == "ok").filter_map(|node| node.status.as_ref())
+                .all(|status| status.account_nonces.iter().any(|account| account.account_id == 1 && account.nonce == 1)));
+        controller.stop_all();
+        wait_for(&controller, |snapshot| !snapshot.running && !snapshot.launching && !snapshot.stopping && snapshot.metrics.alive_nodes == 0);
+        assert_eq!(recovered.metrics.chain_consistency, "consistent");
+        assert_eq!(after_failover.metrics.chain_consistency, "consistent");
+        std::fs::remove_dir_all(base_data).unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns node processes and requires a built light_dex binary"]
+    fn five_tps_across_accounts_can_batch_transactions() {
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let base_data = std::env::temp_dir().join(format!("light-dex-batch-{}", rand::random::<u64>()));
+        let controller = ControllerState::default();
+        controller.launch(LaunchConfig {
+            project_dir: project.display().to_string(), binary_path: "target/debug/light_dex".into(),
+            data_dir: base_data.display().to_string(), recover_existing: false,
+            node_count: 4, block_time_ms: 500, timeout_ms: 1500, poll_ms: 100,
+            build_before_launch: false,
+        }).unwrap();
+        wait_for(&controller, |snapshot| snapshot.running && snapshot.metrics.responsive_nodes == 4 && snapshot.metrics.height_min == Some(1));
+        controller.start_load(LoadConfig {
+            preset: LoadPreset::RoundRobinTransfers { first_account: 0, account_count: 10, asset: 0, amount: 1 },
+            target: TargetNode::Node { node_id: 0 }, tps: 5.0,
+        }).unwrap();
+        let observed = wait_for(&controller, |snapshot| snapshot.nodes.iter().filter(|node| node.state == "ok")
+            .filter_map(|node| node.status.as_ref()).any(|status| status.recent_blocks.iter().any(|block| block.transaction_count >= 2)));
+        controller.stop_all();
+        wait_for(&controller, |snapshot| !snapshot.running && !snapshot.launching && !snapshot.stopping && snapshot.metrics.alive_nodes == 0);
+        assert!(observed.metrics.submitted >= 2);
+        std::fs::remove_dir_all(base_data).unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns seven node processes and requires a built light_dex binary"]
+    fn seven_nodes_batch_quotes_and_commit_after_primary_kill() {
+        use light_dex::exchange::order::{OrderType, Side};
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let base_data = std::env::temp_dir().join(format!("light-dex-failover-{}", rand::random::<u64>()));
+        let controller = ControllerState::default();
+        controller.launch(LaunchConfig {
+            project_dir: project.display().to_string(), binary_path: "target/debug/light_dex".into(),
+            data_dir: base_data.display().to_string(), recover_existing: false,
+            node_count: 7, block_time_ms: 500, timeout_ms: 1200, poll_ms: 100,
+            build_before_launch: false,
+        }).unwrap();
+        wait_for(&controller, |s| s.running && s.metrics.responsive_nodes == 7 && s.metrics.height_min == Some(1));
+        let (primary_address, auth_key) = {
+            let state = controller.inner.lock().unwrap();
+            (state.nodes[&0].address.unwrap(), state.auth_key)
+        };
+        for (nonce, side, price) in [(0, Side::Buy, 100_000), (1, Side::Sell, 100_010),
+            (2, Side::Buy, 99_999), (3, Side::Sell, 100_011)] {
+            send_message(primary_address, &Message::Transaction(Transaction::PlaceOrder {
+                account_id: 90, market_id: 0, order_type: OrderType::LO, side,
+                price, quantity: 1, nonce,
+            }), Duration::from_millis(500), &auth_key).unwrap();
+        }
+        let batched = wait_for(&controller, |s| s.nodes.iter().filter_map(|n| n.status.as_ref()).any(|status|
+            status.recent_blocks.iter().any(|b| b.transaction_count >= 2)) &&
+            s.nodes.iter().filter_map(|n| n.status.as_ref()).any(|status|
+                status.account_nonces.iter().any(|a| a.account_id == 90 && a.nonce == 4)));
+        assert!(batched.metrics.height_min.unwrap_or_default() >= 2);
+        controller.kill_node(TargetNode::Node { node_id: 0 }).unwrap();
+        wait_for(&controller, |s| s.metrics.responsive_nodes == 6 &&
+            s.nodes.iter().filter(|n| n.state == "ok").filter_map(|n| n.status.as_ref())
+                .all(|status| status.current_view >= 1 && status.current_primary == 1));
+        // Stale traffic must not occupy the successor's mempool or prevent
+        // the next valid nonce from being proposed.
+        for _ in 0..4 {
+            let follower_address = controller.inner.lock().unwrap().nodes[&2].address.unwrap();
+            send_message(follower_address, &Message::Transaction(Transaction::PlaceOrder {
+                account_id: 90, market_id: 0, order_type: OrderType::LO,
+                side: Side::Buy, price: 100_000, quantity: 1, nonce: 0,
+            }), Duration::from_millis(500), &auth_key).unwrap();
+        }
+        controller.submit_transaction(Transaction::PlaceOrder {
+            account_id: 90, market_id: 0, order_type: OrderType::LO,
+            side: Side::Buy, price: 99_998, quantity: 1, nonce: 4,
+        }, TargetNode::Node { node_id: 2 }).unwrap();
+        let recovered = wait_for(&controller, |s| s.metrics.responsive_nodes == 6 &&
+            s.nodes.iter().filter(|n| n.state == "ok").filter_map(|n| n.status.as_ref()).all(|status|
+                status.current_view >= 1 && status.account_nonces.iter().any(|a| a.account_id == 90 && a.nonce == 5)));
+        assert_eq!(recovered.metrics.chain_consistency, "consistent");
+        controller.stop_all();
+        wait_for(&controller, |s| !s.running && !s.launching && !s.stopping && s.metrics.alive_nodes == 0);
+        std::fs::remove_dir_all(base_data).unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns four node processes and requires a built light_dex binary"]
+    fn market_maker_sends_both_sides_in_one_block() {
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let base_data = std::env::temp_dir().join(format!("light-dex-maker-batch-{}", rand::random::<u64>()));
+        let controller = ControllerState::default();
+        controller.launch(LaunchConfig {
+            project_dir: project.display().to_string(), binary_path: "target/debug/light_dex".into(),
+            data_dir: base_data.display().to_string(), recover_existing: false,
+            node_count: 4, block_time_ms: 500, timeout_ms: 1500, poll_ms: 100,
+            build_before_launch: false,
+        }).unwrap();
+        wait_for(&controller, |s| s.running && s.metrics.responsive_nodes == 4 && s.metrics.height_min == Some(1));
+        let id = 1;
+        {
+            let mut state = controller.inner.lock().unwrap();
+            state.market_maker = Some(MarketMakerRuntime {
+                id, config: MarketMakerConfig { account_id: 90, levels: 2, refresh_ms: 1_000,
+                    target: TargetNode::Node { node_id: 0 } },
+                active: true, stopping: false, latest_depth: Some(PartialDepth {
+                    last_update_id: 1,
+                    bids: vec![["100000".into(), "1".into()], ["99999".into(), "1".into()]],
+                    asks: vec![["100010".into(), "1".into()], ["100011".into(), "1".into()]],
+                }), feed_at: Some(Instant::now()), desired: DesiredBook::default(),
+                last_applied: None, pending: VecDeque::new(), last_error: None,
+            });
+        }
+        assert!(market_maker_step(&controller.inner, id));
+        let committed = wait_for(&controller, |s| s.nodes.iter().filter_map(|n| n.status.as_ref()).any(|status|
+            status.recent_blocks.iter().any(|b| b.transaction_count >= 4) &&
+            status.account_nonces.iter().any(|a| a.account_id == 90 && a.nonce == 4)));
+        assert_eq!(committed.market_maker.own_open_orders, 4);
+        controller.stop_all();
+        wait_for(&controller, |s| !s.running && !s.launching && !s.stopping && s.metrics.alive_nodes == 0);
+        std::fs::remove_dir_all(base_data).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires live Binance feed and spawns node processes"]
+    fn market_maker_quotes_live_depth_and_cancels_on_stop() {
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let base_data = std::env::temp_dir().join(format!("light-dex-maker-{}", rand::random::<u64>()));
+        let controller = ControllerState::default();
+        controller.launch(LaunchConfig {
+            project_dir: project.display().to_string(), binary_path: "target/debug/light_dex".into(),
+            data_dir: base_data.display().to_string(), recover_existing: false,
+            node_count: 4, block_time_ms: 100, timeout_ms: 1500, poll_ms: 100,
+            build_before_launch: false,
+        }).unwrap();
+        wait_for(&controller, |snapshot| snapshot.running && snapshot.metrics.responsive_nodes == 4 && snapshot.metrics.height_min == Some(1));
+        controller.start_market_maker(MarketMakerConfig {
+            account_id: 90, levels: 1, refresh_ms: 500, target: TargetNode::Node { node_id: 0 },
+        }).unwrap();
+        let quoted = wait_for(&controller, |snapshot| snapshot.market_maker.last_update_id.is_some()
+            && snapshot.market_maker.own_open_orders >= 2);
+        assert!(quoted.market_maker.desired_bids.len() == 1 && quoted.market_maker.desired_asks.len() == 1);
+        controller.start_market_maker(MarketMakerConfig {
+            account_id: 90, levels: 2, refresh_ms: 750, target: TargetNode::Node { node_id: 0 },
+        }).unwrap();
+        wait_for(&controller, |snapshot| snapshot.market_maker.desired_bids.len() == 2
+            && snapshot.market_maker.desired_asks.len() == 2 && snapshot.market_maker.own_open_orders >= 4);
+        controller.start_load(LoadConfig {
+            preset: LoadPreset::BookTaker { account_id: 80, market_id: 0,
+                side: light_dex::exchange::order::Side::Buy },
+            target: TargetNode::Node { node_id: 0 }, tps: 1.0,
+        }).unwrap();
+        wait_for(&controller, |snapshot| snapshot.nodes.iter().filter(|node| node.state == "ok")
+            .filter_map(|node| node.status.as_ref()).any(|status| status.account_nonces.iter()
+                .any(|account| account.account_id == 80 && account.nonce > 0)));
+        controller.stop_load();
+        controller.stop_market_maker();
+        let cleared = wait_for(&controller, |snapshot| !snapshot.market_maker.running
+            && !snapshot.market_maker.stopping && snapshot.market_maker.own_open_orders == 0);
+        controller.stop_all();
+        wait_for(&controller, |snapshot| !snapshot.running && !snapshot.launching && !snapshot.stopping && snapshot.metrics.alive_nodes == 0);
+        assert!(cleared.metrics.height_min.unwrap_or_default() >= 3);
+        std::fs::remove_dir_all(base_data).unwrap();
+    }
+
+    fn wait_for(controller: &ControllerState, predicate: impl Fn(&ControlSnapshot) -> bool) -> ControlSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            let snapshot = controller.snapshot();
+            if predicate(&snapshot) { return snapshot; }
+            assert!(Instant::now() < deadline, "timed out waiting for cluster; relevant logs: {:?}; statuses: {:?}", snapshot.logs.iter().filter(|line| line.contains("Submitted") || line.contains("timeout view") || line.contains("primary changed") || line.contains("committed seq") || line.contains("failed forwarding") || line.contains("rejected proposal")).collect::<Vec<_>>(), snapshot.nodes.iter().map(|node| (node.node_id, node.state.clone(), node.status.as_ref().map(|status| (status.chain_height, status.current_view, status.account_nonces.iter().find(|account| account.account_id == 1).map(|account| account.nonce), status.recent_transaction_outcomes.clone())))).collect::<Vec<_>>());
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}

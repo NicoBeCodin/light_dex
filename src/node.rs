@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpStream},
     sync::mpsc,
@@ -8,12 +8,14 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 use crate::{
     blockchain::{BlockchainState, Digest, Transaction},
-    consensus::pbft::{Consensus, ConsensusAction, ConsensusEvent},
-    message::Message,
+    consensus::pbft::{Consensus, ConsensusAction, ConsensusEvent, ConsensusMessage, PbftMessage},
+    message::{Message, sign_line},
     network::{Network, NetworkEvent},
+    exchange::orderbook::OrderBookSnapshot,
 };
 
 pub type NodeId = u64;
@@ -33,14 +35,29 @@ struct NodeMetrics {
     transaction_received_at: HashMap<Digest, Instant>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, TS)]
 pub struct BlockSummary {
     pub sequence: u64,
     pub transaction_count: usize,
     pub digest: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, TS)]
+pub struct AccountNonce {
+    pub account_id: u64,
+    pub nonce: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, TS)]
+pub struct TransactionOutcome {
+    pub digest: String,
+    pub account_id: u64,
+    pub nonce: u64,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, TS)]
 pub struct NodeStatus {
     pub node_id: NodeId,
     pub pid: u32,
@@ -70,6 +87,20 @@ pub struct NodeStatus {
     pub last_commit_latency_ms: Option<u128>,
 
     pub recent_blocks: Vec<BlockSummary>,
+    pub account_nonces: Vec<AccountNonce>,
+    pub recent_transaction_outcomes: Vec<TransactionOutcome>,
+    pub order_books: Vec<OrderBookSnapshot>,
+    pub open_orders: Vec<OpenOrderSnapshot>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, TS)]
+pub struct OpenOrderSnapshot {
+    pub order_id: u64,
+    pub account_id: u64,
+    pub market_id: u64,
+    pub side: crate::exchange::order::Side,
+    pub price: u64,
+    pub remaining_quantity: u64,
 }
 
 #[derive(Debug)]
@@ -82,8 +113,10 @@ pub struct Node<C: Consensus> {
     consensus: C,
 
     block_time_ms: u64,
+    last_primary_probe: Instant,
 
     metrics: NodeMetrics,
+    recent_transaction_outcomes: VecDeque<TransactionOutcome>,
 }
 
 pub enum NodeEvent {
@@ -130,9 +163,10 @@ impl<C: Consensus> Node<C> {
         pid: u32,
         network: Network,
         state: BlockchainState,
-        consensus: C,
+        mut consensus: C,
         block_time_ms: u64,
     ) -> Result<Node<C>, std::io::Error> {
+        consensus.restore_from_height(state.blocks.len() as u64);
         Ok(Node {
             node_id,
             pid,
@@ -142,8 +176,10 @@ impl<C: Consensus> Node<C> {
             consensus,
 
             block_time_ms,
+            last_primary_probe: Instant::now(),
 
             metrics: NodeMetrics::default(),
+            recent_transaction_outcomes: VecDeque::new(),
         })
     }
 
@@ -240,34 +276,41 @@ impl<C: Consensus> Node<C> {
     ) -> Result<(), std::io::Error> {
         match action {
             ConsensusAction::Broadcast(message) => {
-                let mut serialized = Message::Consensus(message.clone()).to_str()?;
-
-                serialized.push('\n');
+                let serialized = sign_line(&Message::Consensus(message.clone()), &self.network.auth_key)?;
 
                 self.network.broadcast(serialized.as_bytes())?;
             }
 
             ConsensusAction::Send { peer, message } => {
-                let mut serialized = Message::Consensus(message.clone()).to_str()?;
-
-                serialized.push('\n');
+                let serialized = sign_line(&Message::Consensus(message.clone()), &self.network.auth_key)?;
 
                 self.network.send(peer, serialized.as_bytes())?;
             }
 
             ConsensusAction::Commit(proposal) => {
                 let block = proposal.get_block();
+                let outcomes = self.state.commit_block(&block).map_err(std::io::Error::other)?;
 
                 let mut latency_sum = 0u128;
                 let mut latency_samples = 0u64;
-
-                for tx in &block.transactions {
+                let mut successful = 0u64;
+                for (tx, result) in block.transactions.iter().zip(outcomes) {
                     if let Some(start) =
                         self.metrics.transaction_received_at.remove(&tx.to_digest())
                     {
-                        latency_sum += start.elapsed().as_millis();
-                        latency_samples += 1;
+                        if result.is_ok() {
+                            latency_sum += start.elapsed().as_millis();
+                            latency_samples += 1;
+                        }
                     }
+                    successful += u64::from(result.is_ok());
+                    self.recent_transaction_outcomes.push_back(TransactionOutcome {
+                        digest: tx.to_digest().iter().map(|byte| format!("{byte:02x}")).collect(),
+                        account_id: tx.account_id(),
+                        nonce: tx.nonce(),
+                        success: result.is_ok(),
+                        error: result.err().map(|error| format!("{error:?}")),
+                    });
                 }
 
                 if latency_samples > 0 {
@@ -280,8 +323,7 @@ impl<C: Consensus> Node<C> {
                 }
 
                 self.metrics.blocks_committed += 1;
-
-                self.metrics.transactions_committed += block.transactions.len() as u64;
+                self.metrics.transactions_committed += successful;
 
                 println!(
                     "Node {} committed seq {} txs={}",
@@ -290,7 +332,9 @@ impl<C: Consensus> Node<C> {
                     block.transactions.len()
                 );
 
-                self.state.commit_block(&block);
+                while self.recent_transaction_outcomes.len() > 512 {
+                    self.recent_transaction_outcomes.pop_front();
+                }
 
                 self.state.remove_included_txs_from_mempool(&block);
             }
@@ -413,8 +457,7 @@ impl<C: Consensus> Node<C> {
         primary: NodeId,
         transaction: Transaction,
     ) -> Result<(), std::io::Error> {
-        let mut serialized = Message::Transaction(transaction).to_str()?;
-        serialized.push('\n');
+        let serialized = sign_line(&Message::Transaction(transaction), &self.network.auth_key)?;
         self.network.send(&primary, serialized.as_bytes())
     }
 
@@ -483,6 +526,29 @@ impl<C: Consensus> Node<C> {
             last_commit_latency_ms: self.metrics.last_commit_latency_ms,
 
             recent_blocks,
+            account_nonces: self.state.exchange_state.accounts.values().map(|account| AccountNonce {
+                account_id: account.id,
+                nonce: account.nonce,
+            }).collect(),
+            recent_transaction_outcomes: self.recent_transaction_outcomes.iter().cloned().collect(),
+            order_books: {
+                let mut books = self.state.exchange_state.order_books.iter()
+                    .map(|(&market_id, book)| book.snapshot(market_id, 20)).collect::<Vec<_>>();
+                books.sort_by_key(|book| book.market_id);
+                books
+            },
+            open_orders: {
+                let mut orders = self.state.exchange_state.order_books.iter()
+                    .flat_map(|(&market_id, book)| book.bids.values().chain(book.asks.values())
+                        .flat_map(move |level| level.iter().map(move |order| OpenOrderSnapshot {
+                            order_id: order.id, account_id: order.account, market_id,
+                            side: order.side, price: order.price,
+                            remaining_quantity: order.remaining_quantity,
+                        })))
+                    .collect::<Vec<_>>();
+                orders.sort_by_key(|order| order.order_id);
+                orders
+            },
         }
     }
 
@@ -506,10 +572,7 @@ impl<C: Consensus> Node<C> {
             ControlEvent::Status { mut stream } => {
                 let status = self.status();
 
-                let mut serialized = serde_json::to_string(&status)
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-
-                serialized.push('\n');
+                let serialized = sign_line(&status, &self.network.auth_key)?;
 
                 stream.write_all(serialized.as_bytes())?;
 
@@ -528,11 +591,13 @@ impl<C: Consensus> Node<C> {
 
         let block_time_ms = self.block_time_ms;
 
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(block_time_ms));
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_millis(block_time_ms));
 
-            if block_tx.send(NodeEvent::ProduceBlock).is_err() {
-                break;
+                if block_tx.send(NodeEvent::ProduceBlock).is_err() {
+                    break;
+                }
             }
         });
 
@@ -548,59 +613,63 @@ impl<C: Consensus> Node<C> {
 
         let network_node_tx = node_tx.clone();
 
-        thread::spawn(move || loop {
-            let Ok(event) = network_rx.recv() else {
-                break;
-            };
+        thread::spawn(move || {
+            loop {
+                let Ok(event) = network_rx.recv() else {
+                    break;
+                };
 
-            match event {
-                NetworkEvent::Message { from, message } => {
-                    match message {
-                        Message::Consensus(message) => {
-                            let _ = network_node_tx.send(NodeEvent::Consensus(
-                                ConsensusEvent::Message { from, message },
-                            ));
+                match event {
+                    NetworkEvent::Message { from, message } => {
+                        match message {
+                            Message::Consensus(message) => {
+                                let _ = network_node_tx.send(NodeEvent::Consensus(
+                                    ConsensusEvent::Message { from, message },
+                                ));
+                            }
+
+                            // Peer forwarded a transaction.
+                            Message::Transaction(transaction) => {
+                                let _ =
+                                    network_node_tx.send(NodeEvent::NewTransaction(transaction));
+                            }
+
+                            Message::Control(_) => {}
+                        }
+                    }
+
+                    NetworkEvent::IncomingPeer { node_id, stream } => {
+                        let _ =
+                            network_node_tx.send(NodeEvent::Control(ControlEvent::PeerConnected {
+                                node_id,
+                                tcp_stream: stream,
+                            }));
+                    }
+
+                    NetworkEvent::PeerConnected { .. } => {}
+
+                    NetworkEvent::ClientTransaction(transaction) => {
+                        let _ = network_node_tx.send(NodeEvent::NewTransaction(transaction));
+                    }
+
+                    NetworkEvent::ClientControl { message, stream } => match message {
+                        ControlMessage::Pause { millis } => {
+                            let _ = network_node_tx
+                                .send(NodeEvent::Control(ControlEvent::Pause { millis }));
                         }
 
-                        // Peer forwarded a transaction.
-                        Message::Transaction(transaction) => {
-                            let _ = network_node_tx.send(NodeEvent::NewTransaction(transaction));
+                        ControlMessage::Status => {
+                            let _ = network_node_tx
+                                .send(NodeEvent::Control(ControlEvent::Status { stream }));
                         }
 
-                        Message::Control(_) => {}
-                    }
+                        ControlMessage::Shutdown => {
+                            let _ = network_node_tx.send(NodeEvent::Shutdown);
+                        }
+
+                        ControlMessage::Hello { .. } => {}
+                    },
                 }
-
-                NetworkEvent::IncomingPeer { node_id, stream } => {
-                    let _ = network_node_tx.send(NodeEvent::Control(ControlEvent::PeerConnected {
-                        node_id,
-                        tcp_stream: stream,
-                    }));
-                }
-
-                NetworkEvent::PeerConnected { .. } => {}
-
-                NetworkEvent::ClientTransaction(transaction) => {
-                    let _ = network_node_tx.send(NodeEvent::NewTransaction(transaction));
-                }
-
-                NetworkEvent::ClientControl { message, stream } => match message {
-                    ControlMessage::Pause { millis } => {
-                        let _ = network_node_tx
-                            .send(NodeEvent::Control(ControlEvent::Pause { millis }));
-                    }
-
-                    ControlMessage::Status => {
-                        let _ = network_node_tx
-                            .send(NodeEvent::Control(ControlEvent::Status { stream }));
-                    }
-
-                    ControlMessage::Shutdown => {
-                        let _ = network_node_tx.send(NodeEvent::Shutdown);
-                    }
-
-                    ControlMessage::Hello { .. } => {}
-                },
             }
         });
 
@@ -616,14 +685,48 @@ impl<C: Consensus> Node<C> {
 
             match event {
                 NodeEvent::Consensus(event) => {
+                    let peer_suspects_primary = matches!(
+                        &event,
+                        ConsensusEvent::Message {
+                            message: ConsensusMessage::Pbft(PbftMessage::ViewChange { new_view, .. }),
+                            ..
+                        } if *new_view == self.consensus.current_view() + 1
+                    );
+                    if let ConsensusEvent::Message {
+                        message: ConsensusMessage::Pbft(PbftMessage::PrePrepare { proposal, .. }),
+                        ..
+                    } = &event {
+                        if let Err(error) = self.state.validate_block(&proposal.block) {
+                            eprintln!("Node {} rejected proposal: {error}", self.node_id);
+                            continue;
+                        }
+                    }
                     let old_primary = self.consensus.current_primary();
-                    
+
                     let actions = self.consensus.on_event(event);
 
                     self.execute_consensus_actions(&actions, &node_tx)?;
+                    // A single failed forward starts a view change. Peers verify
+                    // that the current primary's listener is actually gone before
+                    // adding their own vote, so one transaction can recover from
+                    // a killed primary even after a quiet restart.
+                    if peer_suspects_primary {
+                        let primary = self.consensus.current_primary();
+                        let unreachable = self.network.peers_address.get(&primary).is_some_and(|address| {
+                            std::net::TcpStream::connect_timeout(address, Duration::from_millis(100)).is_err()
+                        });
+                        if unreachable {
+                            let actions = self.consensus.on_event(ConsensusEvent::Timeout {
+                                view: self.consensus.current_view(),
+                                sequence: self.consensus.next_sequence(),
+                            });
+                            self.execute_consensus_actions(&actions, &node_tx)?;
+                        }
+                    }
                     let new_primary = self.consensus.current_primary();
 
                     if new_primary != old_primary {
+                        self.last_primary_probe = Instant::now();
                         println!(
                             "Node {} primary changed {} -> {}",
                             self.node_id, old_primary, new_primary
@@ -648,6 +751,13 @@ impl<C: Consensus> Node<C> {
                         self.metrics
                             .transaction_received_at
                             .insert(transaction.to_digest(), Instant::now());
+                        if self.node_id != primary {
+                            self.execute_consensus_actions(&[ConsensusAction::ScheduleTimeout {
+                                view: self.consensus.current_view(),
+                                sequence: self.consensus.next_sequence(),
+                                duration: Duration::from_millis(self.consensus.get_timeout()),
+                            }], &node_tx)?;
+                        }
                     }
 
                     // Only forward toward the current leader.
@@ -669,6 +779,27 @@ impl<C: Consensus> Node<C> {
                 }
 
                 NodeEvent::ProduceBlock => {
+                    // Detect a dead leader even when no fresh transaction is
+                    // admitted (for example, only stale nonces are replayed).
+                    // A quiet cluster should still elect a live primary.
+                    let primary = self.consensus.current_primary();
+                    if self.consensus.consensus_started(false)
+                        && primary != self.node_id
+                        && self.last_primary_probe.elapsed()
+                            >= Duration::from_millis(self.consensus.get_timeout())
+                    {
+                        self.last_primary_probe = Instant::now();
+                        let unavailable = self.network.peers_address.get(&primary).is_some_and(|address| {
+                            TcpStream::connect_timeout(address, Duration::from_millis(100)).is_err()
+                        });
+                        if unavailable {
+                            let actions = self.consensus.on_event(ConsensusEvent::Timeout {
+                                view: self.consensus.current_view(),
+                                sequence: self.consensus.next_sequence(),
+                            });
+                            self.execute_consensus_actions(&actions, &node_tx)?;
+                        }
+                    }
                     self.maybe_propose(&node_tx)?;
                 }
 

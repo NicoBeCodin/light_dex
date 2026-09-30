@@ -1,214 +1,149 @@
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::exchange::account::AccountId;
-use crate::exchange::order::{Order, OrderId, OrderType};
-use crate::exchange::{ExchangeError, Side};
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-//In the future we could store something smaller than whole Order struct
-#[derive(Debug)]
+use crate::exchange::{
+    account::AccountId,
+    market::MarketId,
+    order::{Order, OrderId, OrderType, Side},
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderBookError {
+    InvalidOrder,
+    KilledFOK,
+    InexistentOrder,
+    SelfTrade,
+}
+
+#[derive(Debug, Clone)]
+pub struct Fill {
+    pub maker_order_id: OrderId,
+    pub maker_account: AccountId,
+    pub maker_filled: bool,
+    pub price: u64,
+    pub quantity: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchResult {
+    pub fills: Vec<Fill>,
+    pub remaining: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct BookLevel {
+    pub price: u64,
+    pub quantity: u64,
+    pub order_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct OrderBookSnapshot {
+    pub market_id: MarketId,
+    pub bids: Vec<BookLevel>,
+    pub asks: Vec<BookLevel>,
+}
+
+#[derive(Debug, Clone)]
 pub struct OrderBook {
     pub asks: BTreeMap<u64, VecDeque<Order>>,
     pub bids: BTreeMap<u64, VecDeque<Order>>,
 }
 
-#[derive(Debug)]
-pub enum OrderBookError {
-    InvalidOrder,
-    InvalidLimitOrderPrice,
-    KilledFOK,
-    InexistentOrder,
-}
-
 impl OrderBook {
     pub fn new() -> Self {
-        OrderBook {
-            asks: BTreeMap::new(),
-            bids: BTreeMap::new(),
+        Self { asks: BTreeMap::new(), bids: BTreeMap::new() }
+    }
+
+    pub fn snapshot(&self, market_id: MarketId, depth: usize) -> OrderBookSnapshot {
+        fn levels<'a>(entries: impl Iterator<Item = (&'a u64, &'a VecDeque<Order>)>, depth: usize) -> Vec<BookLevel> {
+            entries.take(depth).map(|(&price, orders)| BookLevel {
+                price,
+                quantity: orders.iter().fold(0u64, |total, order| total.saturating_add(order.remaining_quantity)),
+                order_count: orders.len(),
+            }).collect()
+        }
+        OrderBookSnapshot {
+            market_id,
+            bids: levels(self.bids.iter().rev(), depth),
+            asks: levels(self.asks.iter(), depth),
         }
     }
 
-    //For fill or kill
     pub fn fillable(&self, order: &Order) -> bool {
         let mut remaining = order.remaining_quantity;
-        match order.side {
-            Side::Buy => {
-                for (&price, asks) in self.asks.iter() {
-                    if price > order.price {
-                        break;
-                    }
-                    for ask in asks {
-                        if ask.remaining_quantity >= remaining {
-                            return true;
-                        } else {
-                            remaining -= ask.remaining_quantity;
-                        }
-                    }
-                }
-                false
-            }
-            Side::Sell => {
-                for (&price, bids) in self.asks.iter().rev() {
-                    if price < order.price {
-                        break;
-                    }
-                    for bid in bids {
-                        if bid.remaining_quantity >= remaining {
-                            return true;
-                        } else {
-                            remaining -= bid.remaining_quantity;
-                        }
-                    }
-                }
-                false
+        let opposite: Box<dyn Iterator<Item = (&u64, &VecDeque<Order>)> + '_> = match order.side {
+            Side::Buy => Box::new(self.asks.iter()),
+            Side::Sell => Box::new(self.bids.iter().rev()),
+        };
+        for (&price, orders) in opposite {
+            if (order.side == Side::Buy && price > order.price)
+                || (order.side == Side::Sell && price < order.price) { break; }
+            for maker in orders {
+                remaining = remaining.saturating_sub(maker.remaining_quantity);
+                if remaining == 0 { return true; }
             }
         }
+        false
     }
-    pub fn cancel_order(&mut self, order_id: OrderId, side: Side, price: u64, account_id: AccountId)->Result<(), OrderBookError>{
-        match side {
-            Side::Buy => {
-                let Some(bids) = self.asks.get_mut(&price)  else {
-                    return Err(OrderBookError::InexistentOrder);
-                    
-                };
-                if let Some(index) = bids.iter().position(|bid| order_id == bid.id && bid.account == account_id) {
-                    
-                    let _ = bids.remove(index);
-                    return Ok(())
-                } else {
-                    return Err(OrderBookError::InexistentOrder);
-                }
-                
-                
-                
-            },
-            Side::Sell => {
-                
-                let Some(asks) = self.asks.get_mut(&price)  else {
-                    return Err(OrderBookError::InexistentOrder);
-                    
-                };
-                if let Some(index) = asks.iter().position(|ask| order_id == ask.id && ask.id == account_id) {
-                    let _ = asks.remove(index);
-                    return Ok(())
-                } else {
-                    return Err(OrderBookError::InexistentOrder);
-                }
-            }
-            
+
+    fn would_self_trade(&self, order: &Order) -> bool {
+        let opposite: Box<dyn Iterator<Item = (&u64, &VecDeque<Order>)> + '_> = match order.side {
+            Side::Buy => Box::new(self.asks.iter()),
+            Side::Sell => Box::new(self.bids.iter().rev()),
+        };
+        for (&price, orders) in opposite {
+            if (order.side == Side::Buy && price > order.price)
+                || (order.side == Side::Sell && price < order.price) { break; }
+            if orders.iter().any(|maker| maker.account == order.account) { return true; }
         }
+        false
     }
 
-    pub fn match_order(&mut self, order: Order, order_type: OrderType) {
-        let mut matched_order = order;
-        match matched_order.side {
-            Side::Buy => {
-                loop {
-                    if matched_order.remaining_quantity == 0 {
-                        break;
-                    }
-                    let Some((&best_ask, _)) = self.asks.first_key_value() else {
-                        break;
-                    };
-                    if best_ask > matched_order.price {
-                        break;
-                    }
+    pub fn apply_order(&mut self, mut order: Order, order_type: OrderType) -> Result<MatchResult, OrderBookError> {
+        if order.price == 0 || order.remaining_quantity == 0 { return Err(OrderBookError::InvalidOrder); }
+        if self.would_self_trade(&order) { return Err(OrderBookError::SelfTrade); }
+        if order_type == OrderType::FOK && !self.fillable(&order) { return Err(OrderBookError::KilledFOK); }
 
-                    let mut remove_level = false;
-                    {
-                        let orders = self.asks.get_mut(&best_ask).unwrap();
-                        let ask_order = orders.front_mut().unwrap();
+        let mut fills = Vec::new();
+        while order.remaining_quantity > 0 {
+            let price = match order.side {
+                Side::Buy => self.asks.first_key_value().map(|(&price, _)| price),
+                Side::Sell => self.bids.last_key_value().map(|(&price, _)| price),
+            };
+            let Some(price) = price else { break; };
+            if (order.side == Side::Buy && price > order.price)
+                || (order.side == Side::Sell && price < order.price) { break; }
 
-                        if matched_order.remaining_quantity >= ask_order.remaining_quantity {
-                            matched_order.remaining_quantity -= ask_order.remaining_quantity;
-                            orders.pop_front();
-                        } else {
-                            ask_order.remaining_quantity -= matched_order.remaining_quantity;
-                            matched_order.remaining_quantity = 0;
-                        }
-                        if orders.is_empty() {
-                            remove_level = true;
-                        }
-                    }
-                    if remove_level {
-                        self.asks.remove(&best_ask);
-                    }
-                }
-                if matched_order.remaining_quantity > 0 && order_type != OrderType::IOC {
-                    self.asks
-                        .entry(matched_order.price)
-                        .or_default()
-                        .push_back(matched_order);
-                }
-            }
-            Side::Sell => {
-                loop {
-                    if matched_order.remaining_quantity == 0 {
-                        break;
-                    }
-                    let Some((&best_bid, _)) = self.asks.last_key_value() else {
-                        break;
-                    };
-                    if best_bid < matched_order.price {
-                        break;
-                    }
-                    let mut remove_level = false;
-                    {
-                        let orders = self.asks.get_mut(&best_bid).unwrap();
-                        let bid_order = orders.front_mut().unwrap();
+            let levels = match order.side { Side::Buy => &mut self.asks, Side::Sell => &mut self.bids };
+            let makers = levels.get_mut(&price).expect("best level exists");
+            let maker = makers.front_mut().expect("nonempty level");
+            let quantity = maker.remaining_quantity.min(order.remaining_quantity);
+            maker.remaining_quantity -= quantity;
+            order.remaining_quantity -= quantity;
+            let maker_filled = maker.remaining_quantity == 0;
+            fills.push(Fill { maker_order_id: maker.id, maker_account: maker.account, maker_filled, price, quantity });
+            if maker_filled { makers.pop_front(); }
+            if makers.is_empty() { levels.remove(&price); }
+        }
 
-                        if matched_order.remaining_quantity >= bid_order.remaining_quantity {
-                            matched_order.remaining_quantity -= bid_order.remaining_quantity;
-                            orders.pop_front();
-                        } else {
-                            bid_order.remaining_quantity -= matched_order.remaining_quantity;
-                            matched_order.remaining_quantity = 0;
-                        }
-                        if orders.is_empty() {
-                            remove_level = true;
-                        }
-                    }
-                    if remove_level {
-                        self.asks.remove(&best_bid);
-                    }
-                }
-                if matched_order.remaining_quantity > 0 && order_type != OrderType::IOC {
-                    self.asks
-                        .entry(matched_order.price)
-                        .or_default()
-                        .push_back(matched_order);
-                }
-            }
-        };
+        let remaining = order.remaining_quantity;
+        if remaining > 0 && order_type == OrderType::LO {
+            let levels = match order.side { Side::Buy => &mut self.bids, Side::Sell => &mut self.asks };
+            levels.entry(order.price).or_default().push_back(order);
+        }
+        Ok(MatchResult { fills, remaining })
     }
 
-    pub fn apply_order(&mut self, order: Order, order_type: OrderType) -> Result<(), OrderBookError> {
-        match order.side {
-            Side::Buy => {
-                if let Some((&best_ask, _)) = self.asks.first_key_value() {
-                    if order.price >= best_ask {
-                        if order_type == OrderType::FOK && !self.fillable(&order){
-                            return Err(OrderBookError::KilledFOK);
-                        }
-                        self.match_order(order, order_type);
-                    } else {
-                        self.asks.entry(order.price).or_default().push_back(order);
-                    }
-                }
-            }
-            Side::Sell => {
-                if let Some((&best_bid, _)) = self.asks.last_key_value() {
-                    if order.price <= best_bid {
-                        if order_type == OrderType::FOK && !self.fillable(&order){
-                            return Err(OrderBookError::KilledFOK);
-                        }
-                        self.match_order(order, order_type);
-                    } else {
-                        self.asks.entry(order.price).or_default().push_back(order);
-                    }
-                }
-            }
-        };
-
-        Ok(())
+    pub fn cancel_order(&mut self, order_id: OrderId, side: Side, price: u64, account_id: AccountId) -> Result<Order, OrderBookError> {
+        let levels = match side { Side::Buy => &mut self.bids, Side::Sell => &mut self.asks };
+        let orders = levels.get_mut(&price).ok_or(OrderBookError::InexistentOrder)?;
+        let index = orders.iter().position(|order| order.id == order_id && order.account == account_id)
+            .ok_or(OrderBookError::InexistentOrder)?;
+        let order = orders.remove(index).expect("order index exists");
+        if orders.is_empty() { levels.remove(&price); }
+        Ok(order)
     }
 }
