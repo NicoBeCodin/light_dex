@@ -1,17 +1,21 @@
 use crate::types::{
-    ControlSnapshot, LaunchConfig, LoadConfig, LoadPreset, LoadSnapshot, MarketMakerConfig,
+    AgentConfig, AgentSnapshot, ControlSnapshot, LaunchConfig, LoadConfig, LoadPreset, LoadSnapshot, MarketMakerConfig, WalletAccount,
     MarketMakerSnapshot, MetricsSnapshot,
     NodeRuntimeSnapshot, TargetNode,
 };
-use crate::binance_depth::{PartialDepth, STREAM_URL, desired_book};
+use crate::binance_depth::{PartialDepth, STREAM_URL, desired_book, mid_price};
 use light_dex::{
     blockchain::Transaction,
+    crypto::{SessionManifest, create_session, read_secret, sign_transaction, new_key, write_secret},
+    exchange::address::Address,
     message::Message,
     message::{hex_encode, sign_line, verify_line},
     node::{ControlMessage, NodeId, NodeStatus},
     participants::market_maker::{DesiredBook, QuoteAction, plan_actions},
+    participants::strategies::AgentStrategy,
 };
-use rand::Rng;
+use ed25519_dalek::SigningKey;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io::{self, BufRead, BufReader, Read, Write},
@@ -25,12 +29,22 @@ use std::{
 
 type Shared = Arc<Mutex<ControllerInner>>;
 
+fn slot_address(state: &ControllerInner, slot: u64) -> Option<Address> {
+    state.wallet.get(&slot).copied()
+}
+
+fn address_slot(state: &ControllerInner, address: Address) -> Option<u64> {
+    state.wallet.iter().find_map(|(slot, candidate)| (*candidate == address).then_some(*slot))
+}
+
 struct RuntimeNode {
     child: Child,
     address: Option<SocketAddr>,
     status: Option<NodeStatus>,
     state: String,
     last_sample: Option<(Instant, u64, u64)>,
+    last_poll_started: Option<Instant>,
+    last_status_at_ms: Option<u64>,
     tx_rate: f64,
     block_rate: f64,
     paused_until: Option<Instant>,
@@ -49,8 +63,49 @@ struct ControllerInner {
     next_load_id: u64,
     auth_key: [u8; 32],
     active_data_dir: Option<String>,
+    signing_manifest: Option<Arc<SessionManifest>>,
+    account_keys: BTreeMap<u64, SigningKey>,
+    wallet: BTreeMap<u64, Address>,
+    pending_airdrops: HashMap<Address, (u64, Option<String>)>,
     market_maker: Option<MarketMakerRuntime>,
     next_market_maker_id: u64,
+    agents: BTreeMap<u64, AgentRuntime>,
+    next_group_id: u64,
+    feed_depth: Option<PartialDepth>,
+    feed_at: Option<Instant>,
+    feed_history: VecDeque<(Instant, f64)>,
+    feed_started: bool,
+    local_mid_history: VecDeque<f64>,
+    last_book_height: Option<usize>,
+}
+
+struct AgentRuntime {
+    config: AgentConfig,
+    rng: StdRng,
+    desired: DesiredBook,
+    active: bool,
+    stopping: bool,
+    pending: Option<PendingAgentTransaction>,
+    last_step: Instant,
+    last_error: Option<String>,
+    resting_since: HashMap<u64, Instant>,
+    group_id: Option<u64>,
+}
+
+fn new_agent(config: AgentConfig, group_id: Option<u64>) -> AgentRuntime {
+    AgentRuntime {
+        config, rng: StdRng::seed_from_u64(rand::random()),
+        desired: DesiredBook::default(), active: true, stopping: false,
+        pending: None, last_step: Instant::now() - Duration::from_secs(1),
+        last_error: None, resting_since: HashMap::new(), group_id,
+    }
+}
+
+struct PendingAgentTransaction {
+    transaction: Transaction,
+    digest: String,
+    action: Option<QuoteAction>,
+    last_sent: Instant,
 }
 
 struct MarketMakerRuntime {
@@ -102,8 +157,20 @@ impl Default for ControllerInner {
             next_load_id: 0,
             auth_key: [0; 32],
             active_data_dir: None,
+            signing_manifest: None,
+            account_keys: BTreeMap::new(),
+            wallet: BTreeMap::new(),
+            pending_airdrops: HashMap::new(),
             market_maker: None,
             next_market_maker_id: 0,
+            agents: BTreeMap::new(),
+            next_group_id: 0,
+            feed_depth: None,
+            feed_at: None,
+            feed_history: VecDeque::new(),
+            feed_started: false,
+            local_mid_history: VecDeque::new(),
+            last_book_height: None,
         }
     }
 }
@@ -123,7 +190,85 @@ pub struct ControllerState {
     inner: Shared,
 }
 
+fn nonce_in_window(confirmed: u64, requested: u64, future_window: u64) -> bool {
+    requested >= confirmed && requested <= confirmed.saturating_add(future_window)
+}
+
 impl ControllerState {
+    pub fn create_address(&self) -> Result<WalletAccount, String> {
+        let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+        if !state.running { return Err("start the simulation before creating an address".into()); }
+        let dir = PathBuf::from(state.active_data_dir.as_deref().ok_or("no active session directory")?);
+        let label = state.wallet.keys().next_back().map_or(0, |last| last.saturating_add(1));
+        if state.wallet.contains_key(&label) { return Err("wallet label space exhausted".into()); }
+        let key = new_key().map_err(|error| error.to_string())?;
+        let address = Address::from_public_key(&key.verifying_key());
+        write_secret(&dir.join("keys").join(format!("account-{label}.key")), &key).map_err(|error| error.to_string())?;
+        let mut wallet = state.wallet.clone();
+        wallet.insert(label, address);
+        let temporary = dir.join(format!("wallet.json.tmp-{:016x}", rand::random::<u64>()));
+        let result = (|| -> io::Result<()> {
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+            file.write_all(&serde_json::to_vec_pretty(&wallet).map_err(io::Error::other)?)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, dir.join("wallet.json"))?;
+            #[cfg(unix)]
+            std::fs::File::open(&dir)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result { let _ = std::fs::remove_file(&temporary); return Err(error.to_string()); }
+        state.wallet = wallet;
+        state.account_keys.insert(label, key);
+        state.log(format!("Created wallet #{label}: {address} (unfunded)"));
+        Ok(WalletAccount { label, address })
+    }
+
+    pub fn airdrop_new_address(&self, from_label: u64, asset: u64, amount: u64, target: TargetNode) -> Result<WalletAccount, String> {
+        if amount == 0 { return Err("airdrop amount must be positive".into()); }
+        let (from, nonce, destination, auth_key) = {
+            let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+            if !state.running { return Err("start the simulation before airdropping".into()); }
+            let from = slot_address(&state, from_label).ok_or("unknown funding wallet label")?;
+            if state.market_maker.as_ref().is_some_and(|mm| (mm.active || mm.stopping) && mm.config.account_id == from_label)
+                || state.agents.values().any(|agent| agent.config.account_id == from_label)
+                || state.load.as_ref().is_some_and(|load| load_uses_account(&load.config.preset, from_label)) {
+                return Err("funding wallet is controlled by an active participant or load sender".into());
+            }
+            let status = best_status(&state).ok_or("wait for a responsive node")?;
+            let nonce = status.account_nonces.iter().find(|account| account.account_id == from)
+                .map(|account| account.nonce).ok_or("funding address is not on chain")?;
+            let available = status.agent_balances.iter().find(|balance| balance.account_id == from)
+                .map(|balance| if asset == 0 { balance.usd_available } else if asset == 1 { balance.btc_available } else { 0 })
+                .ok_or("funding balance unavailable")?;
+            if available < amount { return Err("funding address has insufficient available balance".into()); }
+            let destination = resolve_target(&state, &target).ok_or("no available target node")?;
+            if let Some((previous_nonce, digest)) = state.pending_airdrops.get(&from) {
+                let failed = digest.as_ref().is_some_and(|digest| status.recent_transaction_outcomes.iter()
+                    .any(|outcome| outcome.digest == *digest && !outcome.success));
+                if nonce <= *previous_nonce && !failed {
+                    return Err("an earlier airdrop from this wallet is still awaiting confirmation".into());
+                }
+            }
+            state.pending_airdrops.insert(from, (nonce, None));
+            (from, nonce, destination, state.auth_key)
+        };
+        let created = match self.create_address() {
+            Ok(created) => created,
+            Err(error) => { self.inner.lock().unwrap().pending_airdrops.remove(&from); return Err(error); }
+        };
+        let transaction = Transaction::Transfer { from, to: created.address, asset, amount, nonce };
+        if let Err(error) = send_signed_transaction(&self.inner, destination.1, transaction.clone(), &auth_key) {
+            self.inner.lock().unwrap().pending_airdrops.remove(&from);
+            return Err(format!("wallet #{} was created, but funding submission failed: {error}", created.label));
+        }
+        let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+        state.pending_airdrops.insert(from, (nonce, Some(hex_encode(&transaction.to_digest()))));
+        state.submitted += 1;
+        state.submit_times.push_back(Instant::now());
+        state.log(format!("Airdrop submitted: wallet #{from_label} -> #{} ({}) amount {amount} asset {asset}, nonce {nonce}, tx {}", created.label, created.address, hex_encode(&transaction.to_digest())));
+        Ok(created)
+    }
+
     pub fn launch(&self, config: LaunchConfig) -> Result<(), String> {
         if config.node_count == 0 {
             return Err("node count must be at least one".into());
@@ -141,8 +286,19 @@ impl ControllerState {
             state.nodes.clear();
             state.load = None;
             state.market_maker = None;
+            state.agents.clear();
+            state.feed_depth = None;
+            state.feed_at = None;
+            state.feed_history.clear();
+            state.feed_started = false;
+            state.local_mid_history.clear();
+            state.last_book_height = None;
             state.logs.clear();
             state.active_data_dir = None;
+            state.signing_manifest = None;
+            state.account_keys.clear();
+            state.wallet.clear();
+            state.pending_airdrops.clear();
             state.log("Starting simulation...");
             state.run_id
         };
@@ -169,27 +325,52 @@ impl ControllerState {
             state.run_id += 1;
             state.load = None;
             state.market_maker = None;
+            state.agents.clear();
             state.log("Stopping simulation...");
         }
         thread::spawn(move || stop_cluster(shared, false));
     }
+
 
     pub fn submit_transaction(
         &self,
         transaction: Transaction,
         target: TargetNode,
     ) -> Result<(), String> {
+        self.submit_transaction_with_window(transaction, target, 0)
+    }
+
+    /// Used only by the headless benchmark driver. The UI command keeps the
+    /// confirmed-nonce-only rule; this path permits a bounded pipeline.
+    pub fn submit_benchmark_transaction(
+        &self,
+        transaction: Transaction,
+        target: TargetNode,
+    ) -> Result<(), String> {
+        self.submit_transaction_with_window(transaction, target, 32)
+    }
+
+    fn submit_transaction_with_window(
+        &self,
+        transaction: Transaction,
+        target: TargetNode,
+        future_nonce_window: u64,
+    ) -> Result<(), String> {
         let (target, auth_key) = {
             let state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
             let account_id = transaction.account_id();
+            let account_slot = address_slot(&state, account_id).ok_or("sender address is not in the controller wallet")?;
             if state.market_maker.as_ref().is_some_and(|mm| (mm.active || mm.stopping)
-                && mm.config.account_id == account_id) {
+                && mm.config.account_id == account_slot) {
                 return Err(format!("account {account_id} is controlled by the market maker"));
+            }
+            if state.agents.values().any(|agent| agent.config.account_id == account_slot) {
+                return Err(format!("account {account_id} is controlled by a participant"));
             }
             if state
                 .load
                 .as_ref()
-                .is_some_and(|load| load.pending.contains_key(&account_id))
+                .is_some_and(|load| load.pending.contains_key(&account_slot))
             {
                 return Err(format!(
                     "account {account_id} already has a load transaction awaiting confirmation"
@@ -209,10 +390,10 @@ impl ControllerState {
                 })
                 .map(|account| account.nonce)
                 .ok_or_else(|| format!("no confirmed nonce available for account {account_id}"))?;
-            if transaction.nonce() != confirmed_nonce {
+            if !nonce_in_window(confirmed_nonce, transaction.nonce(), future_nonce_window) {
                 return Err(format!(
-                    "account {account_id} needs nonce {confirmed_nonce}; transaction uses {}",
-                    transaction.nonce()
+                    "account {account_id} permits nonce {confirmed_nonce}..={}; transaction uses {}",
+                    confirmed_nonce.saturating_add(future_nonce_window), transaction.nonce()
                 ));
             }
             (resolve_target(&state, &target), state.auth_key)
@@ -221,12 +402,7 @@ impl ControllerState {
         let target = target.ok_or_else(|| "no available target node".to_string())?;
         let shared = self.inner.clone();
         thread::spawn(move || {
-            match send_message(
-                target.1,
-                &Message::Transaction(transaction.clone()),
-                Duration::from_millis(500),
-                &auth_key,
-            ) {
+            match send_signed_transaction(&shared, target.1, transaction.clone(), &auth_key) {
                 Ok(()) => {
                     let mut state = shared.lock().unwrap();
                     state.submitted += 1;
@@ -244,6 +420,8 @@ impl ControllerState {
         });
         Ok(())
     }
+
+
 
     pub fn pause_node(&self, target: TargetNode, millis: u64) -> Result<(), String> {
         let (target, auth_key) = {
@@ -332,7 +510,7 @@ impl ControllerState {
                 !status
                     .account_nonces
                     .iter()
-                    .any(|account| account.account_id == id)
+                    .any(|account| Some(account.account_id) == slot_address(&state, id))
             }) {
                 return Err(
                     "one or more preset accounts do not exist in the current cluster".into(),
@@ -341,6 +519,9 @@ impl ControllerState {
             if state.market_maker.as_ref().is_some_and(|mm| (mm.active || mm.stopping)
                 && (first..end).contains(&mm.config.account_id)) {
                 return Err("sender account range overlaps the market maker".into());
+            }
+            if state.agents.values().any(|agent| (first..end).contains(&agent.config.account_id)) {
+                return Err("sender account range overlaps a participant".into());
             }
             state.next_load_id += 1;
             let load_id = state.next_load_id;
@@ -383,15 +564,18 @@ impl ControllerState {
             let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
             if !state.running { return Err("start the simulation first".into()); }
             let status = best_status(&state).ok_or("wait for a responsive node")?;
-            if !status.account_nonces.iter().any(|account| account.account_id == config.account_id) {
+            if !status.account_nonces.iter().any(|account| Some(account.account_id) == slot_address(&state, config.account_id)) {
                 return Err("market maker account does not exist".into());
             }
             if !state.market_maker.as_ref().is_some_and(|mm| mm.active)
-                && status.open_orders.iter().any(|order| order.account_id == config.account_id) {
+                && status.open_orders.iter().any(|order| Some(order.account_id) == slot_address(&state, config.account_id)) {
                 return Err("market maker account already has open orders; use a clean account".into());
             }
             if state.load.as_ref().is_some_and(|load| load_uses_account(&load.config.preset, config.account_id)) {
                 return Err("market maker account is already used by the transaction sender".into());
+            }
+            if state.agents.values().any(|agent| agent.config.account_id == config.account_id) {
+                return Err("market maker account is already used by a participant".into());
             }
             match state.market_maker.as_mut() {
                 Some(mm) if mm.active => {
@@ -436,6 +620,111 @@ impl ControllerState {
         }
     }
 
+    pub fn start_agent(&self, config: AgentConfig) -> Result<(), String> {
+        config.strategy.validate()?;
+        if config.market_id != 0 { return Err("only BTC-USD market 0 exists".into()); }
+        let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+        if !state.running { return Err("start the cluster before an agent".into()); }
+        let status = best_status(&state).cloned().ok_or("wait for a responsive node")?;
+        if !status.account_nonces.iter().any(|account| Some(account.account_id) == slot_address(&state, config.account_id)) {
+            return Err("agent account does not exist".into());
+        }
+        if state.market_maker.as_ref().is_some_and(|mm| (mm.active || mm.stopping) && mm.config.account_id == config.account_id)
+            || state.load.as_ref().is_some_and(|load| load_uses_account(&load.config.preset, config.account_id))
+            || state.agents.values().any(|agent| agent.config.agent_id != config.agent_id && agent.config.account_id == config.account_id) {
+            return Err("account already belongs to another participant".into());
+        }
+        if let Some(agent) = state.agents.get_mut(&config.agent_id) {
+            if agent.config.account_id != config.account_id || agent.stopping {
+                return Err("stop and clear the old agent before changing its account".into());
+            }
+            if std::mem::discriminant(&agent.config.strategy) != std::mem::discriminant(&config.strategy) {
+                return Err("stop and clear the agent before changing strategy presets".into());
+            }
+            agent.config = config;
+            agent.last_error = None;
+            agent.last_step = Instant::now() - Duration::from_secs(1);
+            state.log("Participant settings updated");
+        } else {
+            if status.open_orders.iter().any(|order| Some(order.account_id) == slot_address(&state, config.account_id)) {
+                return Err("agent account has existing open orders; choose a clean account".into());
+            }
+            state.agents.insert(config.agent_id, new_agent(config, None));
+            state.log("Participant started");
+        }
+        let spawn_feed = state.agents.values().any(|agent| agent.active && agent.config.strategy.needs_binance()) && !state.feed_started;
+        if spawn_feed { state.feed_started = true; }
+        let run_id = state.run_id;
+        drop(state);
+        if spawn_feed { spawn_shared_binance_feed(self.inner.clone(), run_id); }
+        Ok(())
+    }
+
+    /// All-or-nothing activation of a fleet. Existing agent IDs are not
+    /// overwritten by a group launch; update them individually instead.
+    pub fn start_agents(&self, configs: Vec<AgentConfig>) -> Result<u64, String> {
+        if configs.is_empty() || configs.len() > 100 { return Err("fleet must contain 1–100 agents".into()); }
+        let mut ids = HashSet::new();
+        let mut accounts = HashSet::new();
+        for config in &configs {
+            config.strategy.validate()?;
+            if config.market_id != 0 { return Err("only BTC-USD market 0 exists".into()); }
+            if !ids.insert(config.agent_id) || !accounts.insert(config.account_id) {
+                return Err("fleet agent IDs and accounts must be unique".into());
+            }
+        }
+        let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+        if !state.running { return Err("start the cluster before a fleet".into()); }
+        let status = best_status(&state).cloned().ok_or("wait for a responsive node")?;
+        for config in &configs {
+            if state.agents.contains_key(&config.agent_id) { return Err(format!("agent ID {} is already active", config.agent_id)); }
+            if !status.account_nonces.iter().any(|account| Some(account.account_id) == slot_address(&state, config.account_id)) {
+                return Err(format!("account {} does not exist", config.account_id));
+            }
+            if status.open_orders.iter().any(|order| Some(order.account_id) == slot_address(&state, config.account_id))
+                || state.agents.values().any(|agent| agent.config.account_id == config.account_id)
+                || state.market_maker.as_ref().is_some_and(|mm| (mm.active || mm.stopping) && mm.config.account_id == config.account_id)
+                || state.load.as_ref().is_some_and(|load| load_uses_account(&load.config.preset, config.account_id)) {
+                return Err(format!("account {} is already in use or has open orders", config.account_id));
+            }
+        }
+        state.next_group_id += 1;
+        let group_id = state.next_group_id;
+        for config in configs {
+            state.agents.insert(config.agent_id, new_agent(config, Some(group_id)));
+        }
+        let spawn_feed = state.agents.values().any(|agent| agent.active && agent.config.strategy.needs_binance()) && !state.feed_started;
+        if spawn_feed { state.feed_started = true; }
+        let run_id = state.run_id;
+        state.log(format!("Participant fleet {group_id} started"));
+        drop(state);
+        if spawn_feed { spawn_shared_binance_feed(self.inner.clone(), run_id); }
+        Ok(group_id)
+    }
+
+    pub fn stop_agent(&self, agent_id: u64) -> Result<(), String> {
+        let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+        let agent = state.agents.get_mut(&agent_id).ok_or("agent not found")?;
+        agent.active = false;
+        agent.stopping = true;
+        agent.desired = DesiredBook::default();
+        state.log(format!("Participant {agent_id} stopping"));
+        Ok(())
+    }
+
+    pub fn stop_agents(&self, agent_ids: Vec<u64>) -> Result<(), String> {
+        let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+        if agent_ids.iter().any(|id| !state.agents.contains_key(id)) { return Err("agent not found".into()); }
+        for id in agent_ids {
+            let agent = state.agents.get_mut(&id).expect("prevalidated agent ID");
+            agent.active = false;
+            agent.stopping = true;
+            agent.desired = DesiredBook::default();
+        }
+        state.log("Participant group stopping");
+        Ok(())
+    }
+
     pub fn kill_node(&self, target: TargetNode) -> Result<(), String> {
         let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
         let node_id = resolve_target_id(&state, &target)
@@ -453,6 +742,26 @@ impl ControllerState {
     pub fn snapshot(&self) -> ControlSnapshot {
         snapshot(&self.inner)
     }
+
+    pub fn refresh_node_status(&self, node_id: NodeId) -> Result<NodeRuntimeSnapshot, String> {
+        let (address, auth_key, run_id) = {
+            let mut state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+            if !state.running { return Err("cluster is not running".into()); }
+            let node = state.nodes.get_mut(&node_id).ok_or("node not found")?;
+            if matches!(node.child.try_wait(), Ok(Some(_))) { node.state = "dead".into(); }
+            if node.state == "dead" { return Err(format!("node {node_id} is dead")); }
+            (node.address.ok_or("node has no registered address")?, state.auth_key, state.run_id)
+        };
+        let started = Instant::now();
+        let result = request_status(address, &auth_key, Duration::from_secs(2));
+        let error = result.as_ref().err().map(ToString::to_string);
+        update_status(&self.inner, run_id, node_id, started, result);
+        let state = self.inner.lock().map_err(|_| "controller lock poisoned")?;
+        if state.run_id != run_id || !state.running { return Err("cluster stopped during query".into()); }
+        if let Some(error) = error { return Err(format!("node {node_id} status query failed: {error}")); }
+        let node = state.nodes.get(&node_id).ok_or("node no longer exists")?;
+        Ok(node_snapshot(node_id, node))
+    }
 }
 
 fn launch_cluster(shared: Shared, config: LaunchConfig, run_id: u64) -> io::Result<()> {
@@ -461,34 +770,45 @@ fn launch_cluster(shared: Shared, config: LaunchConfig, run_id: u64) -> io::Resu
     let requested_data = PathBuf::from(&config.data_dir);
     let base_data = if requested_data.is_absolute() { requested_data } else { project.join(requested_data) };
     let data_dir = if config.recover_existing {
-        if !base_data.is_dir() { return Err(io::Error::new(io::ErrorKind::NotFound, "recovery directory does not exist")); }
-        let mut expected_tip = None;
-        for node_id in 0..config.node_count {
-            let path = base_data.join(format!("node-{node_id}.json"));
-            if !path.is_file() { return Err(io::Error::new(io::ErrorKind::NotFound, format!("missing recovery file {}", path.display()))); }
-            let chain = light_dex::blockchain::BlockchainState::load(path).map_err(io::Error::other)?;
-            let tip = (chain.blocks.len(), chain.blocks.last().map(|block| block.to_digest()));
-            if let Some(expected) = expected_tip { if expected != tip { return Err(io::Error::other("recovery files have different chain tips; refusing unsafe restart")); } }
-            expected_tip = Some(tip);
-        }
-        base_data
+        return Err(io::Error::other("live recovery is unavailable until durable vote and lock state are persisted; use offline replay to inspect old sessions"));
     } else {
         let suffix = format!("run-{}-{:08x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(io::Error::other)?.as_millis(), rand::random::<u32>());
         let path = base_data.join(suffix);
         std::fs::create_dir_all(&path)?;
+        std::fs::write(path.join("consensus.txt"), config.consensus.as_str())?;
         path
     };
     let data_dir = data_dir.canonicalize()?;
+    let manifest = Arc::new(create_session(&data_dir, config.consensus.as_str(), config.node_count)?);
+    let wallet: BTreeMap<u64, Address> = serde_json::from_slice(&std::fs::read(data_dir.join("wallet.json"))?)?;
+    let mut account_keys = BTreeMap::new();
+    for (&id, &address) in &wallet {
+        let key = read_secret(&data_dir.join("keys").join(format!("account-{id}.key")))?;
+        if Address::from_public_key(&key.verifying_key()) != address { return Err(io::Error::other("wallet key/address mismatch")); }
+        account_keys.insert(id, key);
+    }
     {
         let mut state = shared.lock().unwrap();
         state.active_data_dir = Some(data_dir.display().to_string());
+        state.signing_manifest = Some(manifest);
+        state.account_keys = account_keys;
+        state.wallet = wallet;
         state.log(format!("Node data directory: {}", data_dir.display()));
     }
+    let requested_binary = PathBuf::from(&config.binary_path);
+    let binary = if requested_binary.is_absolute() {
+        requested_binary
+    } else {
+        project.join(requested_binary)
+    };
     if config.build_before_launch {
-        log(&shared, "Running cargo build --bin light_dex...");
-        let output = Command::new("cargo")
-            .args(["build", "--bin", "light_dex"])
-            .current_dir(&project)
+        let release = binary == project.join("target/release/light_dex");
+        log(&shared, if release { "Running cargo build --release --bin light_dex..." }
+            else { "Running cargo build --bin light_dex..." });
+        let mut command = Command::new("cargo");
+        command.args(["build", "--bin", "light_dex"]);
+        if release { command.arg("--release"); }
+        let output = command.current_dir(&project)
             .env("LIGHT_DEX_AUTH_KEY", hex_encode(&auth_key))
             .output()?;
         if !output.status.success() {
@@ -497,12 +817,6 @@ fn launch_cluster(shared: Shared, config: LaunchConfig, run_id: u64) -> io::Resu
             ));
         }
     }
-    let requested_binary = PathBuf::from(&config.binary_path);
-    let binary = if requested_binary.is_absolute() {
-        requested_binary
-    } else {
-        project.join(requested_binary)
-    };
     if !binary.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -528,8 +842,14 @@ fn launch_cluster(shared: Shared, config: LaunchConfig, run_id: u64) -> io::Resu
                 &config.block_time_ms.to_string(),
                 "--timeout-ms",
                 &config.timeout_ms.to_string(),
+                "--consensus",
+                config.consensus.as_str(),
                 "--data-dir",
                 &data_dir.display().to_string(),
+                "--chain-config",
+                &data_dir.join("manifest.json").display().to_string(),
+                "--validator-key",
+                &data_dir.join("keys").join(format!("validator-{node_id}.key")).display().to_string(),
             ])
             .current_dir(&project)
             .env("LIGHT_DEX_AUTH_KEY", hex_encode(&auth_key))
@@ -546,6 +866,8 @@ fn launch_cluster(shared: Shared, config: LaunchConfig, run_id: u64) -> io::Resu
                 status: None,
                 state: "starting".into(),
                 last_sample: None,
+                last_poll_started: None,
+                last_status_at_ms: None,
                 tx_rate: 0.0,
                 block_rate: 0.0,
                 paused_until: None,
@@ -627,8 +949,169 @@ fn launch_cluster(shared: Shared, config: LaunchConfig, run_id: u64) -> io::Resu
             config.node_count
         ));
     }
-    spawn_poll_loop(shared, config.poll_ms, run_id);
+    spawn_poll_loop(shared.clone(), config.poll_ms, config.poll_mode, run_id);
+    spawn_agent_loop(shared, run_id);
     Ok(())
+}
+
+fn spawn_agent_loop(shared: Shared, run_id: u64) {
+    thread::spawn(move || loop {
+        let ids = {
+            let state = shared.lock().unwrap();
+            if !state.running || state.run_id != run_id { break; }
+            state.agents.keys().copied().collect::<Vec<_>>()
+        };
+        for id in ids { participant_step(&shared, id); }
+        thread::sleep(Duration::from_millis(50));
+    });
+}
+
+fn participant_step(shared: &Shared, id: u64) {
+    let dispatch = {
+        let mut state = shared.lock().unwrap();
+        let Some(status) = best_status(&state).cloned() else { return; };
+        let feed = state.feed_depth.clone();
+        let feed_stale = state.feed_at.is_none_or(|at| at.elapsed() > Duration::from_secs(3));
+        let feed_history = state.feed_history.clone();
+        let local_history = state.local_mid_history.iter().copied().collect::<Vec<_>>();
+        let auth_key = state.auth_key;
+        let Some(account_address) = state.agents.get(&id).and_then(|agent| slot_address(&state, agent.config.account_id)) else { return; };
+        let Some(agent) = state.agents.get_mut(&id) else { return; };
+        let Some(nonce) = status.account_nonces.iter().find(|account| account.account_id == account_address).map(|account| account.nonce) else { return; };
+        let Some(balance) = status.agent_balances.iter().find(|balance| balance.account_id == account_address) else { return; };
+        let now = Instant::now();
+        let own_orders = status.open_orders.iter().filter(|order| order.account_id == account_address && order.market_id == agent.config.market_id).collect::<Vec<_>>();
+        let own_ids = own_orders.iter().map(|order| order.order_id).collect::<HashSet<_>>();
+        agent.resting_since.retain(|order_id, _| own_ids.contains(order_id));
+        for order in &own_orders { agent.resting_since.entry(order.order_id).or_insert(now); }
+        let mut transaction = None;
+        if let Some(pending) = &mut agent.pending {
+            let outcome = status.recent_transaction_outcomes.iter().find(|outcome| outcome.digest == pending.digest);
+            if let Some(outcome) = outcome.filter(|outcome| !outcome.success) {
+                agent.last_error = Some(format!("Transaction at nonce {} failed: {}; replanning at the confirmed nonce", pending.transaction.nonce(), outcome.error.as_deref().unwrap_or("unknown")));
+                agent.pending = None;
+                agent.last_step = now;
+            } else if nonce > pending.transaction.nonce() {
+                agent.pending = None;
+            } else if now.duration_since(pending.last_sent) >= Duration::from_secs(3) {
+                pending.last_sent = now;
+                transaction = Some(pending.transaction.clone());
+            }
+        }
+        if agent.pending.is_none() {
+            if agent.stopping && own_orders.is_empty() {
+                state.agents.remove(&id);
+                state.log(format!("Participant {id} stopped; resting orders cleared"));
+                return;
+            }
+            let interval = Duration::from_millis(agent.config.strategy.interval_ms());
+            let refresh_due = now.duration_since(agent.last_step) >= interval;
+            if refresh_due || agent.stopping || agent.config.strategy.is_maker() || !own_orders.is_empty() {
+                if refresh_due { agent.last_step = now; }
+                let account_id = account_address;
+                let market_id = agent.config.market_id;
+                let strategy = agent.config.strategy.clone();
+                let book = status.order_books.iter().find(|book| book.market_id == market_id);
+                let mut next = None;
+                if agent.stopping {
+                    if let Some(order) = own_orders.first() {
+                        next = Some((Transaction::CancelOrder { account_id, market_id, order_id: order.order_id, nonce }, Some(QuoteAction::Cancel { order_id: order.order_id })));
+                    }
+                } else if strategy.is_maker() {
+                    if refresh_due {
+                        if !feed_stale && agent.last_error.as_deref() == Some("Binance feed stale; cancelling quotes") {
+                            agent.last_error = None;
+                        }
+                        agent.desired = if feed_stale { DesiredBook::default() } else {
+                            match &strategy {
+                                AgentStrategy::BinanceMirror { levels, .. } => feed.as_ref().map(|depth| desired_book(depth, *levels)).unwrap_or_default(),
+                                AgentStrategy::AvellanedaStoikov { volatility_window_seconds, .. } => {
+                                    let inventory = balance.btc_available.saturating_add(balance.btc_locked);
+                                    feed.as_ref().and_then(mid_price)
+                                        .zip(feed_variance(&feed_history, *volatility_window_seconds))
+                                        .and_then(|(mid, variance)| strategy.avellaneda_quotes(mid, variance, inventory))
+                                        .unwrap_or_default()
+                                }
+                                _ => DesiredBook::default(),
+                            }
+                        };
+                        if let Some(book) = book {
+                            if let Some(ask) = book.asks.first() { for bid in &mut agent.desired.bids { *bid = (*bid).min(ask.price.saturating_sub(1)); } }
+                            if let Some(bid) = book.bids.first() { for ask in &mut agent.desired.asks { *ask = (*ask).max(bid.price.saturating_add(1)); } }
+                        }
+                    }
+                    if feed_stale { agent.desired = DesiredBook::default(); agent.last_error = Some("Binance feed stale; cancelling quotes".into()); }
+                    next = plan_actions(account_id, &status.open_orders, &agent.desired, true, &[])
+                        .into_iter().find_map(|action| {
+                            let tx = match action {
+                                QuoteAction::Cancel { order_id } => Transaction::CancelOrder { account_id, market_id, order_id, nonce },
+                                QuoteAction::Place { side, price } => {
+                                    if (side == light_dex::exchange::order::Side::Buy && balance.usd_available < price)
+                                        || (side == light_dex::exchange::order::Side::Sell && balance.btc_available == 0) { return None; }
+                                    Transaction::PlaceOrder { account_id, market_id, order_type: light_dex::exchange::order::OrderType::LO, side, price, quantity: 1, nonce }
+                                }
+                            };
+                            Some((tx, Some(action)))
+                        });
+                } else {
+                    let expired = match &strategy {
+                        AgentStrategy::RandomOrder { order_type: light_dex::exchange::order::OrderType::LO, resting_ttl_ms, max_resting_orders, .. } =>
+                            own_orders.iter().find(|order| agent.resting_since.get(&order.order_id).is_some_and(|at| now.duration_since(*at) >= Duration::from_millis(*resting_ttl_ms)))
+                                .or_else(|| (own_orders.len() >= *max_resting_orders).then(|| own_orders.first()).flatten()),
+                        _ => own_orders.first(),
+                    };
+                    if let Some(order) = expired {
+                        next = Some((Transaction::CancelOrder { account_id, market_id, order_id: order.order_id, nonce }, Some(QuoteAction::Cancel { order_id: order.order_id })));
+                    } else if refresh_due && agent.active {
+                        let side = match &strategy {
+                            AgentStrategy::RandomOrder { .. } => strategy.random_side(&mut agent.rng),
+                            AgentStrategy::TrendFollower { .. } => strategy.trend_side(&local_history),
+                            _ => None,
+                        };
+                        if let Some(side) = side {
+                            let (order_type, passive_offset) = match strategy {
+                                AgentStrategy::RandomOrder { order_type, passive_offset_ticks, .. } => (order_type, passive_offset_ticks),
+                                _ => (light_dex::exchange::order::OrderType::IOC, 0),
+                            };
+                            let price = match (order_type, side) {
+                                (light_dex::exchange::order::OrderType::LO, light_dex::exchange::order::Side::Buy) => book.and_then(|book| book.bids.first().map(|level| level.price.saturating_sub(passive_offset).max(1))),
+                                (light_dex::exchange::order::OrderType::LO, light_dex::exchange::order::Side::Sell) => book.and_then(|book| book.asks.first().map(|level| level.price.saturating_add(passive_offset))),
+                                (_, light_dex::exchange::order::Side::Buy) => book.and_then(|book| book.asks.first().map(|level| level.price)),
+                                (_, light_dex::exchange::order::Side::Sell) => book.and_then(|book| book.bids.first().map(|level| level.price)),
+                            };
+                            if let Some(price) = price.filter(|price| *price > 0) {
+                                if (side == light_dex::exchange::order::Side::Buy && balance.usd_available >= price)
+                                    || (side == light_dex::exchange::order::Side::Sell && balance.btc_available >= 1) {
+                                    next = Some((Transaction::PlaceOrder { account_id, market_id, order_type, side, price, quantity: 1, nonce },
+                                        (order_type == light_dex::exchange::order::OrderType::LO).then_some(QuoteAction::Place { side, price })));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((tx, action)) = next {
+                    agent.pending = Some(PendingAgentTransaction {
+                        digest: hex_encode(&tx.to_digest()), transaction: tx.clone(), action, last_sent: now,
+                    });
+                    transaction = Some(tx);
+                }
+            }
+        }
+        transaction.map(|tx| (tx, agent.config.target.clone(), auth_key))
+    };
+    let Some((tx, target, auth_key)) = dispatch else { return; };
+    let target = { resolve_target(&shared.lock().unwrap(), &target) };
+    let result = match target {
+        Some((_, address)) => send_signed_transaction(&shared, address, tx, &auth_key),
+        None => Err(io::Error::new(io::ErrorKind::NotConnected, "no available target node")),
+    };
+    let mut state = shared.lock().unwrap();
+    if let Some(agent) = state.agents.get_mut(&id) {
+        match result {
+            Ok(()) => { state.submitted += 1; state.submit_times.push_back(Instant::now()); }
+            Err(error) => { agent.last_error = Some(format!("Submission failed; retrying: {error}")); }
+        }
+    }
 }
 
 fn accept_until(listener: &TcpListener, deadline: Instant) -> io::Result<(TcpStream, SocketAddr)> {
@@ -649,8 +1132,9 @@ fn accept_until(listener: &TcpListener, deadline: Instant) -> io::Result<(TcpStr
     }
 }
 
-fn spawn_poll_loop(shared: Shared, poll_ms: u64, run_id: u64) {
+fn spawn_poll_loop(shared: Shared, poll_ms: u64, poll_mode: crate::types::PollMode, run_id: u64) {
     thread::spawn(move || {
+        let mut next_node = 0;
         loop {
             let started = Instant::now();
             let (targets, auth_key) = {
@@ -668,22 +1152,23 @@ fn spawn_poll_loop(shared: Shared, poll_ms: u64, run_id: u64) {
                     .iter()
                     .filter_map(|(id, node)| (node.state != "dead").then_some((*id, node.address?)))
                     .collect::<Vec<_>>();
-                (targets, state.auth_key)
+                (select_poll_targets(targets, poll_mode, &mut next_node), state.auth_key)
             };
             let (tx, rx) = mpsc::channel();
             let count = targets.len();
             for (id, address) in targets {
                 let tx = tx.clone();
                 thread::spawn(move || {
-                    let _ = tx.send((id, request_status(address, &auth_key)));
+                    let started = Instant::now();
+                    let _ = tx.send((id, started, request_status(address, &auth_key, Duration::from_millis(400))));
                 });
             }
             drop(tx);
             for _ in 0..count {
-                let Ok((id, result)) = rx.recv_timeout(Duration::from_millis(700)) else {
+                let Ok((id, started, result)) = rx.recv_timeout(Duration::from_millis(700)) else {
                     break;
                 };
-                update_status(&shared, run_id, id, result);
+                update_status(&shared, run_id, id, started, result);
             }
             let delay = Duration::from_millis(poll_ms.max(50));
             if started.elapsed() < delay {
@@ -693,13 +1178,47 @@ fn spawn_poll_loop(shared: Shared, poll_ms: u64, run_id: u64) {
     });
 }
 
-fn update_status(shared: &Shared, run_id: u64, node_id: NodeId, result: io::Result<NodeStatus>) {
+fn select_poll_targets(
+    targets: Vec<(NodeId, SocketAddr)>,
+    poll_mode: crate::types::PollMode,
+    next_node: &mut usize,
+) -> Vec<(NodeId, SocketAddr)> {
+    match poll_mode {
+        crate::types::PollMode::All => targets,
+        crate::types::PollMode::RoundRobin => {
+            if targets.is_empty() { return targets; }
+            let target = targets[*next_node % targets.len()];
+            *next_node = next_node.wrapping_add(1);
+            vec![target]
+        }
+    }
+}
+
+fn update_status(shared: &Shared, run_id: u64, node_id: NodeId, started: Instant, result: io::Result<NodeStatus>) {
     let now = Instant::now();
     let mut state = shared.lock().unwrap();
     if state.run_id != run_id { return; }
+    let Some(node) = state.nodes.get_mut(&node_id) else { return; };
+    if matches!(node.child.try_wait(), Ok(Some(_))) { node.state = "dead".into(); return; }
+    if node.last_poll_started.is_some_and(|previous| started < previous) { return; }
+    node.last_poll_started = Some(started);
     match result {
         Ok(status) => {
             reconcile_load(&mut state, &status);
+            if state.last_book_height.is_none_or(|height| status.chain_height > height) {
+                if let Some(book) = status.order_books.iter().find(|book| book.market_id == 0) {
+                    if let Some((bid, ask)) = book.bids.first().zip(book.asks.first()) {
+                        if bid.price < ask.price {
+                            let mid = (bid.price as f64 + ask.price as f64) / 2.0;
+                            if state.local_mid_history.back().is_none_or(|previous| *previous != mid) {
+                                state.local_mid_history.push_back(mid);
+                                while state.local_mid_history.len() > 101 { state.local_mid_history.pop_front(); }
+                            }
+                        }
+                    }
+                }
+                state.last_book_height = Some(status.chain_height);
+            }
             let Some(node) = state.nodes.get_mut(&node_id) else {
                 return;
             };
@@ -711,6 +1230,9 @@ fn update_status(shared: &Shared, run_id: u64, node_id: NodeId, result: io::Resu
             node.last_sample = Some((now, status.transactions_committed, status.blocks_committed));
             node.status = Some(status);
             node.state = "ok".into();
+            node.last_status_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).ok()
+                .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64);
         }
         Err(_) => {
             let Some(node) = state.nodes.get_mut(&node_id) else {
@@ -729,6 +1251,7 @@ fn update_status(shared: &Shared, run_id: u64, node_id: NodeId, result: io::Resu
 }
 
 fn reconcile_load(state: &mut ControllerInner, status: &NodeStatus) {
+    let wallet = state.wallet.clone();
     let Some(load) = state.load.as_mut() else {
         return;
     };
@@ -741,7 +1264,7 @@ fn reconcile_load(state: &mut ControllerInner, status: &NodeStatus) {
             .find(|outcome| outcome.digest == pending.digest)
         {
             let nonce_advanced = status.account_nonces.iter().any(|account| {
-                account.account_id == account_id && account.nonce > pending.transaction.nonce()
+                Some(account.account_id) == wallet.get(&account_id).copied() && account.nonce > pending.transaction.nonce()
             });
             if !outcome.success || !nonce_advanced {
                 failed.push((
@@ -753,7 +1276,7 @@ fn reconcile_load(state: &mut ControllerInner, status: &NodeStatus) {
             }
         }
         if status.account_nonces.iter().any(|account| {
-            account.account_id == account_id && account.nonce > pending.transaction.nonce()
+            Some(account.account_id) == wallet.get(&account_id).copied() && account.nonce > pending.transaction.nonce()
         }) {
             completed.push(account_id);
         }
@@ -800,6 +1323,7 @@ fn spawn_load_loop(shared: Shared, load_id: u64) {
                     .filter_map(|node| node.status.as_ref())
                     .max_by_key(|status| status.chain_height)
                     .cloned();
+                let wallet = state.wallet.clone();
                 let Some(load) = state.load.as_mut() else {
                     break;
                 };
@@ -808,7 +1332,7 @@ fn spawn_load_loop(shared: Shared, load_id: u64) {
                 }
                 let transaction = status
                     .as_ref()
-                    .and_then(|status| next_load_transaction(load, status));
+                    .and_then(|status| next_load_transaction(load, status, &wallet));
                 (transaction, load.config.target.clone(), load.config.tps)
             };
 
@@ -818,12 +1342,7 @@ fn spawn_load_loop(shared: Shared, load_id: u64) {
                     (resolve_target(&state, &target), state.auth_key)
                 };
                 if let Some((node_id, address)) = target {
-                    match send_message(
-                        address,
-                        &Message::Transaction(transaction),
-                        Duration::from_millis(500),
-                        &auth_key,
-                    ) {
+                    match send_signed_transaction(&shared, address, transaction, &auth_key) {
                         Ok(()) => {
                             let mut state = shared.lock().unwrap();
                             if state.load.as_ref().is_some_and(|load| load.id == load_id) {
@@ -847,7 +1366,7 @@ fn spawn_load_loop(shared: Shared, load_id: u64) {
     });
 }
 
-fn next_load_transaction(load: &mut LoadRuntime, status: &NodeStatus) -> Option<Transaction> {
+fn next_load_transaction(load: &mut LoadRuntime, status: &NodeStatus, wallet: &BTreeMap<u64, Address>) -> Option<Transaction> {
     let (first, count) = match load.config.preset {
         LoadPreset::BookTaker { account_id, .. } => (account_id, 1),
         LoadPreset::RoundRobinTransfers {
@@ -877,7 +1396,7 @@ fn next_load_transaction(load: &mut LoadRuntime, status: &NodeStatus) -> Option<
         if let Some(account) = status
             .account_nonces
             .iter()
-            .find(|account| account.account_id == account_id)
+            .find(|account| Some(account.account_id) == wallet.get(&account_id).copied())
         {
             eligible.push((account_id, account.nonce));
         }
@@ -904,7 +1423,7 @@ fn next_load_transaction(load: &mut LoadRuntime, status: &NodeStatus) -> Option<
                 light_dex::exchange::order::Side::Buy => book.asks.first()?.price,
                 light_dex::exchange::order::Side::Sell => book.bids.first()?.price,
             };
-            Transaction::PlaceOrder { account_id, market_id,
+            Transaction::PlaceOrder { account_id: *wallet.get(&account_id)?, market_id,
                 order_type: light_dex::exchange::order::OrderType::IOC,
                 side, price, quantity: 1, nonce }
         }
@@ -916,8 +1435,8 @@ fn next_load_transaction(load: &mut LoadRuntime, status: &NodeStatus) -> Option<
         } => {
             let to = first_account + (account_id - first_account + 1) % account_count;
             Transaction::Transfer {
-                from: account_id,
-                to,
+                from: *wallet.get(&account_id)?,
+                to: *wallet.get(&to)?,
                 asset,
                 amount,
                 nonce,
@@ -932,8 +1451,8 @@ fn next_load_transaction(load: &mut LoadRuntime, status: &NodeStatus) -> Option<
             let offset = rand::rng().random_range(1..account_count);
             let to = first_account + (account_id - first_account + offset) % account_count;
             Transaction::Transfer {
-                from: account_id,
-                to,
+                from: *wallet.get(&account_id)?,
+                to: *wallet.get(&to)?,
                 asset,
                 amount,
                 nonce,
@@ -954,6 +1473,63 @@ fn next_load_transaction(load: &mut LoadRuntime, status: &NodeStatus) -> Option<
         },
     );
     Some(transaction)
+}
+
+fn feed_variance(history: &VecDeque<(Instant, f64)>, window_seconds: u64) -> Option<f64> {
+    let now = Instant::now();
+    let values = history.iter().filter(|(at, _)| now.duration_since(*at) <= Duration::from_secs(window_seconds))
+        .map(|(_, mid)| *mid).collect::<Vec<_>>();
+    if values.len() < 10 { return None; }
+    let changes = values.windows(2).map(|pair| pair[1] - pair[0]).collect::<Vec<_>>();
+    let mean = changes.iter().sum::<f64>() / changes.len() as f64;
+    Some(changes.iter().map(|change| (change - mean).powi(2)).sum::<f64>() / changes.len() as f64)
+}
+
+/// One Binance socket serves every fleet maker. No participant owns the feed.
+fn spawn_shared_binance_feed(shared: Shared, run_id: u64) {
+    thread::spawn(move || loop {
+        if { let state = shared.lock().unwrap(); !state.running || state.run_id != run_id } { break; }
+        match tungstenite::connect(STREAM_URL) {
+            Ok((mut socket, _)) => {
+                use tungstenite::stream::MaybeTlsStream;
+                let timeout = Some(Duration::from_secs(2));
+                match socket.get_mut() {
+                    MaybeTlsStream::Plain(stream) => { let _ = stream.set_read_timeout(timeout); }
+                    MaybeTlsStream::NativeTls(stream) => { let _ = stream.get_mut().set_read_timeout(timeout); }
+                    _ => {}
+                }
+                loop {
+                    if { let state = shared.lock().unwrap(); !state.running || state.run_id != run_id } { return; }
+                    match socket.read() {
+                        Ok(tungstenite::Message::Text(text)) => {
+                            if let Ok(depth) = serde_json::from_str::<PartialDepth>(&text) {
+                                if let Some(mid) = mid_price(&depth) {
+                                    let mut state = shared.lock().unwrap();
+                                    if state.feed_depth.as_ref().is_none_or(|old| depth.last_update_id >= old.last_update_id) {
+                                        let now = Instant::now();
+                                        if state.feed_history.back().is_none_or(|(at, _)| now.duration_since(*at) >= Duration::from_secs(1)) {
+                                            state.feed_history.push_back((now, mid));
+                                            while state.feed_history.len() > 601 { state.feed_history.pop_front(); }
+                                        }
+                                        state.feed_depth = Some(depth);
+                                        state.feed_at = Some(now);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(tungstenite::Message::Ping(_)) => { let _ = socket.flush(); }
+                        Ok(tungstenite::Message::Close(_)) => break,
+                        Ok(_) => {},
+                        Err(tungstenite::Error::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+                            || error.kind() == io::ErrorKind::TimedOut => {},
+                        Err(error) => { log(&shared, format!("Shared Binance feed lost: {error}")); break; }
+                    }
+                }
+            }
+            Err(error) => log(&shared, format!("Shared Binance feed unavailable: {error}")),
+        }
+        thread::sleep(Duration::from_secs(1));
+    });
 }
 
 fn spawn_binance_feed(shared: Shared, id: u64) {
@@ -1026,9 +1602,10 @@ fn market_maker_step(shared: &Shared, id: u64) -> bool {
         if !state.running { return false; }
         let Some(status) = best_status(&state).cloned() else { return true; };
         let auth_key = state.auth_key;
+        let Some(account_address) = state.market_maker.as_ref().and_then(|mm| slot_address(&state, mm.config.account_id)) else { return true; };
         let Some(mm) = state.market_maker.as_mut().filter(|mm| mm.id == id) else { return false; };
         if !mm.active && !mm.stopping { return false; }
-        let Some(nonce) = status.account_nonces.iter().find(|account| account.account_id == mm.config.account_id).map(|account| account.nonce) else { return true; };
+        let Some(nonce) = status.account_nonces.iter().find(|account| account.account_id == account_address).map(|account| account.nonce) else { return true; };
         let now = Instant::now();
         for pending in &mm.pending {
             if let Some(outcome) = status.recent_transaction_outcomes.iter().find(|outcome| outcome.digest == pending.digest) {
@@ -1068,16 +1645,16 @@ fn market_maker_step(shared: &Shared, id: u64) -> bool {
         }
         let pending_actions = mm.pending.iter().map(|pending| pending.action).collect::<Vec<_>>();
         let available = 20usize.saturating_sub(mm.pending.len());
-        let actions = plan_actions(mm.config.account_id, &status.open_orders, &mm.desired, mm.active, &pending_actions);
+        let actions = plan_actions(account_address, &status.open_orders, &mm.desired, mm.active, &pending_actions);
         let next_nonce = mm.pending.back().map_or(nonce, |pending| pending.transaction.nonce().saturating_add(1)).max(nonce);
         for (index, action) in actions.into_iter().take(available).enumerate() {
             let tx_nonce = next_nonce + index as u64;
             let tx = match action {
                 QuoteAction::Cancel { order_id } => Transaction::CancelOrder {
-                    account_id: mm.config.account_id, market_id: 0, order_id, nonce: tx_nonce,
+                    account_id: account_address, market_id: 0, order_id, nonce: tx_nonce,
                 },
                 QuoteAction::Place { side, price } => Transaction::PlaceOrder {
-                    account_id: mm.config.account_id, market_id: 0,
+                    account_id: account_address, market_id: 0,
                     order_type: light_dex::exchange::order::OrderType::LO,
                     side, price, quantity: 1, nonce: tx_nonce,
                 },
@@ -1088,7 +1665,7 @@ fn market_maker_step(shared: &Shared, id: u64) -> bool {
             transactions.push(tx);
         }
         if mm.stopping && mm.pending.is_empty() && transactions.is_empty() &&
-            !status.open_orders.iter().any(|order| order.account_id == mm.config.account_id && order.market_id == 0) {
+            !status.open_orders.iter().any(|order| order.account_id == account_address && order.market_id == 0) {
             mm.stopping = false;
             state.log("Market maker stopped; all visible quotes cleared");
             return false;
@@ -1099,7 +1676,7 @@ fn market_maker_step(shared: &Shared, id: u64) -> bool {
     for tx in transactions {
         let target_address = { resolve_target(&shared.lock().unwrap(), &target) };
         let result = match target_address {
-            Some((_, address)) => send_message(address, &Message::Transaction(tx), Duration::from_millis(500), &auth_key),
+            Some((_, address)) => send_signed_transaction(&shared, address, tx, &auth_key),
             None => Err(io::Error::new(io::ErrorKind::NotConnected, "no available target node")),
         };
         let mut state = shared.lock().unwrap();
@@ -1174,15 +1751,7 @@ fn snapshot(shared: &Shared) -> ControlSnapshot {
     let nodes = state
         .nodes
         .iter()
-        .map(|(id, node)| NodeRuntimeSnapshot {
-            node_id: *id,
-            pid: node.child.id(),
-            state: node.state.clone(),
-            address: node.address.map(|a| a.to_string()),
-            tx_rate: node.tx_rate,
-            block_rate: node.block_rate,
-            status: node.status.clone(),
-        })
+        .map(|(id, node)| node_snapshot(*id, node))
         .collect();
     let market_maker = match state.market_maker.as_ref() {
         Some(mm) => MarketMakerSnapshot {
@@ -1192,7 +1761,7 @@ fn snapshot(shared: &Shared) -> ControlSnapshot {
             feed_age_ms: mm.feed_at.map(|at| now.duration_since(at).as_millis().min(u64::MAX as u128) as u64),
             desired_bids: mm.desired.bids.clone(), desired_asks: mm.desired.asks.clone(),
             own_open_orders: best_status(&state).map_or(0, |status| status.open_orders.iter()
-                .filter(|order| order.account_id == mm.config.account_id && order.market_id == 0).count()),
+                .filter(|order| Some(order.account_id) == slot_address(&state, mm.config.account_id) && order.market_id == 0).count()),
             pending: !mm.pending.is_empty(), last_error: mm.last_error.clone(),
         },
         None => MarketMakerSnapshot {
@@ -1244,8 +1813,41 @@ fn snapshot(shared: &Shared) -> ControlSnapshot {
             }),
         },
         market_maker,
+        agents: state.agents.values().map(|agent| AgentSnapshot {
+            agent_id: agent.config.agent_id,
+            account_id: agent.config.account_id,
+            strategy: agent.config.strategy.clone(),
+            target: agent.config.target.clone(),
+            state: if agent.stopping { "stopping" } else if agent.active { "active" } else { "stopped" }.into(),
+            pending: usize::from(agent.pending.is_some()),
+            pending_action: agent.pending.as_ref().and_then(|pending| pending.action.map(|action| format!("{action:?}"))),
+            own_open_orders: best_status(&state).map_or(0, |status| status.open_orders.iter()
+                .filter(|order| Some(order.account_id) == slot_address(&state, agent.config.account_id) && order.market_id == agent.config.market_id).count()),
+            last_error: agent.last_error.clone(),
+            confirmed_nonce: best_status(&state).and_then(|status| status.account_nonces.iter()
+                .find(|account| Some(account.account_id) == slot_address(&state, agent.config.account_id)).map(|account| account.nonce)),
+            balance: best_status(&state).and_then(|status| status.agent_balances.iter()
+                .find(|balance| Some(balance.account_id) == slot_address(&state, agent.config.account_id)).cloned()),
+            feed_age_ms: agent.config.strategy.needs_binance().then(|| state.feed_at
+                .map(|at| now.duration_since(at).as_millis().min(u64::MAX as u128) as u64)).flatten(),
+            group_id: agent.group_id,
+        }).collect(),
+        wallet: state.wallet.iter().map(|(&label, &address)| WalletAccount { label, address }).collect(),
         logs: state.logs.iter().cloned().collect(),
         active_data_dir: state.active_data_dir.clone(),
+    }
+}
+
+fn node_snapshot(id: NodeId, node: &RuntimeNode) -> NodeRuntimeSnapshot {
+    NodeRuntimeSnapshot {
+        node_id: id,
+        pid: node.child.id(),
+        state: node.state.clone(),
+        address: node.address.map(|address| address.to_string()),
+        tx_rate: node.tx_rate,
+        block_rate: node.block_rate,
+        status: node.status.clone(),
+        last_status_at_ms: node.last_status_at_ms,
     }
 }
 
@@ -1274,6 +1876,7 @@ fn stop_cluster(shared: Shared, force: bool) {
         state.launching = false;
         state.load = None;
         state.market_maker = None;
+        state.agents.clear();
         let addresses = state
             .nodes
             .values()
@@ -1300,6 +1903,10 @@ fn stop_cluster(shared: Shared, force: bool) {
         }
         node.state = "dead".into();
     }
+    state.account_keys.clear();
+    state.pending_airdrops.clear();
+    state.signing_manifest = None;
+    state.auth_key = [0; 32];
     state.stopping = false;
     state.log("Simulation stopped");
 }
@@ -1339,14 +1946,26 @@ fn resolve_target_id(state: &ControllerInner, target: &TargetNode) -> Option<Nod
     }
 }
 
+fn send_signed_transaction(shared: &Shared, address: SocketAddr, transaction: Transaction, auth_key: &[u8; 32]) -> io::Result<()> {
+    let signed = {
+        let state = shared.lock().map_err(|_| io::Error::other("controller lock poisoned"))?;
+        let manifest = state.signing_manifest.as_ref().ok_or_else(|| io::Error::other("no active signing session"))?;
+        let slot = state.wallet.iter().find_map(|(slot, account)| (*account == transaction.account_id()).then_some(*slot))
+            .ok_or_else(|| io::Error::other("sender address is not in the controller wallet"))?;
+        let key = state.account_keys.get(&slot)
+            .ok_or_else(|| io::Error::other("account has no signing key"))?;
+        sign_transaction(transaction, manifest, key)?
+    };
+    send_message(address, &Message::SignedTransaction(signed), Duration::from_millis(500), auth_key)
+}
+
 fn send_message(address: SocketAddr, message: &Message, timeout: Duration, auth_key: &[u8; 32]) -> io::Result<()> {
     let mut stream = TcpStream::connect_timeout(&address, timeout)?;
     stream.set_write_timeout(Some(timeout))?;
     let data = sign_line(message, auth_key)?;
     stream.write_all(data.as_bytes())
 }
-fn request_status(address: SocketAddr, auth_key: &[u8; 32]) -> io::Result<NodeStatus> {
-    let timeout = Duration::from_millis(400);
+fn request_status(address: SocketAddr, auth_key: &[u8; 32], timeout: Duration) -> io::Result<NodeStatus> {
     let mut stream = TcpStream::connect_timeout(&address, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
@@ -1380,10 +1999,39 @@ mod tests {
     use super::*;
     use light_dex::node::{AccountNonce, TransactionOutcome};
 
+    #[test]
+    fn polling_mode_selects_all_or_rotates_one_node() {
+        let targets = (0..3)
+            .map(|id| (id, SocketAddr::from(([127, 0, 0, 1], 9000 + id as u16))))
+            .collect::<Vec<_>>();
+        let mut next = 0;
+        assert_eq!(select_poll_targets(targets.clone(), crate::types::PollMode::All, &mut next), targets);
+        assert_eq!(next, 0);
+        for expected in [0, 1, 2, 0] {
+            let selected = select_poll_targets(targets.clone(), crate::types::PollMode::RoundRobin, &mut next);
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].0, expected);
+        }
+        assert!(select_poll_targets(Vec::new(), crate::types::PollMode::RoundRobin, &mut next).is_empty());
+    }
+
+    #[test]
+    fn benchmark_future_nonce_window_does_not_change_ui_rule() {
+        assert!(nonce_in_window(5, 5, 0));
+        assert!(!nonce_in_window(5, 6, 0));
+        assert!(nonce_in_window(5, 6, 32));
+        assert!(nonce_in_window(5, 37, 32));
+        assert!(!nonce_in_window(5, 38, 32));
+        assert!(!nonce_in_window(5, 4, 32));
+    }
+
     fn status() -> NodeStatus {
         NodeStatus {
             node_id: 0,
             pid: 0,
+            chain_id: String::new(),
+            signing_enabled: false,
+            authentication_rejections: 0,
             network_ready: true,
             peer_count: 0,
             expected_peers: 0,
@@ -1399,21 +2047,28 @@ mod tests {
             transactions_received: 0,
             blocks_committed: 1,
             transactions_committed: 0,
+            transactions_failed: 0,
+            trades_committed: 0,
             average_commit_latency_ms: 0.0,
             last_commit_latency_ms: None,
+            recent_commit_latency_ms: vec![],
+            catch_up_events: 0,
+            blocks_caught_up: 0,
             recent_blocks: vec![],
             account_nonces: vec![
                 AccountNonce {
-                    account_id: 0,
+                    account_id: 0.into(),
                     nonce: 0,
                 },
                 AccountNonce {
-                    account_id: 1,
+                    account_id: 1.into(),
                     nonce: 0,
                 },
             ],
             recent_transaction_outcomes: vec![],
             order_books: vec![],
+            recent_trades: vec![],
+            agent_balances: vec![],
             open_orders: vec![],
         }
     }
@@ -1421,6 +2076,8 @@ mod tests {
     #[test]
     fn failed_sender_keeps_nonce_and_other_sender_can_continue() {
         let mut state = ControllerInner::default();
+        state.wallet.insert(0, 0.into());
+        state.wallet.insert(1, 1.into());
         state.load = Some(LoadRuntime {
             id: 1,
             config: LoadConfig {
@@ -1437,8 +2094,8 @@ mod tests {
             pending: HashMap::new(),
             failed: HashMap::new(),
         });
-        let first = next_load_transaction(state.load.as_mut().unwrap(), &status()).unwrap();
-        assert_eq!(first.account_id(), 0);
+        let first = next_load_transaction(state.load.as_mut().unwrap(), &status(), &state.wallet).unwrap();
+        assert_eq!(first.account_id(), 0.into());
         assert_eq!(first.nonce(), 0);
         let digest = state.load.as_ref().unwrap().pending[&0].digest.clone();
         let mut after_failure = status();
@@ -1446,15 +2103,15 @@ mod tests {
             .recent_transaction_outcomes
             .push(TransactionOutcome {
                 digest,
-                account_id: 0,
+                account_id: 0.into(),
                 nonce: 0,
                 success: false,
                 error: Some("InsufficientBalance".into()),
             });
         reconcile_load(&mut state, &after_failure);
         assert_eq!(state.load.as_ref().unwrap().failed[&0], 0);
-        let second = next_load_transaction(state.load.as_mut().unwrap(), &after_failure).unwrap();
-        assert_eq!(second.account_id(), 1);
+        let second = next_load_transaction(state.load.as_mut().unwrap(), &after_failure, &state.wallet).unwrap();
+        assert_eq!(second.account_id(), 1.into());
         assert_eq!(second.nonce(), 0);
     }
 
@@ -1473,18 +2130,63 @@ mod tests {
             }, target: TargetNode::Random, tps: 1.0 },
             cursor: 0, pending: HashMap::new(), failed: HashMap::new(),
         };
-        assert!(matches!(next_load_transaction(&mut load, &status), Some(Transaction::PlaceOrder {
-            account_id: 1, market_id: 0, price: 102, quantity: 1, nonce: 0,
+        let wallet = BTreeMap::from([(1, 1.into())]);
+        assert!(matches!(next_load_transaction(&mut load, &status, &wallet), Some(Transaction::PlaceOrder {
+            account_id, market_id: 0, price: 102, quantity: 1, nonce: 0,
             order_type: light_dex::exchange::order::OrderType::IOC, ..
-        })));
+        }) if account_id == Address::fixture(1)));
     }
 
     #[test]
     #[ignore = "spawns four node processes and requires a built light_dex binary"]
-    fn cluster_commits_order_book_and_recovers_it() {
+    fn new_address_airdrop_commits_and_replays() {
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let base_data = std::env::temp_dir().join(format!("light-dex-airdrop-{}", rand::random::<u64>()));
+        let controller = ControllerState::default();
+        controller.launch(LaunchConfig {
+            project_dir: project.display().to_string(), binary_path: "target/debug/light_dex".into(),
+            data_dir: base_data.display().to_string(), recover_existing: false,
+            node_count: 4, block_time_ms: 150, timeout_ms: 1_500, poll_ms: 100,
+            poll_mode: crate::types::PollMode::All,
+            build_before_launch: false, consensus: crate::types::ConsensusAlgorithm::Pbft,
+        }).unwrap();
+        wait_for(&controller, |snapshot| snapshot.running && snapshot.metrics.responsive_nodes == 4 && snapshot.metrics.height_min == Some(1));
+        let unfunded = controller.create_address().unwrap();
+        assert_eq!(unfunded.label, 100);
+        assert!(!controller.snapshot().nodes.iter().filter_map(|node| node.status.as_ref())
+            .any(|status| status.account_nonces.iter().any(|account| account.account_id == unfunded.address)));
+        let funded = controller.airdrop_new_address(0, 0, 25, TargetNode::Primary).unwrap();
+        assert_eq!(funded.label, 101);
+        wait_for(&controller, |snapshot| snapshot.metrics.height_min.unwrap_or_default() >= 2
+            && snapshot.nodes.iter().filter(|node| node.state == "ok").filter_map(|node| node.status.as_ref())
+                .all(|status| status.agent_balances.iter().any(|balance| balance.account_id == funded.address && balance.usd_available == 25)
+                    && status.account_nonces.iter().any(|account| account.account_id == funded.address && account.nonce == 0)));
+        controller.submit_transaction(Transaction::Transfer {
+            from: funded.address, to: unfunded.address, asset: 0, amount: 5, nonce: 0,
+        }, TargetNode::Primary).unwrap();
+        let committed = wait_for(&controller, |snapshot| snapshot.metrics.height_min.unwrap_or_default() >= 3
+            && snapshot.nodes.iter().filter(|node| node.state == "ok").filter_map(|node| node.status.as_ref())
+                .all(|status| status.agent_balances.iter().any(|balance| balance.account_id == funded.address && balance.usd_available == 20)
+                    && status.agent_balances.iter().any(|balance| balance.account_id == unfunded.address && balance.usd_available == 5)
+                    && status.account_nonces.iter().any(|account| account.account_id == funded.address && account.nonce == 1)));
+        let session_dir = PathBuf::from(committed.active_data_dir.as_ref().unwrap());
+        assert!(session_dir.join("keys/account-101.key").exists());
+        assert_eq!(committed.wallet.iter().find(|entry| entry.label == 101).unwrap().address, funded.address);
+        controller.stop_all();
+        wait_for(&controller, |snapshot| !snapshot.running && !snapshot.launching && !snapshot.stopping);
+        let manifest = Arc::new(SessionManifest::load(&session_dir.join("manifest.json")).unwrap());
+        let replayed = light_dex::blockchain::BlockchainState::load_signed(session_dir.join("node-0.json"), manifest).unwrap();
+        assert_eq!(replayed.exchange_state.accounts()[&funded.address].balances[&0].available, 20);
+        assert_eq!(replayed.exchange_state.accounts()[&unfunded.address].balances[&0].available, 5);
+        std::fs::remove_dir_all(base_data).unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns four node processes and requires a built light_dex binary"]
+    fn cluster_commits_order_book_and_replays_signed_archive() {
         let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
         let base_data = std::env::temp_dir().join(format!("light-dex-smoke-{}", rand::random::<u64>()));
-        let mut config = LaunchConfig {
+        let config = LaunchConfig {
             project_dir: project.display().to_string(),
             binary_path: "target/debug/light_dex".into(),
             data_dir: base_data.display().to_string(),
@@ -1493,42 +2195,49 @@ mod tests {
             block_time_ms: 100,
             timeout_ms: 800,
             poll_ms: 100,
+            poll_mode: crate::types::PollMode::All,
             build_before_launch: false,
+            consensus: crate::types::ConsensusAlgorithm::Pbft,
         };
         let controller = ControllerState::default();
         controller.launch(config.clone()).unwrap();
         let ready = wait_for(&controller, |snapshot| snapshot.running && snapshot.metrics.responsive_nodes == 4 && snapshot.metrics.height_min == Some(1));
+        let queried = controller.refresh_node_status(1).unwrap();
+        assert_eq!(queried.node_id, 1);
+        assert!(queried.last_status_at_ms.is_some());
+        assert!(queried.status.is_some());
         let data_dir = ready.active_data_dir.clone().unwrap();
         controller.submit_transaction(Transaction::PlaceOrder {
-            account_id: 0, market_id: 0, order_type: light_dex::exchange::order::OrderType::LO,
+            account_id: wallet_addr(&controller, 0), market_id: 0, order_type: light_dex::exchange::order::OrderType::LO,
             side: light_dex::exchange::order::Side::Sell, price: 100_000, quantity: 1, nonce: 0,
         }, TargetNode::Random).unwrap();
         let committed = wait_for(&controller, |snapshot| snapshot.metrics.height_min.unwrap_or_default() >= 2
             && snapshot.nodes.iter().filter_map(|node| node.status.as_ref())
                 .any(|status| status.order_books.iter().any(|book| book.market_id == 0 && book.asks.first().is_some_and(|level| level.price == 100_000 && level.quantity == 1))));
         assert_eq!(committed.metrics.chain_consistency, "consistent");
-        controller.stop_all();
-        wait_for(&controller, |snapshot| !snapshot.running && !snapshot.launching && !snapshot.stopping && snapshot.metrics.alive_nodes == 0);
-        config.data_dir = data_dir;
-        config.recover_existing = true;
-        controller.launch(config).unwrap();
-        let recovered = wait_for(&controller, |snapshot| snapshot.running && snapshot.metrics.responsive_nodes == 4
-            && snapshot.metrics.height_min.unwrap_or_default() >= 2
-            && snapshot.nodes.iter().filter_map(|node| node.status.as_ref())
-                .all(|status| status.order_books.iter().any(|book| book.asks.first().is_some_and(|level| level.price == 100_000))));
         controller.kill_node(TargetNode::Node { node_id: 0 }).unwrap();
+        assert!(controller.refresh_node_status(0).is_err());
         controller.submit_transaction(Transaction::Transfer {
-            from: 1, to: 2, asset: 0, amount: 5, nonce: 0,
+            from: wallet_addr(&controller, 1), to: wallet_addr(&controller, 2), asset: 0, amount: 5, nonce: 0,
         }, TargetNode::Node { node_id: 2 }).unwrap();
         let after_failover = wait_for(&controller, |snapshot| snapshot.metrics.responsive_nodes == 3
             && snapshot.metrics.views.contains(&1)
             && snapshot.metrics.height_min.unwrap_or_default() >= 3
             && snapshot.nodes.iter().filter(|node| node.state == "ok").filter_map(|node| node.status.as_ref())
-                .all(|status| status.account_nonces.iter().any(|account| account.account_id == 1 && account.nonce == 1)));
+                .all(|status| status.account_nonces.iter().any(|account| account.account_id == wallet_addr(&controller, 1) && account.nonce == 1)));
         controller.stop_all();
         wait_for(&controller, |snapshot| !snapshot.running && !snapshot.launching && !snapshot.stopping && snapshot.metrics.alive_nodes == 0);
-        assert_eq!(recovered.metrics.chain_consistency, "consistent");
         assert_eq!(after_failover.metrics.chain_consistency, "consistent");
+        let manifest = Arc::new(SessionManifest::load(&PathBuf::from(&data_dir).join("manifest.json")).unwrap());
+        let replayed = light_dex::blockchain::BlockchainState::load_signed(
+            PathBuf::from(&data_dir).join("node-1.json"), manifest).unwrap();
+        assert!(replayed.blocks.len() >= 3);
+        assert!(replayed.exchange_state.order_books().get(&0).is_some());
+        let mut recovery = config;
+        recovery.data_dir = data_dir;
+        recovery.recover_existing = true;
+        controller.launch(recovery).unwrap();
+        wait_for(&controller, |snapshot| snapshot.logs.iter().any(|line| line.contains("live recovery is unavailable")));
         std::fs::remove_dir_all(base_data).unwrap();
     }
 
@@ -1542,7 +2251,9 @@ mod tests {
             project_dir: project.display().to_string(), binary_path: "target/debug/light_dex".into(),
             data_dir: base_data.display().to_string(), recover_existing: false,
             node_count: 4, block_time_ms: 500, timeout_ms: 1500, poll_ms: 100,
+            poll_mode: crate::types::PollMode::All,
             build_before_launch: false,
+            consensus: crate::types::ConsensusAlgorithm::Pbft,
         }).unwrap();
         wait_for(&controller, |snapshot| snapshot.running && snapshot.metrics.responsive_nodes == 4 && snapshot.metrics.height_min == Some(1));
         controller.start_load(LoadConfig {
@@ -1558,6 +2269,41 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "spawns node processes and requires a built light_dex binary"]
+    fn invalid_account_signature_is_rejected_before_mempool() {
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let base_data = std::env::temp_dir().join(format!("light-dex-invalid-signature-{}", rand::random::<u64>()));
+        let controller = ControllerState::default();
+        controller.launch(LaunchConfig {
+            project_dir: project.display().to_string(), binary_path: "target/debug/light_dex".into(),
+            data_dir: base_data.display().to_string(), recover_existing: false,
+            node_count: 4, block_time_ms: 200, timeout_ms: 1_500, poll_ms: 100,
+            poll_mode: crate::types::PollMode::All,
+            build_before_launch: false, consensus: crate::types::ConsensusAlgorithm::Pbft,
+        }).unwrap();
+        wait_for(&controller, |snapshot| snapshot.running && snapshot.metrics.height_min == Some(1)
+            && snapshot.metrics.responsive_nodes == 4);
+        let (address, auth_key, mut signed) = {
+            let state = controller.inner.lock().unwrap();
+            let transaction = Transaction::Transfer { from: state.wallet[&0], to: state.wallet[&1], asset: 0, amount: 1, nonce: 0 };
+            let signed = sign_transaction(transaction, state.signing_manifest.as_ref().unwrap(),
+                state.account_keys.get(&0).unwrap()).unwrap();
+            (state.nodes[&0].address.unwrap(), state.auth_key, signed)
+        };
+        let changed = if &signed.signature[..2] == "ff" { "fe" } else { "ff" };
+        signed.signature.replace_range(..2, changed);
+        send_message(address, &Message::SignedTransaction(signed), Duration::from_millis(500), &auth_key).unwrap();
+        let observed = wait_for(&controller, |snapshot| snapshot.nodes.iter().filter_map(|node| node.status.as_ref())
+            .any(|status| status.node_id == 0 && status.authentication_rejections > 0));
+        assert_eq!(observed.metrics.height_min, Some(1));
+        assert!(observed.nodes.iter().filter_map(|node| node.status.as_ref()).all(|status|
+            status.account_nonces.iter().any(|nonce| nonce.account_id == wallet_addr(&controller, 0) && nonce.nonce == 0)));
+        controller.stop_all();
+        wait_for(&controller, |snapshot| !snapshot.running && !snapshot.launching && !snapshot.stopping);
+        std::fs::remove_dir_all(base_data).unwrap();
+    }
+
+    #[test]
     #[ignore = "spawns seven node processes and requires a built light_dex binary"]
     fn seven_nodes_batch_quotes_and_commit_after_primary_kill() {
         use light_dex::exchange::order::{OrderType, Side};
@@ -1568,7 +2314,9 @@ mod tests {
             project_dir: project.display().to_string(), binary_path: "target/debug/light_dex".into(),
             data_dir: base_data.display().to_string(), recover_existing: false,
             node_count: 7, block_time_ms: 500, timeout_ms: 1200, poll_ms: 100,
+            poll_mode: crate::types::PollMode::All,
             build_before_launch: false,
+            consensus: crate::types::ConsensusAlgorithm::Pbft,
         }).unwrap();
         wait_for(&controller, |s| s.running && s.metrics.responsive_nodes == 7 && s.metrics.height_min == Some(1));
         let (primary_address, auth_key) = {
@@ -1577,15 +2325,16 @@ mod tests {
         };
         for (nonce, side, price) in [(0, Side::Buy, 100_000), (1, Side::Sell, 100_010),
             (2, Side::Buy, 99_999), (3, Side::Sell, 100_011)] {
-            send_message(primary_address, &Message::Transaction(Transaction::PlaceOrder {
-                account_id: 90, market_id: 0, order_type: OrderType::LO, side,
+            send_signed_transaction(&controller.inner, primary_address, Transaction::PlaceOrder {
+                account_id: wallet_addr(&controller, 90), market_id: 0, order_type: OrderType::LO, side,
                 price, quantity: 1, nonce,
-            }), Duration::from_millis(500), &auth_key).unwrap();
+            }, &auth_key).unwrap();
         }
-        let batched = wait_for(&controller, |s| s.nodes.iter().filter_map(|n| n.status.as_ref()).any(|status|
+        let batched = wait_for(&controller, |s| s.metrics.height_min.unwrap_or_default() >= 2 &&
+            s.nodes.iter().filter_map(|n| n.status.as_ref()).any(|status|
             status.recent_blocks.iter().any(|b| b.transaction_count >= 2)) &&
             s.nodes.iter().filter_map(|n| n.status.as_ref()).any(|status|
-                status.account_nonces.iter().any(|a| a.account_id == 90 && a.nonce == 4)));
+                status.account_nonces.iter().any(|a| a.account_id == wallet_addr(&controller, 90) && a.nonce == 4)));
         assert!(batched.metrics.height_min.unwrap_or_default() >= 2);
         controller.kill_node(TargetNode::Node { node_id: 0 }).unwrap();
         wait_for(&controller, |s| s.metrics.responsive_nodes == 6 &&
@@ -1595,18 +2344,18 @@ mod tests {
         // the next valid nonce from being proposed.
         for _ in 0..4 {
             let follower_address = controller.inner.lock().unwrap().nodes[&2].address.unwrap();
-            send_message(follower_address, &Message::Transaction(Transaction::PlaceOrder {
-                account_id: 90, market_id: 0, order_type: OrderType::LO,
+            send_signed_transaction(&controller.inner, follower_address, Transaction::PlaceOrder {
+                account_id: wallet_addr(&controller, 90), market_id: 0, order_type: OrderType::LO,
                 side: Side::Buy, price: 100_000, quantity: 1, nonce: 0,
-            }), Duration::from_millis(500), &auth_key).unwrap();
+            }, &auth_key).unwrap();
         }
         controller.submit_transaction(Transaction::PlaceOrder {
-            account_id: 90, market_id: 0, order_type: OrderType::LO,
+            account_id: wallet_addr(&controller, 90), market_id: 0, order_type: OrderType::LO,
             side: Side::Buy, price: 99_998, quantity: 1, nonce: 4,
         }, TargetNode::Node { node_id: 2 }).unwrap();
         let recovered = wait_for(&controller, |s| s.metrics.responsive_nodes == 6 &&
             s.nodes.iter().filter(|n| n.state == "ok").filter_map(|n| n.status.as_ref()).all(|status|
-                status.current_view >= 1 && status.account_nonces.iter().any(|a| a.account_id == 90 && a.nonce == 5)));
+                status.current_view >= 1 && status.account_nonces.iter().any(|a| a.account_id == wallet_addr(&controller, 90) && a.nonce == 5)));
         assert_eq!(recovered.metrics.chain_consistency, "consistent");
         controller.stop_all();
         wait_for(&controller, |s| !s.running && !s.launching && !s.stopping && s.metrics.alive_nodes == 0);
@@ -1623,7 +2372,9 @@ mod tests {
             project_dir: project.display().to_string(), binary_path: "target/debug/light_dex".into(),
             data_dir: base_data.display().to_string(), recover_existing: false,
             node_count: 4, block_time_ms: 500, timeout_ms: 1500, poll_ms: 100,
+            poll_mode: crate::types::PollMode::All,
             build_before_launch: false,
+            consensus: crate::types::ConsensusAlgorithm::Pbft,
         }).unwrap();
         wait_for(&controller, |s| s.running && s.metrics.responsive_nodes == 4 && s.metrics.height_min == Some(1));
         let id = 1;
@@ -1643,11 +2394,151 @@ mod tests {
         assert!(market_maker_step(&controller.inner, id));
         let committed = wait_for(&controller, |s| s.nodes.iter().filter_map(|n| n.status.as_ref()).any(|status|
             status.recent_blocks.iter().any(|b| b.transaction_count >= 4) &&
-            status.account_nonces.iter().any(|a| a.account_id == 90 && a.nonce == 4)));
+            status.account_nonces.iter().any(|a| a.account_id == wallet_addr(&controller, 90) && a.nonce == 4)));
         assert_eq!(committed.market_maker.own_open_orders, 4);
         controller.stop_all();
         wait_for(&controller, |s| !s.running && !s.launching && !s.stopping && s.metrics.alive_nodes == 0);
         std::fs::remove_dir_all(base_data).unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns node processes and requires a built light_dex binary"]
+    fn hotstuff_commits_and_changes_leader_after_primary_kill() {
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let base_data = std::env::temp_dir().join(format!("light-dex-hotstuff-{}", rand::random::<u64>()));
+        let controller = ControllerState::default();
+        controller.launch(LaunchConfig {
+            project_dir: project.display().to_string(),
+            binary_path: "target/debug/light_dex".into(),
+            data_dir: base_data.display().to_string(),
+            recover_existing: false,
+            node_count: 4,
+            block_time_ms: 200,
+            timeout_ms: 1500,
+            poll_ms: 100,
+            poll_mode: crate::types::PollMode::All,
+            build_before_launch: false,
+            consensus: crate::types::ConsensusAlgorithm::Hotstuff,
+        }).unwrap();
+        wait_for(&controller, |s| s.running && s.metrics.responsive_nodes == 4 && s.metrics.height_min == Some(1));
+        controller.submit_transaction(Transaction::Transfer {
+            from: wallet_addr(&controller, 0), to: wallet_addr(&controller, 1), asset: 0, amount: 1, nonce: 0,
+        }, TargetNode::Random).unwrap();
+        wait_for(&controller, |s| s.metrics.height_min == Some(2));
+        controller.kill_node(TargetNode::Node { node_id: 0 }).unwrap();
+        controller.submit_transaction(Transaction::Transfer {
+            from: wallet_addr(&controller, 1), to: wallet_addr(&controller, 2), asset: 0, amount: 1, nonce: 0,
+        }, TargetNode::Node { node_id: 2 }).unwrap();
+        let recovered = wait_for(&controller, |s| s.metrics.responsive_nodes == 3
+            && s.nodes.iter().filter(|node| node.state == "ok").filter_map(|node| node.status.as_ref())
+                .all(|status| status.chain_height >= 3 && status.current_view > 0));
+        assert_eq!(recovered.metrics.chain_consistency, "consistent");
+        controller.stop_all();
+        wait_for(&controller, |s| !s.running && !s.launching && !s.stopping && s.metrics.alive_nodes == 0);
+        std::fs::remove_dir_all(base_data).unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns seven node processes and requires a built light_dex binary"]
+    fn hotstuff_two_paused_replicas_rejoin() {
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let base_data = std::env::temp_dir().join(format!("light-dex-hotstuff-sync-{}", rand::random::<u64>()));
+        let controller = ControllerState::default();
+        controller.launch(LaunchConfig {
+            project_dir: project.display().to_string(), binary_path: "target/debug/light_dex".into(),
+            data_dir: base_data.display().to_string(), recover_existing: false,
+            node_count: 7, block_time_ms: 150, timeout_ms: 3000, poll_ms: 100,
+            poll_mode: crate::types::PollMode::All,
+            build_before_launch: false, consensus: crate::types::ConsensusAlgorithm::Hotstuff,
+        }).unwrap();
+        wait_for(&controller, |s| s.running && s.metrics.responsive_nodes == 7 && s.metrics.height_min == Some(1));
+        for node_id in [5, 6] {
+            controller.pause_node(TargetNode::Node { node_id }, 8_000).unwrap();
+        }
+        wait_for(&controller, |s| [5, 6].iter().all(|id| s.nodes.iter().any(|node|
+            node.node_id == *id && node.state == "paused")));
+        for account in 0..4 {
+            controller.submit_transaction(Transaction::Transfer {
+                from: wallet_addr(&controller, account), to: wallet_addr(&controller, account + 10), asset: 0, amount: 1, nonce: 0,
+            }, TargetNode::Node { node_id: 0 }).unwrap();
+            let height = account as usize + 2;
+            wait_for(&controller, |s| s.nodes.iter().filter(|node| node.node_id < 5)
+                .all(|node| node.status.as_ref().is_some_and(|status| status.chain_height >= height)));
+        }
+        let caught_up = wait_for(&controller, |s| s.metrics.responsive_nodes == 7
+            && s.nodes.iter().all(|node| node.status.as_ref().is_some_and(|status| status.chain_height >= 5)));
+        assert_eq!(caught_up.metrics.chain_consistency, "consistent");
+        controller.stop_all();
+        wait_for(&controller, |s| !s.running && !s.launching && !s.stopping && s.metrics.alive_nodes == 0);
+        std::fs::remove_dir_all(base_data).unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns a HotStuff cluster and thirteen participants"]
+    fn hotstuff_thirteen_participants_stay_live() {
+        struct StopOnDrop(ControllerState);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.stop_all();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline {
+                    let snapshot = self.0.snapshot();
+                    if !snapshot.running && !snapshot.launching && !snapshot.stopping && snapshot.metrics.alive_nodes == 0 { break; }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let node_count = std::env::var("LIGHT_DEX_FLEET_TEST_NODES").ok().and_then(|value| value.parse().ok()).unwrap_or(7);
+        let binary_path = std::env::var("LIGHT_DEX_FLEET_TEST_BINARY").unwrap_or_else(|_| "target/debug/light_dex".into());
+        let base_data = std::env::temp_dir().join(format!("light-dex-hotstuff-fleet-{}", rand::random::<u64>()));
+        let controller = ControllerState::default();
+        let _guard = StopOnDrop(controller.clone());
+        controller.launch(LaunchConfig {
+            project_dir: project.display().to_string(), binary_path,
+            data_dir: base_data.display().to_string(), recover_existing: false,
+            node_count, block_time_ms: 500, timeout_ms: 1_500, poll_ms: 200,
+            poll_mode: crate::types::PollMode::RoundRobin,
+            build_before_launch: false, consensus: crate::types::ConsensusAlgorithm::Hotstuff,
+        }).unwrap();
+        wait_for(&controller, |s| s.running && s.metrics.responsive_nodes == node_count as usize && s.metrics.height_min == Some(1));
+        {
+            let mut state = controller.inner.lock().unwrap();
+            state.feed_started = true;
+            state.feed_depth = Some(PartialDepth {
+                last_update_id: 1,
+                bids: vec![["100000".into(), "1".into()], ["99999".into(), "1".into()], ["99998".into(), "1".into()]],
+                asks: vec![["100010".into(), "1".into()], ["100011".into(), "1".into()], ["100012".into(), "1".into()]],
+            });
+            state.feed_at = Some(Instant::now());
+            state.feed_history.push_back((Instant::now(), 100_005.0));
+        }
+        controller.start_agents(crate::participant_fleet_template()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            {
+                let mut state = controller.inner.lock().unwrap();
+                state.feed_at = Some(Instant::now());
+            }
+            let snapshot = controller.snapshot();
+            assert_eq!(snapshot.metrics.alive_nodes, node_count as usize, "logs: {:?}", snapshot.logs.iter().rev().take(20).collect::<Vec<_>>());
+            assert_eq!(snapshot.agents.len(), 13);
+            thread::sleep(Duration::from_millis(200));
+        }
+        let snapshot = controller.snapshot();
+        eprintln!("HotStuff fleet under load: height {:?}-{:?}, responsive {}, submitted {}, committed {:?}",
+            snapshot.metrics.height_min, snapshot.metrics.height_max, snapshot.metrics.responsive_nodes,
+            snapshot.metrics.submitted, snapshot.nodes.iter().filter_map(|node| node.status.as_ref().map(|status| status.transactions_committed)).max());
+        controller.stop_agents((1..=13).collect()).unwrap();
+        let settled = wait_for(&controller, |s| s.agents.is_empty() && s.metrics.responsive_nodes == node_count as usize
+            && s.metrics.height_min == s.metrics.height_max && s.metrics.chain_consistency == "consistent");
+        eprintln!("HotStuff fleet settled: height {:?}, all {} nodes consistent", settled.metrics.height_min, settled.metrics.responsive_nodes);
+        controller.stop_all();
+        wait_for(&controller, |s| !s.running && !s.launching && !s.stopping && s.metrics.alive_nodes == 0);
+        std::fs::remove_dir_all(base_data).unwrap();
+        assert!(snapshot.metrics.submitted > 0);
+        assert!(snapshot.metrics.height_min.unwrap_or_default() > 1);
+        assert_eq!(snapshot.metrics.responsive_nodes, node_count as usize);
     }
 
     #[test]
@@ -1660,7 +2551,9 @@ mod tests {
             project_dir: project.display().to_string(), binary_path: "target/debug/light_dex".into(),
             data_dir: base_data.display().to_string(), recover_existing: false,
             node_count: 4, block_time_ms: 100, timeout_ms: 1500, poll_ms: 100,
+            poll_mode: crate::types::PollMode::All,
             build_before_launch: false,
+            consensus: crate::types::ConsensusAlgorithm::Pbft,
         }).unwrap();
         wait_for(&controller, |snapshot| snapshot.running && snapshot.metrics.responsive_nodes == 4 && snapshot.metrics.height_min == Some(1));
         controller.start_market_maker(MarketMakerConfig {
@@ -1681,7 +2574,7 @@ mod tests {
         }).unwrap();
         wait_for(&controller, |snapshot| snapshot.nodes.iter().filter(|node| node.state == "ok")
             .filter_map(|node| node.status.as_ref()).any(|status| status.account_nonces.iter()
-                .any(|account| account.account_id == 80 && account.nonce > 0)));
+                .any(|account| account.account_id == wallet_addr(&controller, 80) && account.nonce > 0)));
         controller.stop_load();
         controller.stop_market_maker();
         let cleared = wait_for(&controller, |snapshot| !snapshot.market_maker.running
@@ -1692,12 +2585,16 @@ mod tests {
         std::fs::remove_dir_all(base_data).unwrap();
     }
 
+    fn wallet_addr(controller: &ControllerState, label: u64) -> Address {
+        controller.inner.lock().unwrap().wallet[&label]
+    }
+
     fn wait_for(controller: &ControllerState, predicate: impl Fn(&ControlSnapshot) -> bool) -> ControlSnapshot {
         let deadline = Instant::now() + Duration::from_secs(25);
         loop {
             let snapshot = controller.snapshot();
             if predicate(&snapshot) { return snapshot; }
-            assert!(Instant::now() < deadline, "timed out waiting for cluster; relevant logs: {:?}; statuses: {:?}", snapshot.logs.iter().filter(|line| line.contains("Submitted") || line.contains("timeout view") || line.contains("primary changed") || line.contains("committed seq") || line.contains("failed forwarding") || line.contains("rejected proposal")).collect::<Vec<_>>(), snapshot.nodes.iter().map(|node| (node.node_id, node.state.clone(), node.status.as_ref().map(|status| (status.chain_height, status.current_view, status.account_nonces.iter().find(|account| account.account_id == 1).map(|account| account.nonce), status.recent_transaction_outcomes.clone())))).collect::<Vec<_>>());
+            assert!(Instant::now() < deadline, "timed out waiting for cluster; logs: {:?}; statuses: {:?}", snapshot.logs.iter().rev().take(30).collect::<Vec<_>>(), snapshot.nodes.iter().map(|node| (node.node_id, node.state.clone(), node.status.as_ref().map(|status| (status.chain_height, status.current_view, status.account_nonces.iter().find(|account| Some(account.account_id) == snapshot.wallet.iter().find(|entry| entry.label == 1).map(|entry| entry.address)).map(|account| account.nonce), status.recent_transaction_outcomes.clone())))).collect::<Vec<_>>());
             thread::sleep(Duration::from_millis(100));
         }
     }

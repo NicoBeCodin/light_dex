@@ -17,7 +17,7 @@ pub enum OrderBookError {
     SelfTrade,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fill {
     pub maker_order_id: OrderId,
     pub maker_account: AccountId,
@@ -102,6 +102,39 @@ impl OrderBook {
         false
     }
 
+    /// Determine fills without changing the book. Exchange settlement uses
+    /// this to validate balances before applying the book mutation.
+    pub fn preview_order(&self, order: &Order, order_type: OrderType) -> Result<MatchResult, OrderBookError> {
+        if order.price == 0 || order.remaining_quantity == 0 { return Err(OrderBookError::InvalidOrder); }
+        if self.would_self_trade(order) { return Err(OrderBookError::SelfTrade); }
+        let mut remaining = order.remaining_quantity;
+        let mut fills = Vec::new();
+        let levels: Box<dyn Iterator<Item = (&u64, &VecDeque<Order>)> + '_> = match order.side {
+            Side::Buy => Box::new(self.asks.iter()),
+            Side::Sell => Box::new(self.bids.iter().rev()),
+        };
+        for (&price, makers) in levels {
+            if (order.side == Side::Buy && price > order.price)
+                || (order.side == Side::Sell && price < order.price) { break; }
+            for maker in makers {
+                let quantity = maker.remaining_quantity.min(remaining);
+                if quantity == 0 { break; }
+                fills.push(Fill {
+                    maker_order_id: maker.id,
+                    maker_account: maker.account,
+                    maker_filled: quantity == maker.remaining_quantity,
+                    price,
+                    quantity,
+                });
+                remaining -= quantity;
+                if remaining == 0 { break; }
+            }
+            if remaining == 0 { break; }
+        }
+        if order_type == OrderType::FOK && remaining > 0 { return Err(OrderBookError::KilledFOK); }
+        Ok(MatchResult { fills, remaining })
+    }
+
     pub fn apply_order(&mut self, mut order: Order, order_type: OrderType) -> Result<MatchResult, OrderBookError> {
         if order.price == 0 || order.remaining_quantity == 0 { return Err(OrderBookError::InvalidOrder); }
         if self.would_self_trade(&order) { return Err(OrderBookError::SelfTrade); }
@@ -140,10 +173,21 @@ impl OrderBook {
     pub fn cancel_order(&mut self, order_id: OrderId, side: Side, price: u64, account_id: AccountId) -> Result<Order, OrderBookError> {
         let levels = match side { Side::Buy => &mut self.bids, Side::Sell => &mut self.asks };
         let orders = levels.get_mut(&price).ok_or(OrderBookError::InexistentOrder)?;
-        let index = orders.iter().position(|order| order.id == order_id && order.account == account_id)
-            .ok_or(OrderBookError::InexistentOrder)?;
+        let index = orders.binary_search_by_key(&order_id, |order| order.id).map_err(|_| OrderBookError::InexistentOrder)?;
+        if orders[index].account != account_id{
+            return Err(OrderBookError::InexistentOrder);
+        }
         let order = orders.remove(index).expect("order index exists");
         if orders.is_empty() { levels.remove(&price); }
         Ok(order)
+    }
+
+    pub fn find_order(&self, order_id: OrderId, side: Side, price: u64, account_id: AccountId) -> Option<&Order> {
+        let levels = match side { Side::Buy => &self.bids, Side::Sell => &self.asks };
+        let order_level = levels.get(&price)?;
+        order_level.binary_search_by_key(&order_id, |order| order.id)
+            .ok()
+            .and_then(|index| order_level.get(index))
+            .filter(|order| order.account == account_id)
     }
 }

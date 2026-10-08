@@ -6,15 +6,19 @@ use std::io;
 
 use crate::{
     blockchain::Transaction,
-    consensus::pbft::ConsensusMessage,
+    consensus::ConsensusMessage,
+    crypto::{PeerHandshake, SignedConsensusMessage, SignedTransaction},
     node::ControlMessage,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Message {
     Consensus(ConsensusMessage),
+    SignedConsensus(SignedConsensusMessage),
     Control(ControlMessage),
     Transaction(Transaction),
+    SignedTransaction(SignedTransaction),
+    PeerHandshake(PeerHandshake),
 }
 
 #[derive(Serialize, Deserialize)]

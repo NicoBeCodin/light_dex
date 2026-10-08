@@ -1,0 +1,22 @@
+# perf record: 757 samples, exchange microbench only; function self percentages
+
+    22.20%  exchange_microb  exchange_microbench  [.] sha2::sha256::soft::unroll::compress
+    11.23%  exchange_microb  libc.so.6            [.] _int_malloc
+     7.87%  exchange_microb  libc.so.6            [.] _int_free
+     7.45%  exchange_microb  libc.so.6            [.] malloc_consolidate
+     4.77%  exchange_microb  exchange_microbench  [.] <hashbrown::raw::RawTable<T,A> as core::ops::drop::Drop>::drop
+     4.10%  exchange_microb  libc.so.6            [.] malloc
+     3.85%  exchange_microb  exchange_microbench  [.] <alloc::collections::vec_deque::VecDeque<T,A> as core::clone::Clone>::clone
+     3.55%  exchange_microb  libc.so.6            [.] cfree@GLIBC_2.2.5
+     3.03%  exchange_microb  exchange_microbench  [.] <alloc::collections::vec_deque::VecDeque<T,A> as core::clone::Clone>::clone
+     2.71%  exchange_microb  exchange_microbench  [.] <hashbrown::raw::RawTable<T,A> as core::clone::Clone>::clone
+     2.38%  exchange_microb  exchange_microbench  [.] <hashbrown::raw::RawTable<T,A> as core::clone::Clone>::clone
+     2.14%  exchange_microb  exchange_microbench  [.] <hashbrown::raw::RawTable<T,A> as core::clone::Clone>::clone
+     2.09%  exchange_microb  libc.so.6            [.] unlink_chunk.isra.0
+     2.04%  exchange_microb  libc.so.6            [.] __memmove_avx_unaligned_erms
+     1.90%  exchange_microb  exchange_microbench  [.] _ZN96_$LT$alloc..collections..btree..map..BTreeMap$LT$K$C$V$C$A$GT$$u20$as$u20$core..clone..Clone$GT$5clone13clone_subtree17hfb0bb27aaef93d36E.llvm.6858865688148561543
+     1.78%  exchange_microb  exchange_microbench  [.] light_dex::exchange::ExchangeState::state_digest
+     1.66%  exchange_microb  exchange_microbench  [.] <hashbrown::raw::RawTable<T,A> as core::ops::drop::Drop>::drop
+     1.66%  exchange_microb  exchange_microbench  [.] <hashbrown::raw::RawTable<T,A> as core::clone::Clone>::clone
+     1.36%  exchange_microb  exchange_microbench  [.] alloc::collections::btree::navigate::<impl alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Dying,K,V,alloc::collections::btree::node::marker::Leaf>,alloc::collections::btree::node::marker::Edge>>::deallocating_next
+     1.23%  exchange_microb  exchange_microbench  [.] _ZN96_$LT$alloc..collections..btree..map..BTreeMap$LT$K$C$V$C$A$GT$$u20$as$u20$core..clone..Clone$GT$5clone13clone_subtree17habe8e2e81b709d4dE.llvm.5502978390525859261

@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use ed25519_dalek::SigningKey;
+use crate::crypto::{SessionManifest, SignedConsensusMessage};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -6,89 +9,17 @@ use std::{
 };
 
 use crate::{
-    blockchain::{Block, Digest, Proposal},
-    node::NodeId,
+    blockchain::{Block, Digest, Proposal}, consensus::{Consensus, ConsensusEvent, ConsensusMessage}, node::NodeId
 };
+use crate::consensus::{ConsensusAction, CommitCertificate, EvidenceStore};
 
 const DEFAULT_TIMEOUT_MS: u64 = 1000;
 
-pub trait Consensus {
-    fn set_node_count(&mut self, count: u64);
-    fn restore_from_height(&mut self, height: u64);
 
-    fn on_start(&mut self) -> Vec<ConsensusAction>;
 
-    fn on_event(
-        &mut self,
-        event: ConsensusEvent,
-    ) -> Vec<ConsensusAction>;
-
-    fn primary_for_view(&self, view: u64) -> NodeId;
-
-    fn prepare_quorum(&self) -> u64;
-
-    fn commit_quorum(&self) -> u64;
-
-    fn f(&self) -> u64;
-
-    fn can_propose(&self) -> bool;
-
-    fn consensus_started(&mut self, turn_on: bool) -> bool;
-
-    fn current_primary(&self) -> NodeId;
-
-    fn set_timeout(&mut self, timeout_ms: u64);
-
-    fn get_timeout(&self) -> u64;
-
-    //
-    // Monitoring API
-    //
-    fn current_view(&self) -> u64;
-
-    fn next_sequence(&self) -> u64;
-
-    fn has_active_proposal(&self) -> bool;
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub enum ConsensusMessage {
-    Pbft(PbftMessage),
-}
-
-pub enum ConsensusAction {
-    Broadcast(ConsensusMessage),
-
-    Send {
-        peer: NodeId,
-        message: ConsensusMessage,
-    },
-
-    Commit(Proposal),
-
-    ScheduleTimeout {
-        view: u64,
-        sequence: u64,
-        duration: Duration,
-    },
-}
-
-pub enum ConsensusEvent {
-    Message {
-        from: NodeId,
-        message: ConsensusMessage,
-    },
-
-    Timeout {
-        view: u64,
-        sequence: u64,
-    },
-
-    Proposal(Block),
-}
-
-#[derive(Debug)]
 pub struct Pbft {
+    chain_id: Option<String>,
+    evidence: EvidenceStore,
     view: u64,
 
     next_sequence: u64,
@@ -111,7 +42,7 @@ pub struct Pbft {
 
     consensus_started: bool,
 
-    view_changes: HashMap<u64, HashSet<NodeId>>,
+    view_changes: HashMap<(u64, u64), HashSet<NodeId>>,
 
     timeout_ms: u64,
 }
@@ -145,6 +76,7 @@ pub enum PbftMessage {
     NewView {
         view: u64,
         sequence: u64,
+        proofs: Vec<SignedConsensusMessage>,
     },
 }
 
@@ -161,6 +93,8 @@ impl Pbft {
         node_count: u64,
     ) -> Self {
         Pbft {
+            chain_id: None,
+            evidence: EvidenceStore::default(),
             view: 0,
 
             next_sequence: 0,
@@ -202,7 +136,7 @@ impl Pbft {
         //
         if sequence != self.next_sequence
             || view != self.view
-            || from != self.primary_for_view(view)
+            || from != self.leader_for_view(view)
         {
             return vec![];
         }
@@ -436,7 +370,7 @@ impl Pbft {
         //
         let already_voted = self
             .view_changes
-            .get(&new_view)
+            .get(&(new_view, sequence))
             .is_some_and(|votes| {
                 votes.contains(&self.node_id)
             });
@@ -446,7 +380,7 @@ impl Pbft {
         }
 
         self.view_changes
-            .entry(new_view)
+            .entry((new_view, sequence))
             .or_default()
             .insert(self.node_id);
 
@@ -478,13 +412,13 @@ impl Pbft {
         }
 
         self.view_changes
-            .entry(new_view)
+            .entry((new_view, sequence))
             .or_default()
             .insert(from);
 
         let count = self
             .view_changes
-            .get(&new_view)
+            .get(&(new_view, sequence))
             .map(|votes| votes.len())
             .unwrap_or(0) as u64;
 
@@ -495,24 +429,26 @@ impl Pbft {
         //
         // Only the next primary announces NEW_VIEW.
         //
-        if self.node_id != self.primary_for_view(new_view) {
+        if self.node_id != self.leader_for_view(new_view) {
             return vec![];
         }
 
+        let mut voters = self.view_changes[&(new_view, sequence)].iter().copied().collect::<Vec<_>>();
+        voters.sort_unstable();
+        let proofs = if self.evidence.manifest().is_some() {
+            let example = ConsensusMessage::Pbft(PbftMessage::ViewChange { new_view, sequence });
+            let Some(proofs) = self.evidence.proofs(&example, &voters) else { return vec![]; };
+            proofs
+        } else { Vec::new() };
         self.view = new_view;
-
         self.active_proposal = None;
-
-        println!(
-            "Node {} became primary for view {}",
-            self.node_id, self.view
-        );
-
+        println!("Node {} became primary for view {}", self.node_id, self.view);
         vec![ConsensusAction::Broadcast(
             ConsensusMessage::Pbft(
                 PbftMessage::NewView {
                     view: new_view,
                     sequence,
+                    proofs,
                 },
             ),
         )]
@@ -522,13 +458,18 @@ impl Pbft {
         &mut self,
         from: NodeId,
         view: u64,
-        _sequence: u64,
+        sequence: u64,
+        proofs: Vec<SignedConsensusMessage>,
     ) -> Vec<ConsensusAction> {
-        if from != self.primary_for_view(view) {
+        if from != self.leader_for_view(view) {
             return vec![];
         }
 
         if view <= self.view {
+            return vec![];
+        }
+        if self.evidence.manifest().is_some() &&
+            crate::crypto::verify_pbft_new_view(view, sequence, &proofs, self.evidence.manifest().unwrap()).is_err() {
             return vec![];
         }
 
@@ -540,7 +481,7 @@ impl Pbft {
             "Node {} entering view {}. Primary = {}",
             self.node_id,
             view,
-            self.primary_for_view(view)
+            self.leader_for_view(view)
         );
 
         vec![]
@@ -548,6 +489,22 @@ impl Pbft {
 }
 
 impl Consensus for Pbft {
+    fn set_chain_id(&mut self, chain_id: String) { self.chain_id = Some(chain_id); }
+    fn set_signer(&mut self, manifest: Arc<SessionManifest>, key: SigningKey) {
+        self.evidence.set_signer(manifest, key, self.node_id);
+    }
+    fn record_verified(&mut self, message: SignedConsensusMessage) { self.evidence.record(message); }
+    fn commit_certificate(&mut self, block: &Block) -> Option<CommitCertificate> {
+        let key = self.committed.iter().find(|key| key.digest == block.to_digest() && key.sequence == block.sequence)?.clone();
+        let mut voters = self.commits.get(&key)?.iter().copied().collect::<Vec<_>>();
+        voters.sort_unstable();
+        if voters.len() < self.commit_quorum() as usize { return None; }
+        let message = ConsensusMessage::Pbft(PbftMessage::Commit {
+            view: key.view, sequence: key.sequence, digest: key.digest,
+        });
+        let proofs = self.evidence.proofs(&message, &voters)?;
+        Some(CommitCertificate::Pbft { view: key.view, sequence: key.sequence, digest: key.digest, proofs })
+    }
     fn set_node_count(&mut self, count: u64) {
         self.node_count = count;
     }
@@ -562,11 +519,14 @@ impl Consensus for Pbft {
         //
         // View 0 primary creates genesis block.
         //
-        if self.node_id != self.primary_for_view(self.view) {
+        if self.node_id != self.leader_for_view(self.view) {
             return vec![];
         }
 
-        let block = Block::new_initial_block();
+        let block = self.evidence.manifest().map(|manifest| Block::new_initial_block_signed(
+            &manifest.chain_id,
+            crate::message::hex_decode(&manifest.initial_state_root).expect("validated initial state root"),
+        )).unwrap_or_else(Block::new_initial_block);
 
         let proposal = Proposal { block };
 
@@ -580,6 +540,7 @@ impl Consensus for Pbft {
 
         self.active_proposal = Some(key.clone());
 
+        self.prepares.entry(key.clone()).or_default().insert(self.node_id);
         self.proposals.insert(
             key,
             proposal.clone(),
@@ -596,6 +557,10 @@ impl Consensus for Pbft {
                     },
                 ),
             ),
+
+            ConsensusAction::Broadcast(ConsensusMessage::Pbft(PbftMessage::Prepare {
+                view: self.view, sequence: self.next_sequence, digest,
+            })),
 
             ConsensusAction::ScheduleTimeout {
                 view: self.view,
@@ -630,6 +595,8 @@ impl Consensus for Pbft {
 
                 self.active_proposal = Some(key.clone());
 
+                self.prepares.entry(key.clone()).or_default().insert(self.node_id);
+
                 self.proposals.insert(
                     key,
                     proposal.clone(),
@@ -646,6 +613,10 @@ impl Consensus for Pbft {
                             },
                         ),
                     ),
+
+                    ConsensusAction::Broadcast(ConsensusMessage::Pbft(PbftMessage::Prepare {
+                        view: self.view, sequence: self.next_sequence, digest,
+                    })),
 
                     ConsensusAction::ScheduleTimeout {
                         view: self.view,
@@ -711,12 +682,18 @@ impl Consensus for Pbft {
                         PbftMessage::NewView {
                             view,
                             sequence,
+                            proofs,
                         } => self.handle_new_view(
                             from,
                             view,
                             sequence,
+                            proofs,
                         ),
                     }
+                }
+                _=>{
+                    eprintln!("Wrong protocol!");
+                    vec![]
                 }
             },
 
@@ -727,19 +704,35 @@ impl Consensus for Pbft {
                 view,
                 sequence,
             ),
+            ConsensusEvent::TransactionAvailable => {
+                if self.node_id == self.current_primary() { Vec::new() } else {
+                    vec![ConsensusAction::ScheduleTimeout {
+                        view: self.view,
+                        sequence: self.next_sequence,
+                        duration: Duration::from_millis(self.timeout_ms),
+                    }]
+                }
+            }
+            ConsensusEvent::LeaderUnavailable => {
+                self.handle_timeout(self.view, self.next_sequence)
+            }
         }
     }
 
-    fn primary_for_view(&self, view: u64) -> NodeId {
+    fn leader_for_view(&self, view: u64) -> NodeId {
         view % self.node_count
     }
 
     fn prepare_quorum(&self) -> u64 {
-        2 * self.f()
+        crate::consensus::quorum_size(self.node_count)
     }
 
     fn commit_quorum(&self) -> u64 {
-        2 * self.f() + 1
+        crate::consensus::quorum_size(self.node_count)
+    }
+
+    fn quorum(&self)->u64{
+        crate::consensus::quorum_size(self.node_count)
     }
 
     fn f(&self) -> u64 {
@@ -747,7 +740,7 @@ impl Consensus for Pbft {
     }
 
     fn can_propose(&self) -> bool {
-        self.node_id == self.primary_for_view(self.view)
+        self.node_id == self.leader_for_view(self.view)
             && self.active_proposal.is_none()
     }
 
@@ -760,7 +753,7 @@ impl Consensus for Pbft {
     }
 
     fn current_primary(&self) -> NodeId {
-        self.primary_for_view(self.view)
+        self.leader_for_view(self.view)
     }
 
     fn set_timeout(&mut self, timeout_ms: u64) {

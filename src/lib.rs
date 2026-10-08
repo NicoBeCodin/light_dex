@@ -1,5 +1,6 @@
 
 pub mod blockchain;
+pub mod crypto;
 pub mod consensus;
 pub mod message;
 pub mod network;

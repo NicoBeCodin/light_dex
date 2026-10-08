@@ -11,6 +11,12 @@ pub struct PartialDepth {
     pub asks: Vec<[String; 2]>,
 }
 
+pub fn mid_price(depth: &PartialDepth) -> Option<f64> {
+    let bid: f64 = depth.bids.first()?.get(0)?.parse().ok()?;
+    let ask: f64 = depth.asks.first()?.get(0)?.parse().ok()?;
+    (bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > bid).then_some((bid + ask) / 2.0)
+}
+
 fn integer_price(price: &str, bid: bool) -> Option<u64> {
     let value: f64 = price.parse().ok()?;
     if !value.is_finite() || value <= 0.0 || value > u64::MAX as f64 {

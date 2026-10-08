@@ -1,5 +1,11 @@
 /target/
-/benchmark_results/control-plane-state/
+/benchmark_results/
+**/keys/*.key
+**/wallet.json
+**/wallet.json.tmp-*
+**/validator-*.started
+__pycache__/
+*.pyc
 
 # Keep local screenshots untracked, but commit the icons Tauri needs to build.
 *.png

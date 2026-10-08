@@ -11,21 +11,35 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    blockchain::{BlockchainState, Digest, Transaction},
-    consensus::pbft::{Consensus, ConsensusAction, ConsensusEvent, ConsensusMessage, PbftMessage},
-    message::{Message, sign_line},
-    network::{Network, NetworkEvent},
-    exchange::orderbook::OrderBookSnapshot,
+    blockchain::{Block, BlockchainState, Digest, Trade, Transaction}, consensus::{CommitCertificate, Consensus, ConsensusAction, ConsensusEvent}, exchange::orderbook::OrderBookSnapshot, message::{Message, sign_line, verify_line}, network::{Network, NetworkEvent}
 };
+use crate::crypto::{SessionManifest, SignedConsensusMessage, SignedTransaction, sign_consensus, verify_consensus, verify_transaction};
+use crate::exchange::address::Address;
+use ed25519_dalek::SigningKey;
+use std::sync::Arc;
+
+const SYNC_BATCH_SIZE: usize = 32;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BlockSyncResponse {
+    from_sequence: u64,
+    chain_height: u64,
+    blocks: Vec<Block>,
+    #[serde(default)]
+    certificates: Vec<Option<CommitCertificate>>,
+}
 
 pub type NodeId = u64;
 
 #[derive(Debug, Default)]
 struct NodeMetrics {
+    authentication_rejections: u64,
     transactions_received: u64,
 
     blocks_committed: u64,
     transactions_committed: u64,
+    transactions_failed: u64,
+    trades_committed: u64,
 
     commit_latency_sum_ms: u128,
     commit_latency_samples: u64,
@@ -33,6 +47,9 @@ struct NodeMetrics {
     last_commit_latency_ms: Option<u128>,
 
     transaction_received_at: HashMap<Digest, Instant>,
+    recent_commit_latency_ms: VecDeque<u64>,
+    catch_up_events: u64,
+    blocks_caught_up: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, TS)]
@@ -44,14 +61,23 @@ pub struct BlockSummary {
 
 #[derive(Debug, Serialize, Deserialize, Clone, TS)]
 pub struct AccountNonce {
-    pub account_id: u64,
+    pub account_id: Address,
     pub nonce: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, TS)]
+pub struct AgentBalance {
+    pub account_id: Address,
+    pub usd_available: u64,
+    pub usd_locked: u64,
+    pub btc_available: u64,
+    pub btc_locked: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, TS)]
 pub struct TransactionOutcome {
     pub digest: String,
-    pub account_id: u64,
+    pub account_id: Address,
     pub nonce: u64,
     pub success: bool,
     pub error: Option<String>,
@@ -61,6 +87,9 @@ pub struct TransactionOutcome {
 pub struct NodeStatus {
     pub node_id: NodeId,
     pub pid: u32,
+    pub chain_id: String,
+    pub signing_enabled: bool,
+    pub authentication_rejections: u64,
 
     pub network_ready: bool,
     pub peer_count: usize,
@@ -82,28 +111,34 @@ pub struct NodeStatus {
     pub transactions_received: u64,
     pub blocks_committed: u64,
     pub transactions_committed: u64,
+    pub transactions_failed: u64,
+    pub trades_committed: u64,
 
     pub average_commit_latency_ms: f64,
     pub last_commit_latency_ms: Option<u128>,
+    pub recent_commit_latency_ms: Vec<u64>,
+    pub catch_up_events: u64,
+    pub blocks_caught_up: u64,
 
     pub recent_blocks: Vec<BlockSummary>,
     pub account_nonces: Vec<AccountNonce>,
+    pub agent_balances: Vec<AgentBalance>,
     pub recent_transaction_outcomes: Vec<TransactionOutcome>,
     pub order_books: Vec<OrderBookSnapshot>,
+    pub recent_trades: Vec<Trade>,
     pub open_orders: Vec<OpenOrderSnapshot>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, TS)]
 pub struct OpenOrderSnapshot {
     pub order_id: u64,
-    pub account_id: u64,
+    pub account_id: Address,
     pub market_id: u64,
     pub side: crate::exchange::order::Side,
     pub price: u64,
     pub remaining_quantity: u64,
 }
 
-#[derive(Debug)]
 pub struct Node<C: Consensus> {
     node_id: NodeId,
     pid: u32,
@@ -111,22 +146,31 @@ pub struct Node<C: Consensus> {
     network: Network,
     state: BlockchainState,
     consensus: C,
+    signing: Option<(Arc<SessionManifest>, SigningKey)>,
 
     block_time_ms: u64,
     last_primary_probe: Instant,
 
     metrics: NodeMetrics,
     recent_transaction_outcomes: VecDeque<TransactionOutcome>,
+    sync_in_flight: bool,
+    last_sync_probe: Instant,
+    sync_peer_cursor: usize,
 }
 
 pub enum NodeEvent {
     Consensus(ConsensusEvent),
+    SignedConsensus { from: NodeId, signed: SignedConsensusMessage },
+    AuthenticationRejected,
 
     Control(ControlEvent),
 
     NewTransaction(Transaction),
+    NewSignedTransaction(SignedTransaction),
 
     ProduceBlock,
+
+    CatchUp { peer: NodeId, result: std::io::Result<BlockSyncResponse> },
 
     Shutdown,
 }
@@ -144,6 +188,8 @@ pub enum ControlEvent {
     Status {
         stream: TcpStream,
     },
+
+    FetchBlocks { from_sequence: u64, limit: usize, stream: TcpStream },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -153,6 +199,8 @@ pub enum ControlMessage {
     Pause { millis: u64 },
 
     Status,
+
+    FetchBlocks { from_sequence: u64, limit: usize },
 
     Shutdown,
 }
@@ -174,13 +222,30 @@ impl<C: Consensus> Node<C> {
             network,
             state,
             consensus,
+            signing: None,
 
             block_time_ms,
             last_primary_probe: Instant::now(),
 
             metrics: NodeMetrics::default(),
             recent_transaction_outcomes: VecDeque::new(),
+            sync_in_flight: false,
+            last_sync_probe: Instant::now(),
+            sync_peer_cursor: 0,
         })
+    }
+
+    pub fn attach_signing(&mut self, manifest: Arc<SessionManifest>, key: SigningKey) -> std::io::Result<()> {
+        if self.state.signed_chain_id() != Some(manifest.chain_id.as_str()) {
+            return Err(std::io::Error::other("node state and signing session differ"));
+        }
+        if key.verifying_key() != manifest.verifier(true, self.node_id)? {
+            return Err(std::io::Error::other("validator signing key does not match session"));
+        }
+        self.consensus.set_chain_id(manifest.chain_id.clone());
+        self.consensus.set_signer(manifest.clone(), key.clone());
+        self.signing = Some((manifest, key));
+        Ok(())
     }
 
     pub fn register_with_parent(&self) -> Result<(), std::io::Error> {
@@ -269,6 +334,131 @@ impl<C: Consensus> Node<C> {
         Ok(())
     }
 
+    fn apply_committed_block(&mut self, block: &Block, certificate: Option<CommitCertificate>) -> Result<(), std::io::Error> {
+        let outcomes = match certificate {
+            Some(certificate) => self.state.commit_block_with_certificate(block, certificate),
+            None => self.state.commit_block_with_receipts(block),
+        }.map_err(std::io::Error::other)?;
+        let mut latency_sum = 0u128;
+        let mut latency_samples = 0u64;
+        let mut successful = 0u64;
+        for (tx, result) in block.transactions.iter().zip(outcomes) {
+            if let Some(start) = self.metrics.transaction_received_at.remove(&tx.to_digest()) {
+                if result.is_ok() {
+                    let elapsed_ms = start.elapsed().as_millis();
+                    latency_sum += elapsed_ms;
+                    latency_samples += 1;
+                    self.metrics.recent_commit_latency_ms.push_back(elapsed_ms.min(u64::MAX as u128) as u64);
+                    while self.metrics.recent_commit_latency_ms.len() > 1024 {
+                        self.metrics.recent_commit_latency_ms.pop_front();
+                    }
+                }
+            }
+            successful += u64::from(result.is_ok());
+            self.metrics.transactions_failed += u64::from(result.is_err());
+            if let Ok(fills) = &result { self.metrics.trades_committed += fills.len() as u64; }
+            self.recent_transaction_outcomes.push_back(TransactionOutcome {
+                digest: tx.to_digest().iter().map(|byte| format!("{byte:02x}")).collect(),
+                account_id: tx.account_id(),
+                nonce: tx.nonce(),
+                success: result.is_ok(),
+                error: result.err().map(|error| format!("{error:?}")),
+            });
+        }
+        if latency_samples > 0 {
+            self.metrics.last_commit_latency_ms = Some(latency_sum / latency_samples as u128);
+            self.metrics.commit_latency_sum_ms += latency_sum;
+            self.metrics.commit_latency_samples += latency_samples;
+        }
+        self.metrics.blocks_committed += 1;
+        self.metrics.transactions_committed += successful;
+        while self.recent_transaction_outcomes.len() > 512 { self.recent_transaction_outcomes.pop_front(); }
+        self.state.remove_included_txs_from_mempool(block);
+        println!("Node {} committed seq {} txs={}", self.node_id, block.sequence, block.transactions.len());
+        Ok(())
+    }
+
+    fn start_sync(&mut self, peer: NodeId, node_tx: &mpsc::Sender<NodeEvent>) {
+        if !self.consensus.supports_catch_up() || self.sync_in_flight { return; }
+        let Some(&address) = self.network.peers_address.get(&peer) else { return; };
+        self.sync_in_flight = true;
+        self.last_sync_probe = Instant::now();
+        // Include one already-committed anchor block so a peer with a
+        // conflicting chain cannot appear healthy at the same height.
+        let from_sequence = (self.state.blocks.len() as u64).saturating_sub(1);
+        let auth_key = self.network.auth_key;
+        let node_tx = node_tx.clone();
+        thread::spawn(move || {
+            let result = fetch_blocks(address, from_sequence, &auth_key);
+            let _ = node_tx.send(NodeEvent::CatchUp { peer, result });
+        });
+    }
+
+    fn probe_sync(&mut self, node_tx: &mpsc::Sender<NodeEvent>) {
+        if !self.consensus.supports_catch_up() || self.sync_in_flight
+            || self.last_sync_probe.elapsed() < Duration::from_secs(1) { return; }
+        let mut peers = self.network.peers_address.keys().copied().collect::<Vec<_>>();
+        peers.sort_unstable();
+        if !peers.is_empty() {
+            let peer = peers[self.sync_peer_cursor % peers.len()];
+            self.sync_peer_cursor = self.sync_peer_cursor.wrapping_add(1);
+            self.start_sync(peer, node_tx);
+        }
+    }
+
+    fn sync_consensus_height(&mut self, node_tx: &mpsc::Sender<NodeEvent>) {
+        let actions = self.consensus.catch_up_to_height(self.state.blocks.len() as u64);
+        if let Err(error) = self.execute_consensus_actions(&actions, node_tx) {
+            eprintln!("Node {} could not schedule catch-up actions: {error}", self.node_id);
+        }
+    }
+
+    fn apply_sync_response(&mut self, peer: NodeId, response: BlockSyncResponse,
+        node_tx: &mpsc::Sender<NodeEvent>) {
+        let local_height = self.state.blocks.len() as u64;
+        if response.blocks.len() > SYNC_BATCH_SIZE || response.from_sequence > local_height
+            || response.certificates.len() != response.blocks.len()
+            || response.from_sequence.checked_add(response.blocks.len() as u64).is_none_or(|end| end > response.chain_height)
+            || response.blocks.iter().enumerate().any(|(index, block)|
+                response.from_sequence.checked_add(index as u64) != Some(block.sequence)) {
+            eprintln!("Node {} rejected malformed sync response from {peer}", self.node_id);
+            return;
+        }
+        let mut applied = 0usize;
+        for (block, certificate) in response.blocks.into_iter().zip(response.certificates) {
+            let expected = self.state.blocks.len() as u64;
+            if block.sequence < expected {
+                let local = &self.state.blocks[block.sequence as usize];
+                if local.to_digest() != block.to_digest() {
+                    eprintln!("Node {} detected conflicting chain at sequence {} from node {peer}", self.node_id, block.sequence);
+                    return;
+                }
+                continue;
+            }
+            if block.sequence != expected {
+                if applied > 0 { self.sync_consensus_height(node_tx); }
+                eprintln!("Node {} rejected noncontiguous sync block {} from {peer}; expected {expected}", self.node_id, block.sequence);
+                return;
+            }
+            if let Err(error) = self.apply_committed_block(&block, certificate) {
+                if applied > 0 { self.sync_consensus_height(node_tx); }
+                eprintln!("Node {} rejected sync block {} from {peer}: {error}", self.node_id, block.sequence);
+                return;
+            }
+            applied += 1;
+        }
+        if applied > 0 {
+            let height = self.state.blocks.len() as u64;
+            self.sync_consensus_height(node_tx);
+            self.metrics.catch_up_events += 1;
+            self.metrics.blocks_caught_up += applied as u64;
+            println!("Node {} caught up {applied} blocks from node {peer}; next sequence {height}", self.node_id);
+        }
+        if (self.state.blocks.len() as u64) < response.chain_height && applied > 0 {
+            self.start_sync(peer, node_tx);
+        }
+    }
+
     fn execute_action(
         &mut self,
         action: &ConsensusAction,
@@ -276,67 +466,31 @@ impl<C: Consensus> Node<C> {
     ) -> Result<(), std::io::Error> {
         match action {
             ConsensusAction::Broadcast(message) => {
-                let serialized = sign_line(&Message::Consensus(message.clone()), &self.network.auth_key)?;
+                let message = match &self.signing {
+                    Some((manifest, key)) => Message::SignedConsensus(sign_consensus(message.clone(), self.node_id, manifest, key)?),
+                    None => Message::Consensus(message.clone()),
+                };
+                if let Message::SignedConsensus(signed) = &message { self.consensus.record_verified(signed.clone()); }
+                let serialized = sign_line(&message, &self.network.auth_key)?;
 
                 self.network.broadcast(serialized.as_bytes())?;
             }
 
             ConsensusAction::Send { peer, message } => {
-                let serialized = sign_line(&Message::Consensus(message.clone()), &self.network.auth_key)?;
+                let message = match &self.signing {
+                    Some((manifest, key)) => Message::SignedConsensus(sign_consensus(message.clone(), self.node_id, manifest, key)?),
+                    None => Message::Consensus(message.clone()),
+                };
+                if let Message::SignedConsensus(signed) = &message { self.consensus.record_verified(signed.clone()); }
+                let serialized = sign_line(&message, &self.network.auth_key)?;
 
                 self.network.send(peer, serialized.as_bytes())?;
             }
 
             ConsensusAction::Commit(proposal) => {
                 let block = proposal.get_block();
-                let outcomes = self.state.commit_block(&block).map_err(std::io::Error::other)?;
-
-                let mut latency_sum = 0u128;
-                let mut latency_samples = 0u64;
-                let mut successful = 0u64;
-                for (tx, result) in block.transactions.iter().zip(outcomes) {
-                    if let Some(start) =
-                        self.metrics.transaction_received_at.remove(&tx.to_digest())
-                    {
-                        if result.is_ok() {
-                            latency_sum += start.elapsed().as_millis();
-                            latency_samples += 1;
-                        }
-                    }
-                    successful += u64::from(result.is_ok());
-                    self.recent_transaction_outcomes.push_back(TransactionOutcome {
-                        digest: tx.to_digest().iter().map(|byte| format!("{byte:02x}")).collect(),
-                        account_id: tx.account_id(),
-                        nonce: tx.nonce(),
-                        success: result.is_ok(),
-                        error: result.err().map(|error| format!("{error:?}")),
-                    });
-                }
-
-                if latency_samples > 0 {
-                    self.metrics.last_commit_latency_ms =
-                        Some(latency_sum / latency_samples as u128);
-
-                    self.metrics.commit_latency_sum_ms += latency_sum;
-
-                    self.metrics.commit_latency_samples += latency_samples;
-                }
-
-                self.metrics.blocks_committed += 1;
-                self.metrics.transactions_committed += successful;
-
-                println!(
-                    "Node {} committed seq {} txs={}",
-                    self.node_id,
-                    block.sequence,
-                    block.transactions.len()
-                );
-
-                while self.recent_transaction_outcomes.len() > 512 {
-                    self.recent_transaction_outcomes.pop_front();
-                }
-
-                self.state.remove_included_txs_from_mempool(&block);
+                let certificate = self.consensus.commit_certificate(&block);
+                self.apply_committed_block(&block, certificate)?;
             }
 
             ConsensusAction::ScheduleTimeout {
@@ -386,7 +540,8 @@ impl<C: Consensus> Node<C> {
         let transactions = self.state.mempool.clone();
 
         for tx in transactions {
-            if let Err(error) = self.forward_transaction(primary, tx) {
+            let signed = self.state.signed_transaction(&tx);
+            if let Err(error) = self.forward_transaction(primary, tx, signed) {
                 eprintln!(
                     "Node {} failed retrying tx to primary {}: {}",
                     self.node_id, primary, error
@@ -456,8 +611,14 @@ impl<C: Consensus> Node<C> {
         &mut self,
         primary: NodeId,
         transaction: Transaction,
+        signed: Option<SignedTransaction>,
     ) -> Result<(), std::io::Error> {
-        let serialized = sign_line(&Message::Transaction(transaction), &self.network.auth_key)?;
+        let message = match signed {
+            Some(signed) => Message::SignedTransaction(signed),
+            None if self.signing.is_none() => Message::Transaction(transaction),
+            None => return Err(std::io::Error::other("missing transaction signature")),
+        };
+        let serialized = sign_line(&message, &self.network.auth_key)?;
         self.network.send(&primary, serialized.as_bytes())
     }
 
@@ -490,6 +651,9 @@ impl<C: Consensus> Node<C> {
         NodeStatus {
             node_id: self.node_id,
             pid: self.pid,
+            chain_id: self.signing.as_ref().map(|(manifest, _)| manifest.chain_id.clone()).unwrap_or_default(),
+            signing_enabled: self.signing.is_some(),
+            authentication_rejections: self.metrics.authentication_rejections,
 
             network_ready: self.network.is_ready(),
 
@@ -520,25 +684,42 @@ impl<C: Consensus> Node<C> {
             blocks_committed: self.metrics.blocks_committed,
 
             transactions_committed: self.metrics.transactions_committed,
+            transactions_failed: self.metrics.transactions_failed,
+            trades_committed: self.metrics.trades_committed,
 
             average_commit_latency_ms,
 
             last_commit_latency_ms: self.metrics.last_commit_latency_ms,
+            recent_commit_latency_ms: self.metrics.recent_commit_latency_ms.iter().copied().collect(),
+            catch_up_events: self.metrics.catch_up_events,
+            blocks_caught_up: self.metrics.blocks_caught_up,
 
             recent_blocks,
-            account_nonces: self.state.exchange_state.accounts.values().map(|account| AccountNonce {
+            account_nonces: self.state.exchange_state.accounts().values().map(|account| AccountNonce {
                 account_id: account.id,
                 nonce: account.nonce,
             }).collect(),
+            agent_balances: self.state.exchange_state.accounts().values().map(|account| {
+                let usd = account.balances.get(&crate::exchange::market::USD);
+                let btc = account.balances.get(&crate::exchange::market::BTC);
+                AgentBalance {
+                    account_id: account.id,
+                    usd_available: usd.map_or(0, |balance| balance.available),
+                    usd_locked: usd.map_or(0, |balance| balance.locked),
+                    btc_available: btc.map_or(0, |balance| balance.available),
+                    btc_locked: btc.map_or(0, |balance| balance.locked),
+                }
+            }).collect(),
             recent_transaction_outcomes: self.recent_transaction_outcomes.iter().cloned().collect(),
             order_books: {
-                let mut books = self.state.exchange_state.order_books.iter()
+                let mut books = self.state.exchange_state.order_books().iter()
                     .map(|(&market_id, book)| book.snapshot(market_id, 20)).collect::<Vec<_>>();
                 books.sort_by_key(|book| book.market_id);
                 books
             },
+            recent_trades: self.state.recent_trades.iter().rev().cloned().collect(),
             open_orders: {
-                let mut orders = self.state.exchange_state.order_books.iter()
+                let mut orders = self.state.exchange_state.order_books().iter()
                     .flat_map(|(&market_id, book)| book.bids.values().chain(book.asks.values())
                         .flat_map(move |level| level.iter().map(move |order| OpenOrderSnapshot {
                             order_id: order.id, account_id: order.account, market_id,
@@ -578,6 +759,20 @@ impl<C: Consensus> Node<C> {
 
                 Ok(())
             }
+
+            ControlEvent::FetchBlocks { from_sequence, limit, mut stream } => {
+                let start = usize::try_from(from_sequence).unwrap_or(usize::MAX).min(self.state.blocks.len());
+                let blocks = self.state.blocks.iter().skip(start).take(limit.min(SYNC_BATCH_SIZE)).cloned().collect();
+                let certificates = self.state.certificates.iter().skip(start).take(limit.min(SYNC_BATCH_SIZE)).cloned().collect();
+                let response = BlockSyncResponse {
+                    from_sequence,
+                    chain_height: self.state.blocks.len() as u64,
+                    blocks,
+                    certificates,
+                };
+                let serialized = sign_line(&response, &self.network.auth_key)?;
+                stream.write_all(serialized.as_bytes())
+            }
         }
     }
 
@@ -612,6 +807,7 @@ impl<C: Consensus> Node<C> {
             .expect("network receiver already taken");
 
         let network_node_tx = node_tx.clone();
+        let signing_manifest = self.signing.as_ref().map(|(manifest, _)| manifest.clone());
 
         thread::spawn(move || {
             loop {
@@ -620,9 +816,16 @@ impl<C: Consensus> Node<C> {
                 };
 
                 match event {
+                    NetworkEvent::AuthenticationRejected => {
+                        let _ = network_node_tx.send(NodeEvent::AuthenticationRejected);
+                    }
                     NetworkEvent::Message { from, message } => {
                         match message {
                             Message::Consensus(message) => {
+                                if signing_manifest.is_some() {
+                                    let _ = network_node_tx.send(NodeEvent::AuthenticationRejected);
+                                    continue;
+                                }
                                 let _ = network_node_tx.send(NodeEvent::Consensus(
                                     ConsensusEvent::Message { from, message },
                                 ));
@@ -630,11 +833,32 @@ impl<C: Consensus> Node<C> {
 
                             // Peer forwarded a transaction.
                             Message::Transaction(transaction) => {
+                                if signing_manifest.is_some() {
+                                    let _ = network_node_tx.send(NodeEvent::AuthenticationRejected);
+                                    continue;
+                                }
                                 let _ =
                                     network_node_tx.send(NodeEvent::NewTransaction(transaction));
                             }
 
-                            Message::Control(_) => {}
+                            Message::SignedConsensus(signed) => {
+                                let Some(manifest) = &signing_manifest else { continue; };
+                                if signed.signer != from || verify_consensus(&signed, manifest).is_err() {
+                                    let _ = network_node_tx.send(NodeEvent::AuthenticationRejected);
+                                    continue;
+                                }
+                                let _ = network_node_tx.send(NodeEvent::SignedConsensus { from, signed });
+                            }
+
+                            Message::SignedTransaction(transaction) => {
+                                if signing_manifest.as_ref().is_some_and(|manifest| verify_transaction(&transaction, manifest).is_ok()) {
+                                    let _ = network_node_tx.send(NodeEvent::NewSignedTransaction(transaction));
+                                } else {
+                                    let _ = network_node_tx.send(NodeEvent::AuthenticationRejected);
+                                }
+                            }
+
+                            Message::Control(_) | Message::PeerHandshake(_) => {}
                         }
                     }
 
@@ -649,7 +873,16 @@ impl<C: Consensus> Node<C> {
                     NetworkEvent::PeerConnected { .. } => {}
 
                     NetworkEvent::ClientTransaction(transaction) => {
-                        let _ = network_node_tx.send(NodeEvent::NewTransaction(transaction));
+                        if signing_manifest.is_none() { let _ = network_node_tx.send(NodeEvent::NewTransaction(transaction)); }
+                        else { let _ = network_node_tx.send(NodeEvent::AuthenticationRejected); }
+                    }
+
+                    NetworkEvent::SignedClientTransaction(transaction) => {
+                        if signing_manifest.as_ref().is_some_and(|manifest| verify_transaction(&transaction, manifest).is_ok()) {
+                            let _ = network_node_tx.send(NodeEvent::NewSignedTransaction(transaction));
+                        } else {
+                            let _ = network_node_tx.send(NodeEvent::AuthenticationRejected);
+                        }
                     }
 
                     NetworkEvent::ClientControl { message, stream } => match message {
@@ -661,6 +894,12 @@ impl<C: Consensus> Node<C> {
                         ControlMessage::Status => {
                             let _ = network_node_tx
                                 .send(NodeEvent::Control(ControlEvent::Status { stream }));
+                        }
+
+                        ControlMessage::FetchBlocks { from_sequence, limit } => {
+                            let _ = network_node_tx.send(NodeEvent::Control(ControlEvent::FetchBlocks {
+                                from_sequence, limit, stream,
+                            }));
                         }
 
                         ControlMessage::Shutdown => {
@@ -684,21 +923,28 @@ impl<C: Consensus> Node<C> {
             })?;
 
             match event {
+                NodeEvent::AuthenticationRejected => self.metrics.authentication_rejections += 1,
+                NodeEvent::SignedConsensus { from, signed } => {
+                    self.consensus.record_verified(signed.clone());
+                    let _ = node_tx.send(NodeEvent::Consensus(ConsensusEvent::Message {
+                        from, message: signed.message,
+                    }));
+                }
                 NodeEvent::Consensus(event) => {
-                    let peer_suspects_primary = matches!(
-                        &event,
-                        ConsensusEvent::Message {
-                            message: ConsensusMessage::Pbft(PbftMessage::ViewChange { new_view, .. }),
-                            ..
-                        } if *new_view == self.consensus.current_view() + 1
-                    );
                     if let ConsensusEvent::Message {
-                        message: ConsensusMessage::Pbft(PbftMessage::PrePrepare { proposal, .. }),
-                        ..
+                        from,
+                        message,
                     } = &event {
-                        if let Err(error) = self.state.validate_block(&proposal.block) {
-                            eprintln!("Node {} rejected proposal: {error}", self.node_id);
-                            continue;
+                        if let Some(block) = message.proposed_block() {
+                            if self.consensus.supports_catch_up()
+                                && block.sequence > self.state.blocks.len() as u64 {
+                                self.start_sync(*from, &node_tx);
+                                continue;
+                            }
+                            if let Err(error) = self.state.validate_block(block) {
+                                eprintln!("Node {} rejected proposal: {error}", self.node_id);
+                                continue;
+                            }
                         }
                     }
                     let old_primary = self.consensus.current_primary();
@@ -706,23 +952,6 @@ impl<C: Consensus> Node<C> {
                     let actions = self.consensus.on_event(event);
 
                     self.execute_consensus_actions(&actions, &node_tx)?;
-                    // A single failed forward starts a view change. Peers verify
-                    // that the current primary's listener is actually gone before
-                    // adding their own vote, so one transaction can recover from
-                    // a killed primary even after a quiet restart.
-                    if peer_suspects_primary {
-                        let primary = self.consensus.current_primary();
-                        let unreachable = self.network.peers_address.get(&primary).is_some_and(|address| {
-                            std::net::TcpStream::connect_timeout(address, Duration::from_millis(100)).is_err()
-                        });
-                        if unreachable {
-                            let actions = self.consensus.on_event(ConsensusEvent::Timeout {
-                                view: self.consensus.current_view(),
-                                sequence: self.consensus.next_sequence(),
-                            });
-                            self.execute_consensus_actions(&actions, &node_tx)?;
-                        }
-                    }
                     let new_primary = self.consensus.current_primary();
 
                     if new_primary != old_primary {
@@ -741,6 +970,7 @@ impl<C: Consensus> Node<C> {
                 }
 
                 NodeEvent::NewTransaction(transaction) => {
+                    if self.signing.is_some() { continue; }
                     let primary = self.consensus.current_primary();
 
                     let is_new = self.state.add_transaction(&transaction);
@@ -751,34 +981,49 @@ impl<C: Consensus> Node<C> {
                         self.metrics
                             .transaction_received_at
                             .insert(transaction.to_digest(), Instant::now());
-                        if self.node_id != primary {
-                            self.execute_consensus_actions(&[ConsensusAction::ScheduleTimeout {
-                                view: self.consensus.current_view(),
-                                sequence: self.consensus.next_sequence(),
-                                duration: Duration::from_millis(self.consensus.get_timeout()),
-                            }], &node_tx)?;
-                        }
+                        let actions = self.consensus.on_event(ConsensusEvent::TransactionAvailable);
+                        self.execute_consensus_actions(&actions, &node_tx)?;
                     }
 
                     // Only forward toward the current leader.
                     if is_new && self.node_id != primary {
-                        if let Err(error) = self.forward_transaction(primary, transaction) {
+                        if let Err(error) = self.forward_transaction(primary, transaction, None) {
                             eprintln!(
                                 "Node {} failed forwarding tx to primary {}: {}",
                                 self.node_id, primary, error
                             );
 
-                            let actions = self.consensus.on_event(ConsensusEvent::Timeout {
-                                view: self.consensus.current_view(),
-                                sequence: self.consensus.next_sequence(),
-                            });
+                            let actions = self.consensus.on_event(ConsensusEvent::LeaderUnavailable);
 
                             self.execute_consensus_actions(&actions, &node_tx)?;
                         }
                     }
                 }
 
+                NodeEvent::NewSignedTransaction(signed) => {
+                    let Some((manifest, _)) = &self.signing else { continue; };
+                    if verify_transaction(&signed, manifest).is_err() { continue; }
+                    let transaction = &signed.transaction;
+                    let is_new = self.state.add_signed_transaction(&signed);
+                    if is_new {
+                        self.metrics.transactions_received += 1;
+                        self.metrics.transaction_received_at.insert(transaction.to_digest(), Instant::now());
+                        let actions = self.consensus.on_event(ConsensusEvent::TransactionAvailable);
+                        self.execute_consensus_actions(&actions, &node_tx)?;
+                    }
+                    if is_new && self.node_id != self.consensus.current_primary() {
+                        let primary = self.consensus.current_primary();
+                        if let Err(error) = self.forward_transaction(primary, transaction.clone(), Some(signed)) {
+                            eprintln!("Node {} failed forwarding signed tx to primary {primary}: {error}", self.node_id);
+                            let actions = self.consensus.on_event(ConsensusEvent::LeaderUnavailable);
+                            self.execute_consensus_actions(&actions, &node_tx)?;
+                        }
+                    }
+                }
+
                 NodeEvent::ProduceBlock => {
+                    if !self.network.is_ready() { self.network.reconnect_missing(); }
+                    self.probe_sync(&node_tx);
                     // Detect a dead leader even when no fresh transaction is
                     // admitted (for example, only stale nonces are replayed).
                     // A quiet cluster should still elect a live primary.
@@ -793,10 +1038,7 @@ impl<C: Consensus> Node<C> {
                             TcpStream::connect_timeout(address, Duration::from_millis(100)).is_err()
                         });
                         if unavailable {
-                            let actions = self.consensus.on_event(ConsensusEvent::Timeout {
-                                view: self.consensus.current_view(),
-                                sequence: self.consensus.next_sequence(),
-                            });
+                            let actions = self.consensus.on_event(ConsensusEvent::LeaderUnavailable);
                             self.execute_consensus_actions(&actions, &node_tx)?;
                         }
                     }
@@ -807,11 +1049,123 @@ impl<C: Consensus> Node<C> {
                     println!("Node {} shutting down", self.node_id);
                     break;
                 }
+
+                NodeEvent::CatchUp { peer, result } => {
+                    self.sync_in_flight = false;
+                    match result {
+                        Ok(response) => self.apply_sync_response(peer, response, &node_tx),
+                        Err(error) => eprintln!("Node {} could not sync from node {peer}: {error}", self.node_id),
+                    }
+                }
             }
 
             self.maybe_start_consensus(&node_tx)?;
         }
 
         Ok(())
+    }
+}
+
+fn fetch_blocks(address: SocketAddr, from_sequence: u64, auth_key: &[u8; 32]) -> std::io::Result<BlockSyncResponse> {
+    let timeout = Duration::from_millis(500);
+    let mut stream = TcpStream::connect_timeout(&address, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let request = sign_line(&Message::Control(ControlMessage::FetchBlocks {
+        from_sequence, limit: SYNC_BATCH_SIZE,
+    }), auth_key)?;
+    stream.write_all(request.as_bytes())?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    if line.is_empty() { return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty block sync response")); }
+    verify_line(&line, auth_key)
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use crate::consensus::hotstuff::HotStuff;
+    use std::net::TcpListener;
+
+    #[test]
+    fn lagging_hotstuff_replica_replays_a_verified_batch() {
+        let mut source = BlockchainState::new();
+        let genesis = Block::new_initial_block();
+        source.commit_block(&genesis).unwrap();
+        let tx = Transaction::Transfer { from: 0.into(), to: 1.into(), asset: 0, amount: 7, nonce: 0 };
+        assert!(source.add_transaction(&tx));
+        let next = source.build_block().unwrap();
+        source.commit_block(&next).unwrap();
+        let address = "127.0.0.1:0".parse().unwrap();
+        let network = Network::new(2, address, [9; 32]).unwrap();
+        let mut node = Node::new(2, 0, network, BlockchainState::new(), HotStuff::new(2, 4), 100).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        node.apply_sync_response(0, BlockSyncResponse {
+            from_sequence: 0, chain_height: 2, blocks: vec![genesis, next],
+            certificates: vec![None, None],
+        }, &tx);
+        assert_eq!(node.state.blocks.len(), 2);
+        assert_eq!(node.consensus.next_sequence(), 2);
+        assert_eq!(node.state.exchange_state.get_nonce_for_account(0.into()).unwrap(), 1);
+    }
+
+    #[test]
+    fn bad_sync_block_does_not_advance_the_chain() {
+        let address = "127.0.0.1:0".parse().unwrap();
+        let network = Network::new(2, address, [9; 32]).unwrap();
+        let mut node = Node::new(2, 0, network, BlockchainState::new(), HotStuff::new(2, 4), 100).unwrap();
+        let mut forged = Block::new_initial_block();
+        forged.sequence = 1;
+        let (tx, _rx) = mpsc::channel();
+        node.apply_sync_response(0, BlockSyncResponse {
+            from_sequence: 0, chain_height: 2, blocks: vec![forged],
+            certificates: vec![None],
+        }, &tx);
+        assert_eq!(node.state.blocks.len(), 0);
+        assert_eq!(node.consensus.next_sequence(), 0);
+    }
+
+    #[test]
+    fn authenticated_block_fetch_round_trip() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let key = [11; 32];
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let request: Message = verify_line(&line, &key).unwrap();
+            assert!(matches!(request, Message::Control(ControlMessage::FetchBlocks {
+                from_sequence: 0, limit: SYNC_BATCH_SIZE,
+            })));
+            let response = BlockSyncResponse {
+                from_sequence: 0, chain_height: 1, blocks: vec![Block::new_initial_block()],
+                certificates: vec![None],
+            };
+            stream.write_all(sign_line(&response, &key).unwrap().as_bytes()).unwrap();
+        });
+        let response = fetch_blocks(address, 0, &key).unwrap();
+        assert_eq!(response.blocks.len(), 1);
+        assert_eq!(response.chain_height, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn conflicting_anchor_is_not_accepted() {
+        let mut state = BlockchainState::new();
+        let genesis = Block::new_initial_block();
+        state.commit_block(&genesis).unwrap();
+        let mut conflicting = genesis.clone();
+        conflicting.state_root[0] ^= 1;
+        let address = "127.0.0.1:0".parse().unwrap();
+        let network = Network::new(2, address, [9; 32]).unwrap();
+        let mut node = Node::new(2, 0, network, state, HotStuff::new(2, 4), 100).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        node.apply_sync_response(0, BlockSyncResponse {
+            from_sequence: 0, chain_height: 1, blocks: vec![conflicting],
+            certificates: vec![None],
+        }, &tx);
+        assert_eq!(node.state.blocks[0].to_digest(), genesis.to_digest());
+        assert_eq!(node.consensus.next_sequence(), 1);
     }
 }

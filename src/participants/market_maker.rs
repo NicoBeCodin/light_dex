@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{exchange::order::Side, node::OpenOrderSnapshot};
+use crate::{exchange::{address::Address, order::Side}, node::OpenOrderSnapshot};
 
 /// Prices for one BTC per level. The feed adapter supplies prices in the
 /// chain's integer USD ticks; strategy decisions do not depend on Tauri.
@@ -20,7 +20,7 @@ pub enum QuoteAction {
 /// their prices; pending cancellations reserve their order IDs. A placement
 /// cannot be cancelled until its real order ID appears in a node snapshot.
 pub fn plan_actions(
-    account_id: u64,
+    account_id: Address,
     open_orders: &[OpenOrderSnapshot],
     desired: &DesiredBook,
     active: bool,
@@ -77,7 +77,7 @@ mod tests {
     fn order(id: u64, side: Side, price: u64) -> OpenOrderSnapshot {
         OpenOrderSnapshot {
             order_id: id,
-            account_id: 90,
+            account_id: 90.into(),
             market_id: 0,
             side,
             price,
@@ -93,18 +93,18 @@ mod tests {
         };
         let orders = vec![order(7, Side::Buy, 99), order(8, Side::Sell, 102)];
         assert_eq!(
-            plan_actions(90, &orders, &desired, true, &[]),
+            plan_actions(90.into(), &orders, &desired, true, &[]),
             vec![QuoteAction::Cancel { order_id: 7 }, QuoteAction::Place { side: Side::Buy, price: 100 }]
         );
         assert_eq!(
-            plan_actions(90, &orders[1..], &desired, true, &[]),
+            plan_actions(90.into(), &orders[1..], &desired, true, &[]),
             vec![QuoteAction::Place {
                 side: Side::Buy,
                 price: 100
             }]
         );
         assert_eq!(
-            plan_actions(90, &orders, &desired, false, &[]),
+            plan_actions(90.into(), &orders, &desired, false, &[]),
             vec![QuoteAction::Cancel { order_id: 7 }, QuoteAction::Cancel { order_id: 8 }]
         );
     }
@@ -113,7 +113,7 @@ mod tests {
     fn pending_quotes_do_not_get_duplicated() {
         let desired = DesiredBook { bids: vec![100, 99], asks: vec![102] };
         let pending = vec![QuoteAction::Place { side: Side::Buy, price: 100 }];
-        assert_eq!(plan_actions(90, &[], &desired, true, &pending), vec![
+        assert_eq!(plan_actions(90.into(), &[], &desired, true, &pending), vec![
             QuoteAction::Place { side: Side::Buy, price: 99 },
             QuoteAction::Place { side: Side::Sell, price: 102 },
         ]);

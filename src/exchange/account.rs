@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 pub type AssetId = u64;
-pub type AccountId = u64;
+pub type AccountId = super::address::Address;
 
 #[derive(Debug, Clone)]
 pub struct Balance {

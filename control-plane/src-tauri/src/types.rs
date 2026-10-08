@@ -1,5 +1,7 @@
-use light_dex::node::{NodeId, NodeStatus};
+use light_dex::node::{AgentBalance, NodeId, NodeStatus};
+use light_dex::exchange::address::Address;
 use light_dex::exchange::order::Side;
+use light_dex::participants::strategies::AgentStrategy;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -13,7 +15,53 @@ pub struct LaunchConfig {
     pub block_time_ms: u64,
     pub timeout_ms: u64,
     pub poll_ms: u64,
+    pub poll_mode: PollMode,
     pub build_before_launch: bool,
+    pub consensus: ConsensusAlgorithm,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PollMode {
+    All,
+    RoundRobin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct AgentConfig {
+    pub agent_id: u64,
+    pub account_id: u64,
+    pub market_id: u64,
+    pub strategy: AgentStrategy,
+    pub target: TargetNode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct AgentSnapshot {
+    pub agent_id: u64,
+    pub account_id: u64,
+    pub strategy: AgentStrategy,
+    pub target: TargetNode,
+    pub state: String,
+    pub pending: usize,
+    pub pending_action: Option<String>,
+    pub own_open_orders: usize,
+    pub last_error: Option<String>,
+    pub confirmed_nonce: Option<u64>,
+    pub balance: Option<AgentBalance>,
+    pub feed_age_ms: Option<u64>,
+    pub group_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsensusAlgorithm { Pbft, Hotstuff }
+
+impl ConsensusAlgorithm {
+    #[allow(dead_code)] // also included by the standalone ts-rs export binary
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Pbft => "pbft", Self::Hotstuff => "hotstuff" }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -94,6 +142,7 @@ pub struct NodeRuntimeSnapshot {
     pub tx_rate: f64,
     pub block_rate: f64,
     pub status: Option<NodeStatus>,
+    pub last_status_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -113,6 +162,12 @@ pub struct MetricsSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct WalletAccount {
+    pub label: u64,
+    pub address: Address,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct ControlSnapshot {
     pub running: bool,
     pub launching: bool,
@@ -121,6 +176,8 @@ pub struct ControlSnapshot {
     pub metrics: MetricsSnapshot,
     pub load: LoadSnapshot,
     pub market_maker: MarketMakerSnapshot,
+    pub agents: Vec<AgentSnapshot>,
+    pub wallet: Vec<WalletAccount>,
     pub logs: Vec<String>,
     pub active_data_dir: Option<String>,
 }
