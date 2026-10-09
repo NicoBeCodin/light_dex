@@ -15,3 +15,4 @@ __pycache__/
 /control-plane/*.tsbuildinfo
 /control-plane/vite.config.js
 /control-plane/vite.config.d.ts
+/research/

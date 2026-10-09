@@ -20,7 +20,7 @@ use crate::exchange::order::OrderId;
 use crate::exchange::order::OrderType;
 use crate::exchange::order::Side;
 use crate::exchange::{ExchangeError, ExchangeState, ExecutedTrade};
-use crate::crypto::{SessionManifest, SignedTransaction, verify_transaction};
+use crate::crypto::{PROTOCOL_VERSION, SessionManifest, SignedTransaction, verify_transaction};
 use crate::crypto::verify_commit_certificate;
 use crate::consensus::CommitCertificate;
 
@@ -127,7 +127,7 @@ impl BlockchainState {
 
     pub fn new_signed(manifest: Arc<SessionManifest>) -> Self {
         let mut state = Self::new();
-        state.exchange_state = ExchangeState::with_funded_addresses(manifest.accounts.iter().copied());
+        state.exchange_state = ExchangeState::with_claim_faucet(manifest.faucet).expect("validated session faucet");
         state.manifest = Some(manifest);
         state
     }
@@ -137,7 +137,7 @@ impl BlockchainState {
     }
 
     pub fn load_signed(path: PathBuf, manifest: Arc<SessionManifest>) -> Result<Self, String> {
-        if manifest.initial_state_root != crate::message::hex_encode(&ExchangeState::with_funded_addresses(manifest.accounts.iter().copied()).state_digest()) {
+        if manifest.initial_state_root != crate::message::hex_encode(&ExchangeState::with_claim_faucet(manifest.faucet).map_err(|error| error.to_string())?.state_digest()) {
             return Err("session manifest initial state root differs from local genesis".into());
         }
         Self::load_with_manifest(path, Some(manifest))
@@ -241,7 +241,7 @@ impl BlockchainState {
         if let Some(manifest) = &self.manifest {
             let auth = block.authentication.as_ref().ok_or("unsigned block in signed session")?;
             if block.state_root_version != ADDRESS_STATE_ROOT_VERSION
-                || auth.version != 2 || auth.chain_id != manifest.chain_id
+                || auth.version != PROTOCOL_VERSION || auth.chain_id != manifest.chain_id
                 || auth.signatures.len() != block.transactions.len() {
                 return Err("invalid block authentication metadata".into());
             }
@@ -392,9 +392,13 @@ impl BlockchainState {
         // Such leftovers cannot ever become executable, including after a
         // view change, and must not swamp the new primary's mempool.
         self.mempool.retain(|tx| {
-            self.exchange_state
-                .get_nonce_for_account(tx.account_id())
-                .is_ok_and(|nonce| tx.nonce() >= nonce)
+            match tx {
+                Transaction::ClaimAirdrop { account_id, nonce } => *nonce == 0
+                    && !self.exchange_state.accounts().contains_key(account_id),
+                _ => self.exchange_state
+                    .get_nonce_for_account(tx.account_id())
+                    .is_ok_and(|nonce| tx.nonce() >= nonce),
+            }
         });
         let live: HashSet<_> = self.mempool.iter().map(Transaction::to_digest).collect();
         self.signed_mempool.retain(|digest, _| live.contains(digest));
@@ -424,11 +428,14 @@ impl BlockchainState {
     }
 
     fn add_transaction_verified(&mut self, tx: &Transaction) -> bool {
-        if !self
-            .exchange_state
-            .get_nonce_for_account(tx.account_id())
-            .is_ok_and(|nonce| tx.nonce() >= nonce)
-        {
+        let admissible = match tx {
+            Transaction::ClaimAirdrop { account_id, nonce } => *nonce == 0
+                && !self.exchange_state.accounts().contains_key(account_id)
+                && self.exchange_state.faucet_remaining_claims().is_some_and(|remaining| remaining > 0),
+            _ => self.exchange_state.get_nonce_for_account(tx.account_id())
+                .is_ok_and(|nonce| tx.nonce() >= nonce),
+        };
+        if !admissible {
             return false;
         }
         if self.seen_transactions.insert(tx.to_digest()) {
@@ -455,7 +462,7 @@ impl BlockchainState {
             let _ = exchange.execute(tx);
         }
         let authentication = self.manifest.as_ref().map(|manifest| BlockAuthentication {
-            version: 2,
+            version: PROTOCOL_VERSION,
             chain_id: manifest.chain_id.clone(),
             signatures: transactions.iter().map(|tx| self.signed_mempool.get(&tx.to_digest()).cloned().expect("verified mempool signature missing")).collect(),
         });
@@ -485,9 +492,10 @@ impl BlockchainState {
         let mut queues: HashMap<AccountId, VecDeque<PendingTransaction>> = HashMap::new();
         for (account_id, mut txs) in per_account {
             txs.sort_by_key(|tx| tx.transaction.nonce());
-            let Ok(mut expected_nonce) = self.exchange_state.get_nonce_for_account(account_id)
-            else {
-                continue;
+            let mut expected_nonce = match self.exchange_state.get_nonce_for_account(account_id) {
+                Ok(nonce) => nonce,
+                Err(_) if txs.iter().any(|pending| matches!(pending.transaction, Transaction::ClaimAirdrop { nonce: 0, .. })) => 0,
+                Err(_) => continue,
             };
             let mut queue = VecDeque::new();
             for pending in txs {
@@ -588,14 +596,14 @@ impl Block {
         let mut block = Self::new();
         block.state_root = initial_root;
         block.state_root_version = ADDRESS_STATE_ROOT_VERSION;
-        block.authentication = Some(BlockAuthentication { version: 2, chain_id: chain_id.into(), signatures: Vec::new() });
+        block.authentication = Some(BlockAuthentication { version: PROTOCOL_VERSION, chain_id: chain_id.into(), signatures: Vec::new() });
         block
     }
 
     pub fn to_digest(&self) -> Digest {
         let mut hasher = Sha256::new();
         if let Some(auth) = &self.authentication {
-            hasher.update(b"light-dex/block/v3");
+            hasher.update(b"light-dex/block/v4");
             hasher.update([auth.version, self.state_root_version]);
             hasher.update(auth.chain_id.as_bytes());
             hasher.update(self.sequence.to_be_bytes());
@@ -639,6 +647,10 @@ impl Proposal {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, ts_rs::TS)]
 pub enum Transaction {
+    ClaimAirdrop {
+        account_id: AccountId,
+        nonce: u64,
+    },
     Transfer {
         from: AccountId,
         to: AccountId,
@@ -668,6 +680,7 @@ pub enum Transaction {
 impl Transaction {
     pub fn account_id(&self) -> AccountId {
         let account_id = match self {
+            Transaction::ClaimAirdrop { account_id, .. } => account_id,
             Transaction::Transfer {
                 from,
                 to: _,
@@ -696,6 +709,7 @@ impl Transaction {
     }
     pub fn nonce(&self) -> u64 {
         let nonce = match self {
+            Transaction::ClaimAirdrop { nonce, .. } => nonce,
             Transaction::Transfer {
                 from: _,
                 to: _,
@@ -726,6 +740,11 @@ impl Transaction {
         let mut hasher = Sha256::new();
         hasher.update(b"light-dex/transaction/v2");
         match self {
+            Transaction::ClaimAirdrop { account_id, nonce } => {
+                hasher.update(b"CLAIM_AIRDROP");
+                hasher.update(account_id.bytes());
+                hasher.update(nonce.to_le_bytes());
+            }
             Transaction::Transfer {
                 from,
                 to,

@@ -8,6 +8,7 @@ pub mod orderbook;
 use std::{collections::HashMap, sync::OnceLock};
 
 use sha2::{Digest as _, Sha256};
+use serde::{Deserialize, Serialize};
 
 use crate::blockchain::{Digest, Transaction};
 use account::{Account, AccountId, AssetId, Balance};
@@ -16,6 +17,25 @@ use order::{Order, OrderId, OrderLocation, OrderType, Side};
 use orderbook::{OrderBook, OrderBookError};
 
 const N_ACCOUNTS: u64 = 100;
+
+/// Session-bound, finite mint allowance for one-time account claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaucetConfig {
+    pub max_claims: u64,
+    pub usd_per_claim: u64,
+    pub btc_per_claim: u64,
+}
+
+impl FaucetConfig {
+    pub fn validate(self) -> Result<(), String> {
+        if self.max_claims == 0 || self.usd_per_claim == 0 || self.btc_per_claim == 0 {
+            return Err("faucet claims and balances must be positive".into());
+        }
+        self.max_claims.checked_mul(self.usd_per_claim).ok_or("maximum mintable USD overflow")?;
+        self.max_claims.checked_mul(self.btc_per_claim).ok_or("maximum mintable BTC overflow")?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExchangeError {
@@ -29,6 +49,9 @@ pub enum ExchangeError {
     SelfTrade,
     FokUnfilled,
     ArithmeticOverflow,
+    AlreadyClaimed,
+    FaucetUnavailable,
+    FaucetExhausted,
 }
 
 fn map_order_error(error: OrderBookError) -> ExchangeError {
@@ -61,27 +84,15 @@ pub struct ExchangeState {
     order_locations: HashMap<OrderId, OrderLocation>,
     next_order_id: OrderId,
     state_tree: StateTree,
+    faucet: Option<FaucetConfig>,
+    faucet_claims: u64,
 }
 
 impl Default for ExchangeState {
     fn default() -> Self {
-        let mut exchange = Self {
-            accounts: HashMap::new(),
-            markets: HashMap::new(),
-            order_books: HashMap::new(),
-            order_locations: HashMap::new(),
-            next_order_id: 0,
-            state_tree: StateTree::new(),
-        };
-        exchange.markets.insert(
-            BTC_USD,
-            Market {
-                id: BTC_USD,
-                base_asset: BTC,
-                quote_asset: USD,
-            },
-        );
-        exchange.order_books.insert(BTC_USD, OrderBook::new());
+        let mut exchange = Self::empty();
+        // Legacy unsigned fixtures still use deterministic funded accounts.
+        // Signed sessions start from `with_claim_faucet` instead.
         for account_id in 0..N_ACCOUNTS {
             exchange.accounts.insert(
                 account_id.into(),
@@ -113,6 +124,42 @@ impl Default for ExchangeState {
 }
 
 impl ExchangeState {
+    fn empty() -> Self {
+        let mut exchange = Self {
+            accounts: HashMap::new(),
+            markets: HashMap::new(),
+            order_books: HashMap::new(),
+            order_locations: HashMap::new(),
+            next_order_id: 0,
+            state_tree: StateTree::new(),
+            faucet: None,
+            faucet_claims: 0,
+        };
+        exchange.markets.insert(
+            BTC_USD,
+            Market {
+                id: BTC_USD,
+                base_asset: BTC,
+                quote_asset: USD,
+            },
+        );
+        exchange.order_books.insert(BTC_USD, OrderBook::new());
+        exchange.rebuild_state_tree();
+        exchange
+    }
+
+    pub fn with_claim_faucet(faucet: FaucetConfig) -> Result<Self, String> {
+        faucet.validate()?;
+        let mut state = Self::empty();
+        state.faucet = Some(faucet);
+        state.rebuild_state_tree();
+        Ok(state)
+    }
+
+    pub fn faucet_remaining_claims(&self) -> Option<u64> {
+        Some(self.faucet?.max_claims.saturating_sub(self.faucet_claims))
+    }
+
     pub fn with_funded_addresses(addresses: impl IntoIterator<Item = AccountId>) -> Self {
         let accounts = addresses.into_iter().map(|id| Account {
             id,
@@ -469,6 +516,25 @@ impl ExchangeState {
                 self.commit_accounts(staged);
                 Ok(Vec::new())
             }
+            Transaction::ClaimAirdrop { account_id, nonce } => {
+                if *nonce != 0 { return Err(ExchangeError::InvalidNonce); }
+                if self.accounts.contains_key(account_id) { return Err(ExchangeError::AlreadyClaimed); }
+                let faucet = self.faucet.ok_or(ExchangeError::FaucetUnavailable)?;
+                if self.faucet_claims >= faucet.max_claims { return Err(ExchangeError::FaucetExhausted); }
+                let account = Account {
+                    id: *account_id,
+                    nonce: 1,
+                    balances: HashMap::from([
+                        (USD, Balance { available: faucet.usd_per_claim, locked: 0 }),
+                        (BTC, Balance { available: faucet.btc_per_claim, locked: 0 }),
+                    ]),
+                };
+                self.faucet_claims += 1;
+                self.state_tree.put(StateKey::FaucetClaims, &self.faucet_claims.to_be_bytes());
+                self.state_tree.put(StateKey::Account(*account_id), &canonical::encode_account(&account));
+                self.accounts.insert(*account_id, account);
+                Ok(Vec::new())
+            }
             Transaction::PlaceOrder {
                 account_id,
                 market_id,
@@ -519,6 +585,8 @@ impl ExchangeState {
             order_locations: HashMap::new(),
             next_order_id: 0,
             state_tree: StateTree::new(),
+            faucet: None,
+            faucet_claims: 0,
         })
     }
 
@@ -756,6 +824,9 @@ impl ExchangeState {
             StateKey::NextOrderId,
             &canonical::encode_next_order_id(self.next_order_id),
         );
+        if self.faucet.is_some() {
+            tree.put(StateKey::FaucetClaims, &self.faucet_claims.to_be_bytes());
+        }
         for (&id, account) in &self.accounts {
             tree.put(StateKey::Account(id), &canonical::encode_account(account));
         }
@@ -836,6 +907,7 @@ enum StateKey {
     Order(OrderId),
     Market(MarketId),
     NextOrderId,
+    FaucetClaims,
 }
 
 use std::sync::Arc;
@@ -1097,6 +1169,7 @@ fn hash_key(key: StateKey) -> Digest {
         StateKey::Order(id) => hash_parts(&[DOMAIN, &[1], &id.to_be_bytes()]),
         StateKey::Market(id) => hash_parts(&[DOMAIN, &[2], &id.to_be_bytes()]),
         StateKey::NextOrderId => hash_parts(&[DOMAIN, &[3]]),
+        StateKey::FaucetClaims => hash_parts(&[DOMAIN, &[4]]),
     }
 }
 
@@ -1142,6 +1215,7 @@ mod tests {
     ) -> Result<Vec<ExecutedTrade>, ExchangeError> {
         let mut staged = state.clone();
         let trades = match tx {
+            Transaction::ClaimAirdrop { .. } => staged.execute_with_receipt(tx)?,
             Transaction::Transfer {
                 from,
                 to,
@@ -1304,6 +1378,32 @@ mod tests {
         account.balances.get_mut(&USD).unwrap().available += 1;
         state.upsert_genesis_account(account);
         assert_ne!(state.state_digest(), before);
+        assert!(state.verify_state_tree());
+    }
+
+    #[test]
+    fn claim_faucet_mints_with_a_committed_claim_limit() {
+        let faucet = FaucetConfig {
+            max_claims: 2,
+            usd_per_claim: 50,
+            btc_per_claim: 3,
+        };
+        let mut state = ExchangeState::with_claim_faucet(faucet).unwrap();
+        assert!(state.accounts.is_empty());
+        assert_eq!(state.faucet_remaining_claims(), Some(2));
+        let first = address::Address::fixture(901);
+        let second = address::Address::fixture(902);
+        state.execute(&Transaction::ClaimAirdrop { account_id: first, nonce: 0 }).unwrap();
+        assert_eq!(state.accounts[&first].nonce, 1);
+        assert_eq!(state.accounts[&first].balances[&USD].available, 50);
+        assert_eq!(state.accounts[&first].balances[&BTC].available, 3);
+        assert_eq!(state.faucet_remaining_claims(), Some(1));
+        let root = state.state_digest();
+        assert_eq!(state.execute(&Transaction::ClaimAirdrop { account_id: first, nonce: 0 }), Err(ExchangeError::AlreadyClaimed));
+        assert_eq!(state.state_digest(), root);
+        state.execute(&Transaction::ClaimAirdrop { account_id: second, nonce: 0 }).unwrap();
+        assert_eq!(state.faucet_remaining_claims(), Some(0));
+        assert_eq!(state.execute(&Transaction::ClaimAirdrop { account_id: address::Address::fixture(903), nonce: 0 }), Err(ExchangeError::FaucetExhausted));
         assert!(state.verify_state_tree());
     }
 

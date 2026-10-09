@@ -18,6 +18,9 @@ pub struct LaunchConfig {
     pub poll_mode: PollMode,
     pub build_before_launch: bool,
     pub consensus: ConsensusAlgorithm,
+    pub claim_limit: u64,
+    pub claim_usd: u64,
+    pub claim_btc: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
@@ -168,6 +171,14 @@ pub struct WalletAccount {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ClaimProgress {
+    pub active: bool,
+    pub requested: usize,
+    pub confirmed: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct ControlSnapshot {
     pub running: bool,
     pub launching: bool,
@@ -178,6 +189,8 @@ pub struct ControlSnapshot {
     pub market_maker: MarketMakerSnapshot,
     pub agents: Vec<AgentSnapshot>,
     pub wallet: Vec<WalletAccount>,
+    pub generated_wallets: Vec<WalletAccount>,
+    pub claim_progress: Option<ClaimProgress>,
     pub logs: Vec<String>,
     pub active_data_dir: Option<String>,
 }

@@ -383,7 +383,7 @@ impl ExtraDriver {
             confirmed: HashMap::new(),
             workload,
             accounts,
-            wallet: (0..100).map(|slot| (slot, slot.into())).collect(),
+            wallet: BTreeMap::new(),
             window,
             cursor: 0,
             attempted: 0,
@@ -609,7 +609,7 @@ fn build_transaction(
     wallet: &std::collections::BTreeMap<u64, light_dex::exchange::address::Address>,
 ) -> Option<Transaction> {
     let address = *wallet.get(&account)?;
-    let next_address = *wallet.get(&((account + 1) % 70))?;
+    let next_address = *wallet.iter().find(|(label, _)| **label != account)?.1;
     if workload == Workload::Transfer {
         return Some(Transaction::Transfer {
             from: address,
@@ -765,7 +765,7 @@ fn failed_summary(trial: &Trial, reason: String, workload: Workload, window: usi
         timeout_ms: trial.timeout_ms,
         offered_tps: trial.offered_tps,
         participants,
-        driver_accounts: 100 - participants,
+        driver_accounts: (100 - participants).min(70),
         workload,
         in_flight_per_account: window,
         result: "invalid".into(),
@@ -824,15 +824,22 @@ fn run_trial(
         poll_mode: PollMode::All,
         build_before_launch: false,
         consensus: trial.algorithm.config(),
+        claim_limit: 1_000,
+        claim_usd: 1_000_000,
+        claim_btc: 1_000,
     })?;
     wait_for(&controller, Instant::now() + Duration::from_secs(40), |s| {
         s.running
             && s.metrics.responsive_nodes == trial.nodes as usize
             && s.metrics.height_min == Some(1)
     })?;
-    let fleet = participant_fleet(participants);
-    let agent_accounts = fleet.iter().map(|agent| agent.account_id).collect::<std::collections::HashSet<_>>();
-    let driver_accounts = (0..100).filter(|id| !agent_accounts.contains(id)).collect::<Vec<_>>();
+    let mut fleet = participant_fleet(participants);
+    let driver_count = (100 - participants).min(70);
+    let wallets = controller.claim_new_accounts((participants + driver_count) as u64)?;
+    for (agent, wallet) in fleet.iter_mut().zip(&wallets) {
+        agent.account_id = wallet.label;
+    }
+    let driver_accounts = wallets.iter().skip(participants).map(|wallet| wallet.label).collect::<Vec<_>>();
     controller.start_agents(fleet)?;
     thread::sleep(warmup);
     let warm = controller.snapshot();
@@ -934,6 +941,7 @@ fn run_trial(
             for tx in &block.transactions {
                 active_accounts.insert(tx.account_id());
                 match tx {
+                    Transaction::ClaimAirdrop { .. } => {},
                     Transaction::Transfer { .. } => included_transfers += 1,
                     Transaction::PlaceOrder { .. } => included_places += 1,
                     Transaction::CancelOrder { .. } => included_cancels += 1,
@@ -1224,6 +1232,11 @@ mod tests {
             error: Some("test failure".into()),
         }
     }
+    fn test_driver(window: usize) -> ExtraDriver {
+        let mut driver = ExtraDriver::new(Workload::Transfer, window, vec![0]);
+        driver.wallet.insert(0, 0.into());
+        driver
+    }
     #[test]
     fn percentile_nearest_rank() {
         assert_eq!(percentile(&[1, 2, 3, 4, 5], 0.95), Some(5));
@@ -1239,7 +1252,7 @@ mod tests {
     }
     #[test]
     fn pipeline_allocates_contiguous_nonces_up_to_window() {
-        let mut driver = ExtraDriver::new(Workload::Transfer, 3, vec![0]);
+        let mut driver = test_driver(3);
         let now = Instant::now();
         driver.observe_account(0, 7, &[]);
         for nonce in 7..10 {
@@ -1256,7 +1269,7 @@ mod tests {
     }
     #[test]
     fn failed_head_is_repaired_at_same_nonce_before_new_work() {
-        let mut driver = ExtraDriver::new(Workload::Transfer, 3, vec![0]);
+        let mut driver = test_driver(3);
         let now = Instant::now();
         driver.observe_account(0, 5, &[]);
         let head = transfer(0, 5);
@@ -1277,7 +1290,7 @@ mod tests {
     }
     #[test]
     fn timed_out_head_retries_identical_transaction_and_nonce() {
-        let mut driver = ExtraDriver::new(Workload::Transfer, 2, vec![0]);
+        let mut driver = test_driver(2);
         let now = Instant::now();
         let transaction = transfer(0, 3);
         driver.observe_account(0, 3, &[]);

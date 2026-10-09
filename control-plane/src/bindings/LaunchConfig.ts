@@ -2,4 +2,4 @@
 import type { ConsensusAlgorithm } from "./ConsensusAlgorithm";
 import type { PollMode } from "./PollMode";
 
-export type LaunchConfig = { project_dir: string, binary_path: string, data_dir: string, recover_existing: boolean, node_count: number, block_time_ms: number, timeout_ms: number, poll_ms: number, poll_mode: PollMode, build_before_launch: boolean, consensus: ConsensusAlgorithm, };
+export type LaunchConfig = { project_dir: string, binary_path: string, data_dir: string, recover_existing: boolean, node_count: number, block_time_ms: number, timeout_ms: number, poll_ms: number, poll_mode: PollMode, build_before_launch: boolean, consensus: ConsensusAlgorithm, claim_limit: number, claim_usd: number, claim_btc: number, };

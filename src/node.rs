@@ -90,6 +90,7 @@ pub struct NodeStatus {
     pub chain_id: String,
     pub signing_enabled: bool,
     pub authentication_rejections: u64,
+    pub faucet_remaining_claims: Option<u64>,
 
     pub network_ready: bool,
     pub peer_count: usize,
@@ -654,6 +655,7 @@ impl<C: Consensus> Node<C> {
             chain_id: self.signing.as_ref().map(|(manifest, _)| manifest.chain_id.clone()).unwrap_or_default(),
             signing_enabled: self.signing.is_some(),
             authentication_rejections: self.metrics.authentication_rejections,
+            faucet_remaining_claims: self.state.exchange_state.faucet_remaining_claims(),
 
             network_ready: self.network.is_ready(),
 

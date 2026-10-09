@@ -9,7 +9,7 @@ use light_dex::{
         quorum_size,
     },
     crypto::{
-        create_session, read_secret, sign_consensus, sign_transaction, verify_hotstuff_qc,
+        create_session, new_key, read_secret, sign_consensus, sign_transaction, verify_hotstuff_qc,
         verify_transaction,
     },
     exchange::address::Address,
@@ -41,10 +41,11 @@ fn measure(
     samples: usize,
 ) -> Result<(f64, f64, f64), Box<dyn std::error::Error>> {
     let manifest = create_session(dir, "hotstuff", nodes)?;
-    let account_key = read_secret(&dir.join("keys/account-0.key"))?;
+    let account_key = new_key()?;
+    let recipient_key = new_key()?;
     let transaction = Transaction::Transfer {
         from: Address::from_public_key(&account_key.verifying_key()),
-        to: Address::from_public_key(&read_secret(&dir.join("keys/account-1.key"))?.verifying_key()),
+        to: Address::from_public_key(&recipient_key.verifying_key()),
         asset: 0,
         amount: 1,
         nonce: 0,

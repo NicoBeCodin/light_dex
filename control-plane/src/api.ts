@@ -18,8 +18,11 @@ export const api = {
   submitTransaction: (transaction: Transaction, target: TargetNode) =>
     invoke<void>("submit_transaction", { transaction, target }),
   createAddress: () => invoke<WalletAccount>("create_address"),
+  claimNewAccounts: (count: number) => invoke<WalletAccount[]>("claim_new_accounts", { count }),
   airdropNewAddress: (fromLabel: number, asset: number, amount: number, target: TargetNode) =>
     invoke<WalletAccount>("airdrop_new_address", { fromLabel, asset, amount, target }),
+  fundAddress: (fromLabel: number, to: string, asset: number, amount: number, target: TargetNode) =>
+    invoke<void>("fund_address", { fromLabel, to, asset, amount, target }),
   pauseNode: (target: TargetNode, millis: number) =>
     invoke<void>("pause_node", { target, millis }),
   killNode: (target: TargetNode) => invoke<void>("kill_node", { target }),

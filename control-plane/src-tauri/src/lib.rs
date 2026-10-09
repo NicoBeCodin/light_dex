@@ -4,6 +4,7 @@ pub mod types;
 
 use controller::ControllerState;
 use light_dex::blockchain::Transaction;
+use light_dex::exchange::address::Address;
 use light_dex::exchange::order::OrderType;
 use light_dex::participants::strategies::AgentStrategy;
 use std::path::PathBuf;
@@ -29,6 +30,9 @@ fn default_config() -> LaunchConfig {
         poll_mode: PollMode::RoundRobin,
         build_before_launch: true,
         consensus: ConsensusAlgorithm::Pbft,
+        claim_limit: 1_000,
+        claim_usd: 1_000_000,
+        claim_btc: 1_000,
     }
 }
 
@@ -53,8 +57,20 @@ fn create_address(state: State<'_, ControllerState>) -> Result<WalletAccount, St
     state.create_address()
 }
 #[tauri::command]
+async fn claim_new_accounts(count: u64, state: State<'_, ControllerState>) -> Result<Vec<WalletAccount>, String> {
+    let controller = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || controller.claim_new_accounts(count))
+        .await.map_err(|error| error.to_string())?
+}
+#[tauri::command]
 fn airdrop_new_address(from_label: u64, asset: u64, amount: u64, target: TargetNode, state: State<'_, ControllerState>) -> Result<WalletAccount, String> {
     state.airdrop_new_address(from_label, asset, amount, target)
+}
+#[tauri::command]
+async fn fund_address(from_label: u64, to: Address, asset: u64, amount: u64, target: TargetNode, state: State<'_, ControllerState>) -> Result<(), String> {
+    let controller = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || controller.fund_address(from_label, to, asset, amount, target))
+        .await.map_err(|error| error.to_string())?
 }
 #[tauri::command]
 fn pause_node(
@@ -157,7 +173,9 @@ pub fn run() {
             stop_all,
             submit_transaction,
             create_address,
+            claim_new_accounts,
             airdrop_new_address,
+            fund_address,
             pause_node,
             kill_node,
             start_load,

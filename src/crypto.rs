@@ -19,14 +19,27 @@ use crate::{
         hotstuff::{HotStuffMessage, Phase, QuorumCertificate},
         pbft::PbftMessage,
     },
-    exchange::{ExchangeState, address::Address},
+    exchange::{ExchangeState, FaucetConfig, address::Address},
     message::{hex_decode, hex_encode},
 };
 
-pub const PROTOCOL_VERSION: u8 = 2;
-const TX_DOMAIN: &[u8] = b"light-dex/transaction-signature/v2";
-const CONSENSUS_DOMAIN: &[u8] = b"light-dex/consensus-signature/v2";
-const PEER_DOMAIN: &[u8] = b"light-dex/peer-handshake/v2";
+pub const PROTOCOL_VERSION: u8 = 4;
+const TX_DOMAIN: &[u8] = b"light-dex/transaction-signature/v4";
+const CONSENSUS_DOMAIN: &[u8] = b"light-dex/consensus-signature/v4";
+const PEER_DOMAIN: &[u8] = b"light-dex/peer-handshake/v4";
+
+#[derive(Debug, Clone, Copy)]
+pub struct FaucetTerms {
+    pub max_claims: u64,
+    pub usd_per_claim: u64,
+    pub btc_per_claim: u64,
+}
+
+impl Default for FaucetTerms {
+    fn default() -> Self {
+        Self { max_claims: 1_000, usd_per_claim: 1_000_000, btc_per_claim: 1_000 }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionManifest {
@@ -36,6 +49,7 @@ pub struct SessionManifest {
     pub initial_state_root: String,
     pub validators: BTreeMap<u64, String>,
     pub accounts: BTreeSet<Address>,
+    pub faucet: FaucetConfig,
     pub chain_id: String,
 }
 
@@ -46,7 +60,7 @@ impl SessionManifest {
 
     fn calculated_id(&self) -> io::Result<[u8; 32]> {
         let mut hash = Sha256::new();
-        hash.update(b"light-dex/session-manifest/v2");
+        hash.update(b"light-dex/session-manifest/v4");
         let mut encoded = Vec::new();
         encode_value(
             &serde_json::to_value((
@@ -56,6 +70,7 @@ impl SessionManifest {
                 &self.initial_state_root,
                 &self.validators,
                 &self.accounts,
+                &self.faucet,
             ))
             .map_err(io::Error::other)?,
             &mut encoded,
@@ -68,10 +83,10 @@ impl SessionManifest {
         if self.version != PROTOCOL_VERSION
             || self.consensus != "pbft" && self.consensus != "hotstuff"
             || self.validators.is_empty()
-            || self.accounts.is_empty()
         {
             return Err(invalid("invalid session manifest"));
         }
+        self.faucet.validate().map_err(io::Error::other)?;
         let _: [u8; 32] = hex_decode(&self.session_nonce)?;
         let _: [u8; 32] = hex_decode(&self.initial_state_root)?;
         if self.session_nonce != self.session_nonce.to_ascii_lowercase()
@@ -233,6 +248,15 @@ pub fn create_session(
     consensus: &str,
     nodes: u64,
 ) -> io::Result<SessionManifest> {
+    create_session_with_faucet(path, consensus, nodes, FaucetTerms::default())
+}
+
+pub fn create_session_with_faucet(
+    path: &Path,
+    consensus: &str,
+    nodes: u64,
+    terms: FaucetTerms,
+) -> io::Result<SessionManifest> {
     if nodes == 0 || nodes > 1_000 {
         return Err(invalid("invalid validator count"));
     }
@@ -254,8 +278,14 @@ pub fn create_session(
         initial_state_root: String::new(),
         validators: BTreeMap::new(),
         accounts: BTreeSet::new(),
+        faucet: FaucetConfig {
+            max_claims: terms.max_claims,
+            usd_per_claim: terms.usd_per_claim,
+            btc_per_claim: terms.btc_per_claim,
+        },
         chain_id: String::new(),
     };
+    manifest.faucet.validate().map_err(io::Error::other)?;
     for id in 0..nodes {
         let key = new_key()?;
         manifest
@@ -263,15 +293,8 @@ pub fn create_session(
             .insert(id, hex_encode(&key.verifying_key().to_bytes()));
         write_secret(&keys.join(format!("validator-{id}.key")), &key)?;
     }
-    let mut wallet = BTreeMap::new();
-    for id in 0..100u64 {
-        let key = new_key()?;
-        let address = Address::from_public_key(&key.verifying_key());
-        manifest.accounts.insert(address);
-        wallet.insert(id, address);
-        write_secret(&keys.join(format!("account-{id}.key")), &key)?;
-    }
-    manifest.initial_state_root = hex_encode(&ExchangeState::with_funded_addresses(manifest.accounts.iter().copied()).state_digest());
+    let wallet = BTreeMap::<u64, Address>::new();
+    manifest.initial_state_root = hex_encode(&ExchangeState::with_claim_faucet(manifest.faucet).map_err(io::Error::other)?.state_digest());
     let mut wallet_file = OpenOptions::new().write(true).create_new(true).open(path.join("wallet.json"))?;
     wallet_file.write_all(&serde_json::to_vec_pretty(&wallet).map_err(io::Error::other)?)?;
     wallet_file.sync_all()?;
@@ -689,7 +712,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                fs::metadata(path.join("keys/account-0.key"))
+                fs::metadata(path.join("keys/validator-0.key"))
                     .unwrap()
                     .permissions()
                     .mode()
@@ -705,21 +728,17 @@ mod tests {
                 0o700
             );
         }
-        let account = read_secret(&path.join("keys/account-0.key")).unwrap();
-        let recipient = read_secret(&path.join("keys/account-1.key")).unwrap();
+        assert!(manifest.accounts.is_empty());
+        assert_eq!(fs::read_to_string(path.join("wallet.json")).unwrap().trim(), "{}");
+        let account = new_key().unwrap();
+        let recipient = new_key().unwrap();
         let sender_address = Address::from_public_key(&account.verifying_key());
-        let tx = Transaction::Transfer {
-            from: sender_address,
-            to: Address::from_public_key(&recipient.verifying_key()),
-            asset: 0,
-            amount: 3,
-            nonce: 0,
-        };
+        let tx = Transaction::ClaimAirdrop { account_id: sender_address, nonce: 0 };
         let signed = sign_transaction(tx, &manifest, &account).unwrap();
         assert!(verify_transaction(&signed, &manifest).is_ok());
         let mut changed = signed.clone();
-        if let Transaction::Transfer { amount, .. } = &mut changed.transaction {
-            *amount += 1;
+        if let Transaction::ClaimAirdrop { account_id, .. } = &mut changed.transaction {
+            *account_id = Address::from_public_key(&recipient.verifying_key());
         }
         assert!(verify_transaction(&changed, &manifest).is_err());
         let mut other_chain = (*manifest).clone();

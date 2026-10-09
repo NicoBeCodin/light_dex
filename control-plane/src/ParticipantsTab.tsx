@@ -51,7 +51,8 @@ function Editor({ config, onChange, nodes, lockIdentity }: {
   return <div className="space-y-4">
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
       <Numeric label="Agent ID" value={config.agent_id} disabled={lockIdentity} set={value => onChange({ ...config, agent_id: value })} />
-      <Numeric label="Wallet #" value={config.account_id} disabled={lockIdentity} set={value => onChange({ ...config, account_id: value })} />
+      {lockIdentity ? <Numeric label="Wallet #" value={config.account_id} disabled set={value => onChange({ ...config, account_id: value })} />
+        : <div className="space-y-1"><Label>Wallet</Label><Input value="New address on activation" disabled /></div>}
       <div className="space-y-1"><Label>Preset</Label><Select value={strategy.kind} disabled={lockIdentity} onValueChange={value => value && change(defaultStrategy(value as Kind))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{(Object.keys(names) as Kind[]).map(kind => <SelectItem key={kind} value={kind}>{names[kind]}</SelectItem>)}</SelectContent></Select></div>
       <div className="space-y-1"><Label>Submit to</Label><Select value={targetValue} onValueChange={value => value && onChange({ ...config, target: value === "random" || value === "primary" ? { kind: value } as TargetNode : { kind: "node", node_id: Number(value.slice(5)) } })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="random">Random node</SelectItem><SelectItem value="primary">Primary</SelectItem>{nodes.filter(node => node.state !== "dead").map(node => <SelectItem key={node.node_id} value={`node:${node.node_id}`}>Node {node.node_id}</SelectItem>)}</SelectContent></Select></div>
     </div>
@@ -89,8 +90,10 @@ function Editor({ config, onChange, nodes, lockIdentity }: {
 }
 
 export function ParticipantsTab({ snapshot, command }: { snapshot: ControlSnapshot | null; command: (operation: () => Promise<void>) => Promise<void> }) {
-  const [draft, setDraft] = useState<AgentConfig>(newConfig(1, 70))
+  const [draft, setDraft] = useState<AgentConfig>(newConfig(1, 0))
   const [fleet, setFleet] = useState<AgentConfig[]>([])
+  const [preparedWallets, setPreparedWallets] = useState<{ label: number; address: string }[]>([])
+  const [launchingFleet, setLaunchingFleet] = useState(false)
   const [editingFleetIndex, setEditingFleetIndex] = useState<number | null>(null)
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [transferTps, setTransferTps] = useState(5)
@@ -99,20 +102,13 @@ export function ParticipantsTab({ snapshot, command }: { snapshot: ControlSnapsh
   const agents = snapshot?.agents ?? []
   const selected = agents.find(agent => agent.agent_id === selectedId)
   const groups = [...new Set(agents.flatMap(agent => agent.group_id === null ? [] : [agent.group_id]))]
-  const availableAccounts = () => {
-    const status = snapshot?.nodes.find(node => node.state === "ok")?.status
-    const wallet = snapshot?.wallet ?? []
-    const used = new Set([...agents.map(agent => agent.account_id), ...fleet.map(agent => agent.account_id), ...((status?.open_orders ?? []).flatMap(order => wallet.filter(account => account.address === order.account_id).map(account => account.label)))])
-    return wallet.filter(account => status?.account_nonces.some(nonce => nonce.account_id === account.address)).map(account => account.label).filter(id => !used.has(id))
-  }
   const nextId = () => Math.max(0, ...agents.map(agent => agent.agent_id), ...fleet.map(agent => agent.agent_id), draft.agent_id) + 1
-  const addRow = () => setFleet(rows => [...rows, newConfig(nextId(), availableAccounts()[0] ?? 0)])
+  const addRow = () => { setPreparedWallets([]); setFleet(rows => [...rows, newConfig(nextId(), 0)]) }
   const loadMeta = () => command(async () => {
     const template = await api.defaultParticipantFleet()
-    const available = availableAccounts()
-    if (available.length < template.length) { throw new Error("Not enough unused funded accounts for the 13-agent preset") }
     const startId = Math.max(0, ...agents.map(agent => agent.agent_id)) + 1
-    setFleet(template.map((config, index) => ({ ...config, agent_id: startId + index, account_id: available[index] })))
+    setFleet(template.map((config, index) => ({ ...config, agent_id: startId + index, account_id: 0 })))
+    setPreparedWallets([])
     setEditingFleetIndex(null)
   })
   const editActive = (id: number) => {
@@ -128,7 +124,19 @@ export function ParticipantsTab({ snapshot, command }: { snapshot: ControlSnapsh
       setEditingFleetIndex(null)
       return Promise.resolve()
     }
-    return api.startAgent(draft)
+    if (selected) return api.startAgent(draft)
+    return api.claimNewAccounts(1).then(([wallet]) => api.startAgent({ ...draft, account_id: wallet.label }))
+  }
+  const launchFleet = async () => {
+    if (launchingFleet || fleet.length === 0) return
+    setLaunchingFleet(true)
+    try {
+      const wallets = preparedWallets.length === fleet.length ? preparedWallets : await api.claimNewAccounts(fleet.length)
+      setPreparedWallets(wallets)
+      await api.startAgents(fleet.map((config, index) => ({ ...config, account_id: wallets[index].label })))
+      setFleet([])
+      setPreparedWallets([])
+    } finally { setLaunchingFleet(false) }
   }
   const startTransfers = () => {
     const config: LoadConfig = { preset: { kind: "random_transfers", first_account: transferFirst,
@@ -139,9 +147,10 @@ export function ParticipantsTab({ snapshot, command }: { snapshot: ControlSnapsh
   return <div className="space-y-5">
     <div className="flex flex-wrap items-end justify-between gap-3"><div><p className="data-label text-primary">Agents</p><h2 className="mt-1 text-2xl font-semibold tracking-tight">Market participants</h2><p className="mt-1 text-sm text-muted-foreground">Configure and monitor agent strategies.</p></div><Badge variant="outline">{agents.length} active / stopping</Badge></div>
     <Card className="dashboard-card"><CardHeader><div className="flex items-center justify-between"><CardTitle>Participant fleet</CardTitle><Badge variant="secondary">{fleet.length} staged</Badge></div></CardHeader><CardContent className="space-y-4">
-      <p className="text-sm text-muted-foreground">Build any mix of presets, then launch them together. Each agent gets a distinct funded account; an invalid row prevents the entire fleet from starting.</p>
-      <div className="flex flex-wrap gap-2"><Button variant="outline" onClick={addRow}>Add agent</Button><Button variant="outline" onClick={loadMeta}>Load 13-agent mix</Button><Button disabled={!snapshot?.running || fleet.length === 0} onClick={() => command(() => api.startAgents(fleet).then(() => setFleet([])))}>Launch fleet ({fleet.length})</Button></div>
-      {fleet.length > 0 && <div className="overflow-x-auto"><Table><TableHeader><TableRow><TableHead>ID</TableHead><TableHead>Account</TableHead><TableHead>Preset</TableHead><TableHead>Target</TableHead><TableHead /></TableRow></TableHeader><TableBody>{fleet.map((config, index) => <TableRow key={index}><TableCell>{config.agent_id}</TableCell><TableCell>{config.account_id}</TableCell><TableCell>{names[config.strategy.kind]}</TableCell><TableCell>{config.target.kind}</TableCell><TableCell className="space-x-2 text-right"><Button size="sm" variant="outline" onClick={() => { setDraft(config); setEditingFleetIndex(index); setSelectedId(null) }}>Edit</Button><Button size="sm" variant="ghost" onClick={() => setFleet(rows => rows.filter((_, item) => item !== index))}>Remove</Button></TableCell></TableRow>)}</TableBody></Table></div>}
+      <p className="text-sm text-muted-foreground">Each agent signs a one-time on-chain claim from a new address. Trading begins only after every claim commits.</p>
+      <div className="flex flex-wrap gap-2"><Button variant="outline" disabled={launchingFleet} onClick={addRow}>Add agent</Button><Button variant="outline" disabled={launchingFleet} onClick={loadMeta}>Load 13-agent mix</Button><Button disabled={!snapshot?.running || fleet.length === 0 || launchingFleet} onClick={() => void command(launchFleet)}>{launchingFleet ? "Claiming accounts…" : `Claim & launch fleet (${fleet.length})`}</Button></div>
+      {snapshot?.claim_progress && <p role="status" className="text-xs text-muted-foreground">Claims: {snapshot.claim_progress.confirmed}/{snapshot.claim_progress.requested} committed{snapshot.claim_progress.error ? ` · ${snapshot.claim_progress.error}` : ""}</p>}
+      {fleet.length > 0 && <div className="overflow-x-auto"><Table><TableHeader><TableRow><TableHead>ID</TableHead><TableHead>Account</TableHead><TableHead>Preset</TableHead><TableHead>Target</TableHead><TableHead /></TableRow></TableHeader><TableBody>{fleet.map((config, index) => <TableRow key={index}><TableCell>{config.agent_id}</TableCell><TableCell>{preparedWallets[index] ? `#${preparedWallets[index].label} · claimed` : "New address on launch"}</TableCell><TableCell>{names[config.strategy.kind]}</TableCell><TableCell>{config.target.kind}</TableCell><TableCell className="space-x-2 text-right"><Button size="sm" variant="outline" disabled={launchingFleet} onClick={() => { setDraft(config); setEditingFleetIndex(index); setSelectedId(null) }}>Edit</Button><Button size="sm" variant="ghost" disabled={launchingFleet} onClick={() => { setPreparedWallets([]); setFleet(rows => rows.filter((_, item) => item !== index)) }}>Remove</Button></TableCell></TableRow>)}</TableBody></Table></div>}
       {groups.map(groupId => <div key={groupId} className="flex items-center gap-3 text-sm"><Badge variant="outline">Group {groupId}</Badge><span>{agents.filter(agent => agent.group_id === groupId).length} agents</span><Button size="sm" variant="outline" onClick={() => command(() => api.stopAgents(agents.filter(agent => agent.group_id === groupId).map(agent => agent.agent_id)))}>Stop group</Button></div>)}
     </CardContent></Card>
 
@@ -150,7 +159,7 @@ export function ParticipantsTab({ snapshot, command }: { snapshot: ControlSnapsh
       <Card className="dashboard-card"><CardHeader><CardTitle>{editingFleetIndex !== null ? `Edit fleet row ${editingFleetIndex + 1}` : selected ? `Agent ${selected.agent_id}` : "New agent"}</CardTitle></CardHeader><CardContent className="space-y-4">
         {selected && <div className="grid gap-2 text-sm sm:grid-cols-2"><span>Confirmed nonce: {selected.confirmed_nonce ?? "—"}</span><span>Pending: {selected.pending_action ?? (selected.pending ? "transaction" : "none")}</span><span>BTC available / locked: {selected.balance ? `${selected.balance.btc_available} / ${selected.balance.btc_locked}` : "—"}</span><span>USD available / locked: {selected.balance ? `${selected.balance.usd_available.toLocaleString()} / ${selected.balance.usd_locked.toLocaleString()}` : "—"}</span><span>Open orders: {selected.own_open_orders}</span><span>Binance feed age: {selected.feed_age_ms === null ? "not used / waiting" : `${selected.feed_age_ms} ms`}</span>{selected.last_error && <span role="alert" className="text-destructive sm:col-span-2">{selected.last_error}</span>}</div>}
         <Editor config={draft} onChange={setDraft} nodes={snapshot?.nodes ?? []} lockIdentity={!!selected} />
-        <div className="flex flex-wrap gap-2"><Button disabled={!snapshot?.running} onClick={() => command(saveDraft)}>{editingFleetIndex !== null ? "Save fleet row" : selected ? "Update live" : "Activate agent"}</Button>{selected && <Button variant="outline" onClick={() => command(() => api.stopAgent(selected.agent_id))}>Stop and clear orders</Button>}<Button variant="ghost" onClick={() => { setSelectedId(null); setEditingFleetIndex(null); setDraft(newConfig(nextId(), availableAccounts()[0] ?? 0)) }}>New agent</Button></div>
+        <div className="flex flex-wrap gap-2"><Button disabled={!snapshot?.running || launchingFleet} onClick={() => void command(saveDraft)}>{editingFleetIndex !== null ? "Save fleet row" : selected ? "Update live" : "Claim & activate agent"}</Button>{selected && <Button variant="outline" onClick={() => command(() => api.stopAgent(selected.agent_id))}>Stop and clear orders</Button>}<Button variant="ghost" onClick={() => { setSelectedId(null); setEditingFleetIndex(null); setDraft(newConfig(nextId(), 0)) }}>New agent</Button></div>
       </CardContent></Card>
     </div>
 

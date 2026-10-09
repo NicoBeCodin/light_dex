@@ -3,4 +3,4 @@ import type { Address } from "./Address";
 import type { OrderType } from "./OrderType";
 import type { Side } from "./Side";
 
-export type Transaction = { "Transfer": { from: Address, to: Address, asset: number, amount: number, nonce: number, } } | { "PlaceOrder": { account_id: Address, market_id: number, order_type: OrderType, side: Side, price: number, quantity: number, nonce: number, } } | { "CancelOrder": { account_id: Address, market_id: number, order_id: number, nonce: number, } };
+export type Transaction = { "ClaimAirdrop": { account_id: Address, nonce: number, } } | { "Transfer": { from: Address, to: Address, asset: number, amount: number, nonce: number, } } | { "PlaceOrder": { account_id: Address, market_id: number, order_type: OrderType, side: Side, price: number, quantity: number, nonce: number, } } | { "CancelOrder": { account_id: Address, market_id: number, order_id: number, nonce: number, } };

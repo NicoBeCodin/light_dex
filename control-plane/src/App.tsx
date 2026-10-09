@@ -84,16 +84,16 @@ function App() {
         <Metric label="Submitted" value={(metrics?.submitted ?? 0).toLocaleString()} detail="Control-plane total" icon={<Send className="size-4" />} />
         <Metric label="Submit rate" value={`${(metrics?.submit_tps ?? 0).toFixed(1)} tx/s`} detail="Rolling 5-second window" icon={<ArrowRight className="size-4" />} />
         <Metric label="Commit rate" value={`${(metrics?.commit_tps ?? 0).toFixed(1)} tx/s`} detail="Median responsive node" icon={<Gauge className="size-4" />} />
-        <Metric label="Blocks" value={`${(metrics?.blocks_per_second ?? 0).toFixed(2)} /s`} detail="Median responsive node" icon={<Boxes className="size-4" />} />
-        <Metric label="Commit latency" value={`${(metrics?.commit_latency_ms ?? 0).toFixed(1)} ms`} detail="Reported by validators" icon={<Clock3 className="size-4" />} />
+        <Metric label="Blocks" value={`${(metrics?.blocks_per_second ?? 0).toFixed(2)} /s`} detail="Median node, since last poll" icon={<Boxes className="size-4" />} />
+        <Metric label="Tx commit latency" value={`${(metrics?.commit_latency_ms ?? 0).toFixed(1)} ms`} detail="Lifetime mean, receipt to commit" icon={<Clock3 className="size-4" />} />
       </div>
       <Tabs value={section} onValueChange={value => setSection(value as Section)} className="space-y-5">
         <TabsList className="h-auto w-full justify-start gap-1 overflow-x-auto rounded-xl border border-border bg-card p-1.5 sm:w-auto">
-          <TabsTrigger value="overview">Overview</TabsTrigger><TabsTrigger value="market">Market</TabsTrigger><TabsTrigger value="participants"><Users className="size-4" />Participants</TabsTrigger><TabsTrigger value="operations">Operations</TabsTrigger>
+          <TabsTrigger value="overview">Status</TabsTrigger><TabsTrigger value="operations">Operations</TabsTrigger><TabsTrigger value="market">Market</TabsTrigger><TabsTrigger value="participants"><Users className="size-4" />Participants</TabsTrigger>
         </TabsList>
         <TabsContent value="overview"><NodeOverview snapshot={snapshot} onQuery={queryNode} onPause={pauseNode} onKill={killNode} onOpenMarket={() => setSection("market")} onOpenParticipants={() => setSection("participants")} /></TabsContent>
         <TabsContent value="market"><OrderBookView snapshot={snapshot} /></TabsContent>
-        <TabsContent value="participants"><ParticipantsTab snapshot={snapshot} command={command} /></TabsContent>
+        <TabsContent value="participants" keepMounted><ParticipantsTab snapshot={snapshot} command={command} /></TabsContent>
         <TabsContent value="operations"><OperationsTab snapshot={snapshot} config={config} setConfig={setConfig} command={command} onLaunch={() => config ? command(() => api.launch(config)) : Promise.resolve()} onStop={() => command(api.stopAll)} /></TabsContent>
       </Tabs>
     </main>
