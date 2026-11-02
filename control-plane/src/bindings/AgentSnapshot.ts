@@ -3,4 +3,4 @@ import type { AgentBalance } from "./AgentBalance";
 import type { AgentStrategy } from "./AgentStrategy";
 import type { TargetNode } from "./TargetNode";
 
-export type AgentSnapshot = { agent_id: number, account_id: number, strategy: AgentStrategy, target: TargetNode, state: string, pending: number, pending_action: string | null, own_open_orders: number, last_error: string | null, confirmed_nonce: number | null, balance: AgentBalance | null, feed_age_ms: number | null, group_id: number | null, };
+export type AgentSnapshot = { agent_id: number, account_id: number, market_id: number, strategy: AgentStrategy, target: TargetNode, wait_for_confirmation: boolean, state: string, pending: number, pending_action: string | null, own_open_orders: number, last_error: string | null, confirmed_nonce: number | null, balance: AgentBalance | null, feed_age_ms: number | null, group_id: number | null, };

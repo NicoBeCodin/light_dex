@@ -1,0 +1,133 @@
+# Consensus genesis catalog. IDs are stable protocol identifiers.
+# USD uses 6 decimals; BTC/ETH/BNB/SOL use 4, XRP uses 2.
+# Fees and margin rates are integer basis points (10_000 = 100%).
+
+[[markets]]
+id = 0
+base_asset = 1
+quote_asset = 0
+price = { decimals = 1, step = 1 }
+quantity = { decimals = 4, step = 1 }
+market_type = { kind = "spot" }
+fees = { maker_bps = 0, taker_bps = 2, liquidation_bps = 0, keeper_reward_bps = 0 }
+maintenance_margin_bps = 0
+funding_interval_updates = 0
+max_funding_bps = 0
+max_liquidation_slippage_bps = 0
+
+[[markets]]
+id = 1
+base_asset = 1
+quote_asset = 0
+price = { decimals = 1, step = 1 }
+quantity = { decimals = 4, step = 1 }
+market_type = { kind = "perp", max_leverage = 10 }
+fees = { maker_bps = 1, taker_bps = 3, liquidation_bps = 50, keeper_reward_bps = 5 }
+maintenance_margin_bps = 500
+funding_interval_updates = 120
+max_funding_bps = 10
+max_liquidation_slippage_bps = 100
+
+[[markets]]
+id = 2
+base_asset = 2
+quote_asset = 0
+price = { decimals = 2, step = 1 }
+quantity = { decimals = 4, step = 1 }
+market_type = { kind = "spot" }
+fees = { maker_bps = 0, taker_bps = 2, liquidation_bps = 0, keeper_reward_bps = 0 }
+maintenance_margin_bps = 0
+funding_interval_updates = 0
+max_funding_bps = 0
+max_liquidation_slippage_bps = 0
+
+[[markets]]
+id = 3
+base_asset = 2
+quote_asset = 0
+price = { decimals = 2, step = 1 }
+quantity = { decimals = 4, step = 1 }
+market_type = { kind = "perp", max_leverage = 10 }
+fees = { maker_bps = 1, taker_bps = 3, liquidation_bps = 50, keeper_reward_bps = 5 }
+maintenance_margin_bps = 500
+funding_interval_updates = 120
+max_funding_bps = 10
+max_liquidation_slippage_bps = 100
+
+[[markets]]
+id = 4
+base_asset = 4
+quote_asset = 0
+price = { decimals = 2, step = 1 }
+quantity = { decimals = 4, step = 1 }
+market_type = { kind = "spot" }
+fees = { maker_bps = 0, taker_bps = 2, liquidation_bps = 0, keeper_reward_bps = 0 }
+maintenance_margin_bps = 0
+funding_interval_updates = 0
+max_funding_bps = 0
+max_liquidation_slippage_bps = 0
+
+[[markets]]
+id = 5
+base_asset = 4
+quote_asset = 0
+price = { decimals = 2, step = 1 }
+quantity = { decimals = 4, step = 1 }
+market_type = { kind = "perp", max_leverage = 10 }
+fees = { maker_bps = 1, taker_bps = 3, liquidation_bps = 50, keeper_reward_bps = 5 }
+maintenance_margin_bps = 500
+funding_interval_updates = 120
+max_funding_bps = 10
+max_liquidation_slippage_bps = 100
+
+[[markets]]
+id = 6
+base_asset = 5
+quote_asset = 0
+price = { decimals = 4, step = 1 }
+quantity = { decimals = 2, step = 1 }
+market_type = { kind = "spot" }
+fees = { maker_bps = 0, taker_bps = 2, liquidation_bps = 0, keeper_reward_bps = 0 }
+maintenance_margin_bps = 0
+funding_interval_updates = 0
+max_funding_bps = 0
+max_liquidation_slippage_bps = 0
+
+[[markets]]
+id = 7
+base_asset = 5
+quote_asset = 0
+price = { decimals = 4, step = 1 }
+quantity = { decimals = 2, step = 1 }
+market_type = { kind = "perp", max_leverage = 5 }
+fees = { maker_bps = 1, taker_bps = 3, liquidation_bps = 50, keeper_reward_bps = 5 }
+maintenance_margin_bps = 1000
+funding_interval_updates = 120
+max_funding_bps = 10
+max_liquidation_slippage_bps = 100
+
+[[markets]]
+id = 8
+base_asset = 3
+quote_asset = 0
+price = { decimals = 2, step = 1 }
+quantity = { decimals = 4, step = 1 }
+market_type = { kind = "spot" }
+fees = { maker_bps = 0, taker_bps = 2, liquidation_bps = 0, keeper_reward_bps = 0 }
+maintenance_margin_bps = 0
+funding_interval_updates = 0
+max_funding_bps = 0
+max_liquidation_slippage_bps = 0
+
+[[markets]]
+id = 9
+base_asset = 3
+quote_asset = 0
+price = { decimals = 2, step = 1 }
+quantity = { decimals = 4, step = 1 }
+market_type = { kind = "perp", max_leverage = 10 }
+fees = { maker_bps = 1, taker_bps = 3, liquidation_bps = 50, keeper_reward_bps = 5 }
+maintenance_margin_bps = 500
+funding_interval_updates = 120
+max_funding_bps = 10
+max_liquidation_slippage_bps = 100

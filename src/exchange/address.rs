@@ -20,11 +20,7 @@ impl Address {
         self.0
     }
     pub fn public_key(self) -> Result<VerifyingKey, String> {
-        let key = VerifyingKey::from_bytes(&self.0).map_err(|error| error.to_string())?;
-        if key.is_weak() {
-            return Err("weak account address".into());
-        }
-        Ok(key)
+        crate::crypto::decoded_public_key(self.0).map_err(|error| error.to_string())
     }
 
     /// Deterministic test/benchmark identity, never used to sign live sessions.

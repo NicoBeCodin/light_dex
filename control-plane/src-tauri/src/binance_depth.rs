@@ -1,3 +1,4 @@
+use light_dex::exchange::market_config::DecimalStep;
 use light_dex::participants::market_maker::DesiredBook;
 use serde::Deserialize;
 
@@ -17,17 +18,26 @@ pub fn mid_price(depth: &PartialDepth) -> Option<f64> {
     (bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > bid).then_some((bid + ask) / 2.0)
 }
 
-fn integer_price(price: &str, bid: bool) -> Option<u64> {
-    let value: f64 = price.parse().ok()?;
-    if !value.is_finite() || value <= 0.0 || value > u64::MAX as f64 {
-        return None;
-    }
-    Some(if bid { value.floor() } else { value.ceil() } as u64)
+/// Keep the existing BTC-USD whole-dollar behavior.
+#[cfg(test)]
+pub fn desired_book(depth: &PartialDepth, levels: usize) -> DesiredBook {
+    desired_book_for_market(
+        depth,
+        levels,
+        DecimalStep {
+            decimals: 0,
+            step: 1,
+        },
+    )
 }
 
-/// Chain prices are whole-USD integers. Keep level order and one-dollar tick
-/// separation when Binance's finer prices map to the same chain tick.
-pub fn desired_book(depth: &PartialDepth, levels: usize) -> DesiredBook {
+/// Convert decimal feed strings into integer chain units using the market's
+/// configured tick. Bids round down and asks round up without using f64.
+pub fn desired_book_for_market(
+    depth: &PartialDepth,
+    levels: usize,
+    tick: DecimalStep,
+) -> DesiredBook {
     let mut book = DesiredBook::default();
     for entry in &depth.bids {
         if book.bids.len() == levels {
@@ -40,11 +50,11 @@ pub fn desired_book(depth: &PartialDepth, levels: usize) -> DesiredBook {
         {
             continue;
         }
-        let Some(mut price) = integer_price(&entry[0], true) else {
+        let Ok(mut price) = tick.parse_bid(&entry[0]) else {
             continue;
         };
         if let Some(&previous) = book.bids.last() {
-            price = price.min(previous.saturating_sub(1));
+            price = price.min(previous.saturating_sub(tick.step));
         }
         if price > 0 {
             book.bids.push(price);
@@ -61,11 +71,11 @@ pub fn desired_book(depth: &PartialDepth, levels: usize) -> DesiredBook {
         {
             continue;
         }
-        let Some(mut price) = integer_price(&entry[0], false) else {
+        let Ok(mut price) = tick.parse_ask(&entry[0]) else {
             continue;
         };
         if let Some(&previous) = book.asks.last() {
-            price = price.max(previous.saturating_add(1));
+            price = price.max(previous.saturating_add(tick.step));
         }
         if price > 0 {
             book.asks.push(price);
@@ -95,6 +105,19 @@ mod tests {
             DesiredBook {
                 bids: vec![82762, 82761],
                 asks: vec![82763, 82764]
+            }
+        );
+    }
+
+    #[test]
+    fn maps_feed_to_fractional_chain_tick() {
+        let depth: PartialDepth = serde_json::from_str(r#"{"lastUpdateId":1,"bids":[["12.349","1"],["12.348","1"]],"asks":[["12.351","1"],["12.352","1"]]}"#).unwrap();
+        let tick = DecimalStep::new(2, 5).unwrap();
+        assert_eq!(
+            desired_book_for_market(&depth, 2, tick),
+            DesiredBook {
+                bids: vec![1230, 1225],
+                asks: vec![1240, 1245],
             }
         );
     }

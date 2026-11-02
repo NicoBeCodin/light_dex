@@ -1,0 +1,14 @@
+{
+  "profiles": [
+    {
+      "id": "example",
+      "label": "Example SSH host",
+      "ssh_alias": "my-validator-host",
+      "remote_base_dir": "/home/my-user/light-dex-runs",
+      "peer_port": 44000,
+      "bootstrap_port": 44050,
+      "feed_port_start": 45000,
+      "tailnet_ip": "100.101.102.103"
+    }
+  ]
+}

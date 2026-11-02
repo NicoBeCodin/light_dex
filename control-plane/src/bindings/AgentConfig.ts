@@ -2,4 +2,4 @@
 import type { AgentStrategy } from "./AgentStrategy";
 import type { TargetNode } from "./TargetNode";
 
-export type AgentConfig = { agent_id: number, account_id: number, market_id: number, strategy: AgentStrategy, target: TargetNode, };
+export type AgentConfig = { agent_id: number, account_id: number, market_id: number, strategy: AgentStrategy, target: TargetNode, wait_for_confirmation: boolean, };

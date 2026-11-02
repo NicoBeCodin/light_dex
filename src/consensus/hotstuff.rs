@@ -1,20 +1,34 @@
 use std::{
     collections::{HashMap, HashSet},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::crypto::{SessionManifest, SignedConsensusMessage, verify_hotstuff_qc};
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use ed25519_dalek::SigningKey;
-use crate::crypto::{SessionManifest, SignedConsensusMessage, verify_hotstuff_qc};
 
 use crate::{
     blockchain::{Block, Digest, Proposal},
-    consensus::{CommitCertificate, Consensus, ConsensusAction, ConsensusEvent, ConsensusMessage, EvidenceStore},
+    consensus::{
+        CommitCertificate, Consensus, ConsensusAction, ConsensusEvent, ConsensusMessage,
+        EvidenceStore,
+    },
     node::NodeId,
 };
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_000;
+
+pub(crate) fn handoff_trace(node: NodeId, view: u64, event: &str) {
+    if std::env::var_os("LIGHT_DEX_HANDOFF_TRACE").is_none() {
+        return;
+    }
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    eprintln!("HANDOFF node={node} view={view} event={event} unix_us={micros}");
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuorumCertificate {
@@ -181,10 +195,19 @@ impl HotStuff {
         ids.sort_unstable();
         let signatures = if self.evidence.manifest().is_some() {
             let example = ConsensusMessage::Hotstuff(HotStuffMessage::Vote {
-                view: key.view, height: key.height, phase: key.phase, digest: key.digest,
+                view: key.view,
+                height: key.height,
+                phase: key.phase,
+                digest: key.digest,
             });
-            self.evidence.proofs(&example, &ids)?.into_iter().map(|proof| proof.signature).collect()
-        } else { Vec::new() };
+            self.evidence
+                .proofs(&example, &ids)?
+                .into_iter()
+                .map(|proof| proof.signature)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let qc = QuorumCertificate {
             view: key.view,
             height: key.height,
@@ -211,7 +234,8 @@ impl HotStuff {
             return false;
         }
         if (unique_voters.len() as u64) < self.quorum()
-            || unique_voters.iter().any(|id| *id >= self.node_count) {
+            || unique_voters.iter().any(|id| *id >= self.node_count)
+        {
             return false;
         }
 
@@ -219,57 +243,103 @@ impl HotStuff {
     }
     fn vote_once(&mut self, view: u64, height: u64, phase: Phase, digest: Digest) -> bool {
         match self.voted.entry((view, height, phase)) {
-            std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(digest); true }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(digest);
+                true
+            }
             std::collections::hash_map::Entry::Occupied(_) => false,
         }
     }
     fn timer(&mut self) -> Vec<ConsensusAction> {
         let key = (self.view, self.next_height);
-        if self.armed_timer == Some(key) { return vec![]; }
+        if self.armed_timer == Some(key) {
+            return vec![];
+        }
         self.armed_timer = Some(key);
         vec![ConsensusAction::ScheduleTimeout {
-            view: self.view, sequence: self.next_height,
+            view: self.view,
+            sequence: self.next_height,
             duration: Duration::from_millis(self.timeout_ms),
         }]
     }
     fn advance_view(&mut self, view: u64) -> Vec<ConsensusAction> {
-        if view <= self.view { return vec![]; }
+        if view <= self.view {
+            return vec![];
+        }
         self.view = view;
+        handoff_trace(self.node_id, view, "new_view_sent");
         self.armed_timer = None;
         self.view_ready = false;
         self.active_proposal = None;
         self.votes.clear();
         self.formed_qcs.clear();
-        self.new_view_message.entry(view).or_default().insert(self.node_id, self.high_qc.clone());
-        let mut actions = vec![
-            ConsensusAction::Broadcast(ConsensusMessage::Hotstuff(HotStuffMessage::NewView {
-                view, high_qc: self.high_qc.clone(),
-            })),
-        ];
+        self.new_view_message
+            .entry(view)
+            .or_default()
+            .insert(self.node_id, self.high_qc.clone());
+        let mut actions = vec![ConsensusAction::Broadcast(ConsensusMessage::Hotstuff(
+            HotStuffMessage::NewView {
+                view,
+                high_qc: self.high_qc.clone(),
+            },
+        ))];
         actions.extend(self.timer());
         actions
     }
-    fn handle_new_view(&mut self, from: NodeId, view: u64, high_qc: QuorumCertificate) -> Vec<ConsensusAction> {
-        if from >= self.node_count || view < self.view || !self.valid_qc(&high_qc) { return vec![]; }
-        let mut actions = if view > self.view { self.advance_view(view) } else { vec![] };
-        if self.node_id != self.leader_for_view(view) || self.view_ready { return actions; }
-        self.new_view_message.entry(view).or_default().insert(from, high_qc);
+    fn handle_new_view(
+        &mut self,
+        from: NodeId,
+        view: u64,
+        high_qc: QuorumCertificate,
+    ) -> Vec<ConsensusAction> {
+        if from >= self.node_count || view < self.view || !self.valid_qc(&high_qc) {
+            return vec![];
+        }
+        let mut actions = if view > self.view {
+            self.advance_view(view)
+        } else {
+            vec![]
+        };
+        if self.node_id != self.leader_for_view(view) || self.view_ready {
+            return actions;
+        }
+        self.new_view_message
+            .entry(view)
+            .or_default()
+            .insert(from, high_qc);
         let votes = &self.new_view_message[&view];
         if votes.len() as u64 >= self.quorum() {
+            handoff_trace(self.node_id, view, "new_view_quorum");
             let mut voters = votes.keys().copied().collect::<Vec<_>>();
             voters.sort_unstable();
             let proofs = if self.evidence.manifest().is_some() {
-                let example = ConsensusMessage::Hotstuff(HotStuffMessage::NewView { view, high_qc: self.high_qc.clone() });
-                let Some(proofs) = self.evidence.proofs(&example, &voters) else { return actions; };
+                let example = ConsensusMessage::Hotstuff(HotStuffMessage::NewView {
+                    view,
+                    high_qc: self.high_qc.clone(),
+                });
+                let Some(proofs) = self.evidence.proofs(&example, &voters) else {
+                    return actions;
+                };
                 proofs
-            } else { Vec::new() };
-            let best = votes.values().max_by_key(|qc| (qc.height, qc.view, qc.phase.rank(), qc.digest)).cloned().unwrap();
+            } else {
+                Vec::new()
+            };
+            let best = votes
+                .values()
+                .max_by_key(|qc| (qc.height, qc.view, qc.phase.rank(), qc.digest))
+                .cloned()
+                .unwrap();
             self.update_high_qc(best.clone());
             self.view_ready = true;
-            actions.push(ConsensusAction::Broadcast(ConsensusMessage::Hotstuff(HotStuffMessage::StartView {
-                view, high_qc: best.clone(),
-                proofs,
-            })));
+            handoff_trace(self.node_id, view, "start_view_sent");
+            actions.push(ConsensusAction::Broadcast(ConsensusMessage::Hotstuff(
+                HotStuffMessage::StartView {
+                    view,
+                    high_qc: best.clone(),
+                    proofs,
+                },
+            )));
+            actions.push(ConsensusAction::TryPropose);
             // If a phase certificate refers to this still-uncommitted height,
             // carry that proposal into the new view instead of rebuilding a
             // conflicting block from a different local mempool order.
@@ -281,10 +351,25 @@ impl HotStuff {
         }
         actions
     }
-    fn handle_start_view(&mut self, from: NodeId, view: u64, high_qc: QuorumCertificate, proofs: Vec<SignedConsensusMessage>) -> Vec<ConsensusAction> {
-        if from != self.leader_for_view(view) || view < self.view || !self.valid_qc(&high_qc) { return vec![]; }
-        if self.evidence.manifest().is_some() &&
-            crate::crypto::verify_hotstuff_start_view(view, &high_qc, &proofs, self.evidence.manifest().unwrap()).is_err() {
+    fn handle_start_view(
+        &mut self,
+        from: NodeId,
+        view: u64,
+        high_qc: QuorumCertificate,
+        proofs: Vec<SignedConsensusMessage>,
+    ) -> Vec<ConsensusAction> {
+        if from != self.leader_for_view(view) || view < self.view || !self.valid_qc(&high_qc) {
+            return vec![];
+        }
+        if self.evidence.manifest().is_some()
+            && crate::crypto::verify_hotstuff_start_view(
+                view,
+                &high_qc,
+                &proofs,
+                self.evidence.manifest().unwrap(),
+            )
+            .is_err()
+        {
             return vec![];
         }
         if view > self.view {
@@ -293,7 +378,12 @@ impl HotStuff {
         }
         self.update_high_qc(high_qc);
         self.view_ready = true;
-        self.timer()
+        handoff_trace(self.node_id, view, "start_view_received");
+        let mut actions = self.timer();
+        if self.node_id == self.leader_for_view(view) {
+            actions.push(ConsensusAction::TryPropose);
+        }
+        actions
     }
     fn update_high_qc(&mut self, qc: QuorumCertificate) {
         if qc_is_newer(&qc, &self.high_qc) {
@@ -339,21 +429,21 @@ impl HotStuff {
         if proposal.block.sequence != height || !self.safe_to_vote(&proposal, &justify) {
             return vec![];
         }
-        if !self.vote_once(view, height, Phase::Prepare, digest) { return vec![]; }
+        if !self.vote_once(view, height, Phase::Prepare, digest) {
+            return vec![];
+        }
         self.proposals.entry(digest).or_insert(proposal);
         let leader = self.leader_for_view(view);
 
-        let mut actions = vec![
-            ConsensusAction::Send {
-                peer: leader,
-                message: ConsensusMessage::Hotstuff(HotStuffMessage::Vote {
-                    view,
-                    height: height,
-                    phase: Phase::Prepare,
-                    digest,
-                }),
-            },
-        ];
+        let mut actions = vec![ConsensusAction::Send {
+            peer: leader,
+            message: ConsensusMessage::Hotstuff(HotStuffMessage::Vote {
+                view,
+                height: height,
+                phase: Phase::Prepare,
+                digest,
+            }),
+        }];
         actions.extend(self.timer());
         actions
         // if justify
@@ -385,7 +475,12 @@ impl HotStuff {
             digest,
         };
 
-        if from >= self.node_count || height != self.next_height || self.active_proposal != Some(digest) { return vec![]; }
+        if from >= self.node_count
+            || height != self.next_height
+            || self.active_proposal != Some(digest)
+        {
+            return vec![];
+        }
         self.votes.entry(key.clone()).or_default().insert(from);
         let Some(qc) = self.try_form_qc(&key) else {
             return vec![];
@@ -402,7 +497,12 @@ impl HotStuff {
         self.votes.entry(next_key).or_default().insert(self.node_id);
 
         vec![ConsensusAction::Broadcast(ConsensusMessage::Hotstuff(
-            HotStuffMessage::PreCommit {view,height,qc, digest },
+            HotStuffMessage::PreCommit {
+                view,
+                height,
+                qc,
+                digest,
+            },
         ))]
     }
     fn handle_pre_commit(
@@ -437,7 +537,9 @@ impl HotStuff {
             return vec![];
         }
         self.update_high_qc(qc);
-        if !self.vote_once(view, height, Phase::PreCommit, digest) { return vec![]; }
+        if !self.vote_once(view, height, Phase::PreCommit, digest) {
+            return vec![];
+        }
         vec![ConsensusAction::Send {
             peer: self.leader_for_view(view),
             message: ConsensusMessage::Hotstuff(HotStuffMessage::Vote {
@@ -470,7 +572,12 @@ impl HotStuff {
             phase: Phase::PreCommit,
             digest,
         };
-        if from >= self.node_count || height != self.next_height || self.active_proposal != Some(digest) { return vec![]; }
+        if from >= self.node_count
+            || height != self.next_height
+            || self.active_proposal != Some(digest)
+        {
+            return vec![];
+        }
         self.votes.entry(key.clone()).or_default().insert(from);
         let Some(qc) = self.try_form_qc(&key) else {
             return vec![];
@@ -485,7 +592,12 @@ impl HotStuff {
 
         self.votes.entry(next_key).or_default().insert(self.node_id);
         vec![ConsensusAction::Broadcast(ConsensusMessage::Hotstuff(
-            HotStuffMessage::Commit {view,qc,height, digest },
+            HotStuffMessage::Commit {
+                view,
+                qc,
+                height,
+                digest,
+            },
         ))]
     }
 
@@ -525,7 +637,9 @@ impl HotStuff {
         self.update_locked_qc(qc.clone());
 
         self.update_high_qc(qc);
-        if !self.vote_once(view, height, Phase::Commit, digest) { return vec![]; }
+        if !self.vote_once(view, height, Phase::Commit, digest) {
+            return vec![];
+        }
 
         vec![ConsensusAction::Send {
             peer: self.leader_for_view(view),
@@ -561,7 +675,12 @@ impl HotStuff {
             digest,
         };
 
-        if from >= self.node_count || height != self.next_height || self.active_proposal != Some(digest) { return vec![]; }
+        if from >= self.node_count
+            || height != self.next_height
+            || self.active_proposal != Some(digest)
+        {
+            return vec![];
+        }
         self.votes.entry(key.clone()).or_default().insert(from);
 
         let Some(qc) = self.try_form_qc(&key) else {
@@ -649,23 +768,35 @@ impl HotStuff {
     }
 
     fn propose(&mut self, block: Block) -> Vec<ConsensusAction> {
-        if !self.view_ready || self.node_id != self.current_primary() ||
-            self.active_proposal.is_some() || block.sequence != self.next_height {
+        if !self.view_ready
+            || self.node_id != self.current_primary()
+            || self.active_proposal.is_some()
+            || block.sequence != self.next_height
+        {
             return vec![];
         }
         let proposal = Proposal { block };
         let digest = proposal.to_digest();
         self.proposals.insert(digest, proposal.clone());
         self.active_proposal = Some(digest);
-        self.votes.entry(VoteKey {
-            view: self.view, height: self.next_height, phase: Phase::Prepare, digest,
-        }).or_default().insert(self.node_id);
-        let mut actions = vec![
-            ConsensusAction::Broadcast(ConsensusMessage::Hotstuff(HotStuffMessage::Prepare {
-                view: self.view, height: self.next_height, proposal, digest,
+        self.votes
+            .entry(VoteKey {
+                view: self.view,
+                height: self.next_height,
+                phase: Phase::Prepare,
+                digest,
+            })
+            .or_default()
+            .insert(self.node_id);
+        let mut actions = vec![ConsensusAction::Broadcast(ConsensusMessage::Hotstuff(
+            HotStuffMessage::Prepare {
+                view: self.view,
+                height: self.next_height,
+                proposal,
+                digest,
                 justify: self.high_qc.clone(),
-            })),
-        ];
+            },
+        ))];
         actions.extend(self.timer());
         actions
     }
@@ -679,11 +810,15 @@ impl HotStuff {
 }
 
 impl Consensus for HotStuff {
-    fn set_chain_id(&mut self, chain_id: String) { self.chain_id = Some(chain_id); }
+    fn set_chain_id(&mut self, chain_id: String) {
+        self.chain_id = Some(chain_id);
+    }
     fn set_signer(&mut self, manifest: Arc<SessionManifest>, key: SigningKey) {
         self.evidence.set_signer(manifest, key, self.node_id);
     }
-    fn record_verified(&mut self, message: SignedConsensusMessage) { self.evidence.record(message); }
+    fn record_verified(&mut self, message: SignedConsensusMessage) {
+        self.evidence.record(message);
+    }
     fn commit_certificate(&mut self, block: &Block) -> Option<CommitCertificate> {
         let qc = self.committed_qcs.get(&block.to_digest())?.clone();
         Some(CommitCertificate::Hotstuff { qc })
@@ -710,7 +845,9 @@ impl Consensus for HotStuff {
     }
 
     fn catch_up_to_height(&mut self, height: u64) -> Vec<ConsensusAction> {
-        if height <= self.next_height { return vec![]; }
+        if height <= self.next_height {
+            return vec![];
+        }
         self.next_height = height;
         self.last_committed_height = height.checked_sub(1);
         self.armed_timer = None;
@@ -723,14 +860,24 @@ impl Consensus for HotStuff {
         self.timer()
     }
 
-    fn supports_catch_up(&self) -> bool { true }
+    fn supports_catch_up(&self) -> bool {
+        true
+    }
 
     fn on_start(&mut self) -> Vec<super::ConsensusAction> {
         if self.next_height == 0 && self.node_id == self.current_primary() {
-            self.propose(self.evidence.manifest().map(|manifest| Block::new_initial_block_signed(
-                &manifest.chain_id,
-                crate::message::hex_decode(&manifest.initial_state_root).expect("validated initial state root"),
-            )).unwrap_or_else(Block::new_initial_block))
+            self.propose(
+                self.evidence
+                    .manifest()
+                    .map(|manifest| {
+                        Block::new_initial_block_signed(
+                            &manifest.chain_id,
+                            crate::message::hex_decode(&manifest.initial_state_root)
+                                .expect("validated initial state root"),
+                        )
+                    })
+                    .unwrap_or_else(Block::new_initial_block),
+            )
         } else if self.node_id != self.current_primary() {
             self.timer()
         } else {
@@ -741,6 +888,8 @@ impl Consensus for HotStuff {
     fn on_event(&mut self, event: super::ConsensusEvent) -> Vec<ConsensusAction> {
         match event {
             ConsensusEvent::Message { from, message } => match message {
+                ConsensusMessage::Chained(_) => vec![],
+                ConsensusMessage::Hotstuff2(_) | ConsensusMessage::Votor(_) => vec![],
                 ConsensusMessage::Pbft(_) => {
                     eprintln!("WRONG PROTOCOL");
                     vec![]
@@ -763,29 +912,62 @@ impl Consensus for HotStuff {
                         Phase::PreCommit => self.handle_pre_commit_vote(from, view, height, digest),
                         Phase::Commit => self.handle_commit_vote(from, view, height, digest),
                     },
-                    HotStuffMessage::PreCommit { view, qc, height, digest } => self.handle_pre_commit(from, view, height, digest, qc),
-                    HotStuffMessage::Commit { view, qc, height, digest } => self.handle_commit(from, view, height, digest, qc),
+                    HotStuffMessage::PreCommit {
+                        view,
+                        qc,
+                        height,
+                        digest,
+                    } => self.handle_pre_commit(from, view, height, digest, qc),
+                    HotStuffMessage::Commit {
+                        view,
+                        qc,
+                        height,
+                        digest,
+                    } => self.handle_commit(from, view, height, digest, qc),
                     HotStuffMessage::Decide {
                         view,
                         qc,
                         height,
                         digest,
                     } => self.handle_decide(from, view, height, digest, qc),
-                    HotStuffMessage::NewView { view, high_qc } => self.handle_new_view(from, view, high_qc),
-                    HotStuffMessage::StartView { view, high_qc, proofs } => self.handle_start_view(from, view, high_qc, proofs),
+                    HotStuffMessage::NewView { view, high_qc } => {
+                        self.handle_new_view(from, view, high_qc)
+                    }
+                    HotStuffMessage::StartView {
+                        view,
+                        high_qc,
+                        proofs,
+                    } => self.handle_start_view(from, view, high_qc, proofs),
                 },
             },
             ConsensusEvent::Timeout { view, sequence } => {
                 if view == self.view && sequence == self.next_height {
                     self.armed_timer = None;
                     self.advance_view(view + 1)
-                } else { vec![] }
+                } else {
+                    vec![]
+                }
             }
             ConsensusEvent::LeaderUnavailable => self.advance_view(self.view + 1),
+            ConsensusEvent::AutomaticViewChange {
+                committed_view,
+                next_sequence,
+            } => {
+                if self.view == committed_view && self.next_height == next_sequence {
+                    self.advance_view(self.view + 1)
+                } else {
+                    vec![]
+                }
+            }
             ConsensusEvent::TransactionAvailable => {
-                if self.node_id == self.current_primary() { vec![] } else { self.timer() }
+                if self.node_id == self.current_primary() {
+                    vec![]
+                } else {
+                    self.timer()
+                }
             }
             ConsensusEvent::Proposal(block) => self.propose(block),
+            ConsensusEvent::DataRetry => vec![],
         }
     }
 
@@ -798,7 +980,9 @@ impl Consensus for HotStuff {
     }
 
     fn can_propose(&self) -> bool {
-        self.consensus_started && self.view_ready && self.leader_for_view(self.view) == self.node_id
+        self.consensus_started
+            && self.view_ready
+            && self.leader_for_view(self.view) == self.node_id
             && self.active_proposal.is_none()
     }
 

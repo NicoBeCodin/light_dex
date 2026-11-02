@@ -1,4 +1,5 @@
 /target/
+/market-data-hub/target/
 /benchmark_results/
 **/keys/*.key
 **/wallet.json
@@ -10,9 +11,16 @@ __pycache__/
 # Keep local screenshots untracked, but commit the icons Tauri needs to build.
 *.png
 !/control-plane/src-tauri/icons/*.png
+!/docs/assets/tx-pacing-*.png
+!/docs/figures/wan_consensus_followup_2026_10_29.png
+
+# Local working reports and generated module notes.
+/docs/
+/src/**/README.md
 
 # Generated frontend build metadata.
 /control-plane/*.tsbuildinfo
 /control-plane/vite.config.js
 /control-plane/vite.config.d.ts
 /research/
+/control-plane/.local/

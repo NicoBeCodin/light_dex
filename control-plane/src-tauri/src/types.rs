@@ -1,6 +1,6 @@
-use light_dex::node::{AgentBalance, NodeId, NodeStatus};
 use light_dex::exchange::address::Address;
 use light_dex::exchange::order::Side;
+use light_dex::node::{AgentBalance, NodeId, NodeStatus};
 use light_dex::participants::strategies::AgentStrategy;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -11,16 +11,42 @@ pub struct LaunchConfig {
     pub binary_path: String,
     pub data_dir: String,
     pub recover_existing: bool,
+    #[serde(default)]
+    pub remote_placements: Vec<RemotePlacement>,
     pub node_count: u64,
     pub block_time_ms: u64,
+    #[serde(default = "default_tx_batch_window_ms")]
+    pub tx_batch_window_ms: u64,
     pub timeout_ms: u64,
+    pub auto_view_change_blocks: Option<u64>,
     pub poll_ms: u64,
     pub poll_mode: PollMode,
     pub build_before_launch: bool,
     pub consensus: ConsensusAlgorithm,
+    #[serde(default = "default_chained_hotstuff")]
+    pub chained_hotstuff: bool,
     pub claim_limit: u64,
     pub claim_usd: u64,
     pub claim_btc: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct RemotePlacement {
+    pub profile_id: String,
+    pub count: u64,
+}
+
+fn default_chained_hotstuff() -> bool {
+    true
+}
+fn default_tx_batch_window_ms() -> u64 {
+    50
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct RemoteChoice {
+    pub id: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
@@ -28,6 +54,7 @@ pub struct LaunchConfig {
 pub enum PollMode {
     All,
     RoundRobin,
+    Pinned,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -37,14 +64,18 @@ pub struct AgentConfig {
     pub market_id: u64,
     pub strategy: AgentStrategy,
     pub target: TargetNode,
+    #[serde(default)]
+    pub wait_for_confirmation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct AgentSnapshot {
     pub agent_id: u64,
     pub account_id: u64,
+    pub market_id: u64,
     pub strategy: AgentStrategy,
     pub target: TargetNode,
+    pub wait_for_confirmation: bool,
     pub state: String,
     pub pending: usize,
     pub pending_action: Option<String>,
@@ -58,12 +89,22 @@ pub struct AgentSnapshot {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
-pub enum ConsensusAlgorithm { Pbft, Hotstuff }
+pub enum ConsensusAlgorithm {
+    Pbft,
+    Hotstuff,
+    Hotstuff2,
+    Votor,
+}
 
 impl ConsensusAlgorithm {
     #[allow(dead_code)] // also included by the standalone ts-rs export binary
     pub fn as_str(self) -> &'static str {
-        match self { Self::Pbft => "pbft", Self::Hotstuff => "hotstuff" }
+        match self {
+            Self::Pbft => "pbft",
+            Self::Hotstuff => "hotstuff",
+            Self::Hotstuff2 => "hotstuff2",
+            Self::Votor => "votor",
+        }
     }
 }
 
@@ -140,8 +181,11 @@ pub struct MarketMakerSnapshot {
 pub struct NodeRuntimeSnapshot {
     pub node_id: NodeId,
     pub pid: u32,
+    pub host_label: String,
+    pub status_rtt_ms: Option<u64>,
     pub state: String,
     pub address: Option<String>,
+    pub read_api_address: Option<String>,
     pub tx_rate: f64,
     pub block_rate: f64,
     pub status: Option<NodeStatus>,

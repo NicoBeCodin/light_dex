@@ -8,6 +8,7 @@
     "dev": "npm run bindings && vite --port 1420",
     "build": "npm run bindings && tsc -b && vite build",
     "preview": "vite preview",
+    "serve": "npm run build && cargo run --manifest-path src-tauri/Cargo.toml --bin light-dex-web",
     "tauri": "tauri"
   },
   "dependencies": {

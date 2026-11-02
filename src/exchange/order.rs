@@ -4,14 +4,22 @@ use ts_rs::TS;
 use crate::exchange::{account::AccountId, market::MarketId};
 
 pub type OrderId = u64;
-#[derive(Debug, PartialEq, Deserialize, Serialize, Clone, Copy, TS)]
+#[derive(Debug, PartialEq, Eq, Hash, Deserialize, Serialize, Clone, Copy, TS)]
 pub enum OrderType {
     IOC,
     FOK,
     LO,
+    /// Resting limit order; reject rather than take liquidity at execution time.
+    PostOnly,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, TS)]
+impl OrderType {
+    pub fn rests(self) -> bool {
+        matches!(self, Self::LO | Self::PostOnly)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, TS)]
 pub enum Side {
     Buy,
     Sell,

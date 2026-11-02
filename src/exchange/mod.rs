@@ -1,41 +1,41 @@
 pub mod account;
+mod account_batch;
 pub mod address;
 mod canonical;
+mod catalog;
+mod faucet;
+mod fees;
+mod indexes;
+pub mod limits;
 pub mod market;
+pub mod market_config;
 pub mod order;
 pub mod orderbook;
+pub mod perp;
+pub mod perp_units;
+mod quotes;
+mod spot;
+mod state_tree;
 
-use std::{collections::HashMap, sync::OnceLock};
+use im::{HashMap as StateMap, OrdSet};
+use std::collections::HashMap;
 
-use sha2::{Digest as _, Sha256};
-use serde::{Deserialize, Serialize};
-
-use crate::blockchain::{Digest, Transaction};
+use crate::{
+    blockchain::{Digest, Transaction},
+    exchange::perp::{IsolatedPerpAccount, MarginMode},
+};
 use account::{Account, AccountId, AssetId, Balance};
-use market::{Market, MarketId, BTC, BTC_USD, USD};
+pub use faucet::FaucetConfig;
+use market::{BTC, BTC_ATOMS, BTC_USD, Market, MarketId, USD, USD_ATOMS};
+use market_config::{DecimalStep, FeeSchedule, MarketConfig, MarketType, btc_usd_spot_config};
 use order::{Order, OrderId, OrderLocation, OrderType, Side};
 use orderbook::{OrderBook, OrderBookError};
+use sha2::{Digest as _, Sha256};
+use state_tree::{StateKey, StateTree};
+pub(crate) mod prefetch;
+use crate::oracle::{OraclePair, OracleUpdate, index_from_observations};
 
 const N_ACCOUNTS: u64 = 100;
-
-/// Session-bound, finite mint allowance for one-time account claims.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FaucetConfig {
-    pub max_claims: u64,
-    pub usd_per_claim: u64,
-    pub btc_per_claim: u64,
-}
-
-impl FaucetConfig {
-    pub fn validate(self) -> Result<(), String> {
-        if self.max_claims == 0 || self.usd_per_claim == 0 || self.btc_per_claim == 0 {
-            return Err("faucet claims and balances must be positive".into());
-        }
-        self.max_claims.checked_mul(self.usd_per_claim).ok_or("maximum mintable USD overflow")?;
-        self.max_claims.checked_mul(self.btc_per_claim).ok_or("maximum mintable BTC overflow")?;
-        Ok(())
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExchangeError {
@@ -43,6 +43,9 @@ pub enum ExchangeError {
     InvalidNonce,
     InsufficientBalance,
     MarketNotFound,
+    MarketAlreadyExists,
+    InvalidMarketConfig,
+    UnsupportedMarketSettlement,
     OrderNotFound,
     OrderBookNotFound,
     InvalidOrder,
@@ -52,12 +55,18 @@ pub enum ExchangeError {
     AlreadyClaimed,
     FaucetUnavailable,
     FaucetExhausted,
+    InvalidOracleUpdate,
+    OracleUnavailable,
+    WorkLimit,
+    WouldTakeLiquidity,
 }
 
 fn map_order_error(error: OrderBookError) -> ExchangeError {
     match error {
         OrderBookError::KilledFOK => ExchangeError::FokUnfilled,
         OrderBookError::SelfTrade => ExchangeError::SelfTrade,
+        OrderBookError::WorkLimit => ExchangeError::WorkLimit,
+        OrderBookError::WouldTakeLiquidity => ExchangeError::WouldTakeLiquidity,
         _ => ExchangeError::InvalidOrder,
     }
 }
@@ -76,16 +85,67 @@ pub struct ExecutedTrade {
     pub taker_account: AccountId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleMark {
+    pub index_e8: u64,
+    pub update_digest: Digest,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RestingExposure {
+    buy_qty: u64,
+    sell_qty: u64,
+}
+
+impl RestingExposure {
+    fn change(&mut self, side: Side, quantity: u64, add: bool) -> Result<(), ExchangeError> {
+        let target = match side {
+            Side::Buy => &mut self.buy_qty,
+            Side::Sell => &mut self.sell_qty,
+        };
+        *target = if add {
+            target.checked_add(quantity)
+        } else {
+            target.checked_sub(quantity)
+        }
+        .ok_or(ExchangeError::ArithmeticOverflow)?;
+        Ok(())
+    }
+
+    fn is_empty(self) -> bool {
+        self.buy_qty == 0 && self.sell_qty == 0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExchangeState {
-    accounts: HashMap<AccountId, Account>,
-    markets: HashMap<MarketId, Market>,
-    order_books: HashMap<MarketId, OrderBook>,
-    order_locations: HashMap<OrderId, OrderLocation>,
+    accounts: StateMap<AccountId, Account>,
+    perp_accounts: StateMap<(MarketId, AccountId), IsolatedPerpAccount>,
+    margin_modes: StateMap<AccountId, MarginMode>,
+    cross_collateral: StateMap<AccountId, i128>,
+    insurance_assets: StateMap<AssetId, u64>,
+    bad_debt_usd: u64,
+    // Derived from resting perp orders. The orders themselves are committed
+    // in the state tree; this index avoids scanning the book on every quote.
+    perp_resting_exposure: StateMap<(MarketId, AccountId), RestingExposure>,
+    /// Rebuildable index of resting perp order IDs by owner.
+    perp_owned_orders: StateMap<AccountId, OrdSet<OrderId>>,
+    markets: StateMap<MarketId, Market>,
+    order_books: StateMap<MarketId, OrderBook>,
+    order_locations: StateMap<OrderId, OrderLocation>,
     next_order_id: OrderId,
     state_tree: StateTree,
     faucet: Option<FaucetConfig>,
     faucet_claims: u64,
+    oracle_marks: StateMap<OraclePair, OracleMark>,
+    funding_clocks: StateMap<MarketId, perp::FundingClock>,
+    // Derived lookup indexes, excluded from canonical consensus state.
+    perp_markets_by_account: StateMap<AccountId, OrdSet<MarketId>>,
+    perp_accounts_by_market: StateMap<MarketId, OrdSet<AccountId>>,
+    owned_orders: StateMap<AccountId, OrdSet<OrderId>>,
+    order_owners: StateMap<OrderId, AccountId>,
+    execution_work: limits::WorkCounter,
+    metering: limits::MeterFlag,
 }
 
 impl Default for ExchangeState {
@@ -99,22 +159,25 @@ impl Default for ExchangeState {
                 Account {
                     id: account_id.into(),
                     nonce: 0,
+                    used_nonces: [0; 2],
                     balances: HashMap::from([
                         (
                             USD,
                             Balance {
-                                available: 1_000_000,
+                                available: 1_000_000 * USD_ATOMS,
                                 locked: 0,
                             },
                         ),
                         (
                             BTC,
                             Balance {
-                                available: 1_000,
+                                available: 1_000 * BTC_ATOMS,
                                 locked: 0,
                             },
                         ),
-                    ]),
+                    ])
+                    .into_iter()
+                    .collect(),
                 },
             );
         }
@@ -124,33 +187,170 @@ impl Default for ExchangeState {
 }
 
 impl ExchangeState {
+    /// An isolated speculative state sharing immutable collection/tree nodes.
+    /// Writes copy only the affected paths (including order-book price queues).
+    /// Dropping a rejected fork cannot mutate the committed parent.
+    pub fn fork(&self) -> Self {
+        self.clone()
+    }
+
     fn empty() -> Self {
         let mut exchange = Self {
-            accounts: HashMap::new(),
-            markets: HashMap::new(),
-            order_books: HashMap::new(),
-            order_locations: HashMap::new(),
+            accounts: StateMap::new(),
+            perp_accounts: StateMap::new(),
+            margin_modes: StateMap::new(),
+            cross_collateral: StateMap::new(),
+            insurance_assets: StateMap::new(),
+            bad_debt_usd: 0,
+            perp_resting_exposure: StateMap::new(),
+            perp_owned_orders: StateMap::new(),
+            markets: StateMap::new(),
+            order_books: StateMap::new(),
+            order_locations: StateMap::new(),
             next_order_id: 0,
             state_tree: StateTree::new(),
             faucet: None,
             faucet_claims: 0,
+            oracle_marks: StateMap::new(),
+            funding_clocks: StateMap::new(),
+            perp_markets_by_account: StateMap::new(),
+            perp_accounts_by_market: StateMap::new(),
+            owned_orders: StateMap::new(),
+            order_owners: StateMap::new(),
+            execution_work: limits::WorkCounter::new(0),
+            metering: limits::MeterFlag::new(false),
         };
-        exchange.markets.insert(
-            BTC_USD,
-            Market {
-                id: BTC_USD,
-                base_asset: BTC,
-                quote_asset: USD,
-            },
-        );
-        exchange.order_books.insert(BTC_USD, OrderBook::new());
+        exchange
+            .register_market(BTC_USD, btc_usd_spot_config())
+            .expect("valid genesis market");
         exchange.rebuild_state_tree();
         exchange
+    }
+
+    pub fn markets(&self) -> &StateMap<MarketId, Market> {
+        &self.markets
+    }
+
+    pub fn oracle_marks(&self) -> &StateMap<OraclePair, OracleMark> {
+        &self.oracle_marks
+    }
+
+    pub fn oracle_mark(&self, pair: OraclePair) -> Option<OracleMark> {
+        self.oracle_marks.get(&pair).copied()
+    }
+
+    /// Validates and commits one pair's mark together with its state-tree leaf.
+    /// This function never consults local WebSocket state or wall-clock time.
+    pub fn apply_oracle_update(&mut self, update: &OracleUpdate) -> Result<(), ExchangeError> {
+        let pair = update.pair;
+        if !self.markets.values().any(|market| {
+            market.base_asset == pair.base_asset && market.quote_asset == pair.quote_asset
+        }) {
+            return Err(ExchangeError::MarketNotFound);
+        }
+        let calculated = index_from_observations(pair, &update.observations)
+            .ok_or(ExchangeError::InvalidOracleUpdate)?;
+        if calculated != update.index_e8 {
+            return Err(ExchangeError::InvalidOracleUpdate);
+        }
+        let digest = update.digest();
+        if self
+            .oracle_mark(pair)
+            .is_some_and(|previous| previous.update_digest == digest)
+        {
+            return Err(ExchangeError::InvalidOracleUpdate);
+        }
+        let funding = self.plan_funding(pair, calculated)?;
+        let mark = OracleMark {
+            index_e8: calculated,
+            update_digest: digest,
+        };
+        self.state_tree.put(
+            StateKey::OracleMark(pair),
+            &canonical::encode_oracle_mark(pair, mark),
+        );
+        self.oracle_marks.insert(pair, mark);
+        self.commit_funding(funding);
+        Ok(())
+    }
+
+    pub fn create_spot_market(
+        &mut self,
+        id: MarketId,
+        base_asset: AssetId,
+        quote_asset: AssetId,
+        price: DecimalStep,
+        quantity: DecimalStep,
+    ) -> Result<(), ExchangeError> {
+        self.register_market(
+            id,
+            MarketConfig {
+                base_asset,
+                quote_asset,
+                price,
+                quantity,
+                market_type: MarketType::Spot,
+                fees: FeeSchedule::default(),
+                maintenance_margin_bps: 0,
+                funding_interval_updates: 0,
+                max_funding_bps: 0,
+                max_liquidation_slippage_bps: 0,
+            },
+        )
+    }
+
+    pub fn create_perp_market(
+        &mut self,
+        id: MarketId,
+        base_asset: AssetId,
+        quote_asset: AssetId,
+        price: DecimalStep,
+        quantity: DecimalStep,
+        max_leverage: u32,
+    ) -> Result<(), ExchangeError> {
+        self.register_market(
+            id,
+            MarketConfig {
+                base_asset,
+                quote_asset,
+                price,
+                quantity,
+                market_type: MarketType::Perp { max_leverage },
+                fees: FeeSchedule::default(),
+                maintenance_margin_bps: (10_000_u64.div_ceil(u64::from(max_leverage.max(1))) / 2)
+                    .max(1),
+                funding_interval_updates: 100,
+                max_funding_bps: 10,
+                max_liquidation_slippage_bps: 100,
+            },
+        )
+    }
+
+    fn register_market(&mut self, id: MarketId, config: MarketConfig) -> Result<(), ExchangeError> {
+        config
+            .validate()
+            .map_err(|_| ExchangeError::InvalidMarketConfig)?;
+        if self.markets.contains_key(&id) {
+            return Err(ExchangeError::MarketAlreadyExists);
+        }
+        let market = Market::from_config(id, config);
+        self.state_tree
+            .put(StateKey::Market(id), &canonical::encode_market(&market));
+        self.markets.insert(id, market);
+        self.order_books.insert(id, OrderBook::new());
+        Ok(())
     }
 
     pub fn with_claim_faucet(faucet: FaucetConfig) -> Result<Self, String> {
         faucet.validate()?;
         let mut state = Self::empty();
+        state.markets.clear();
+        state.order_books.clear();
+        for (id, config) in catalog::genesis_markets()? {
+            state
+                .register_market(id, config)
+                .map_err(|error| format!("invalid genesis market: {error:?}"))?;
+        }
         state.faucet = Some(faucet);
         state.rebuild_state_tree();
         Ok(state)
@@ -164,18 +364,33 @@ impl ExchangeState {
         let accounts = addresses.into_iter().map(|id| Account {
             id,
             nonce: 0,
+            used_nonces: [0; 2],
             balances: HashMap::from([
-                (USD, Balance { available: 1_000_000, locked: 0 }),
-                (BTC, Balance { available: 1_000, locked: 0 }),
-            ]),
+                (
+                    USD,
+                    Balance {
+                        available: 1_000_000,
+                        locked: 0,
+                    },
+                ),
+                (
+                    BTC,
+                    Balance {
+                        available: 1_000,
+                        locked: 0,
+                    },
+                ),
+            ])
+            .into_iter()
+            .collect(),
         });
         Self::with_accounts(accounts)
     }
-    pub fn accounts(&self) -> &HashMap<AccountId, Account> {
+    pub fn accounts(&self) -> &StateMap<AccountId, Account> {
         &self.accounts
     }
 
-    pub fn order_books(&self) -> &HashMap<MarketId, OrderBook> {
+    pub fn order_books(&self) -> &StateMap<MarketId, OrderBook> {
         &self.order_books
     }
 
@@ -186,7 +401,10 @@ impl ExchangeState {
     /// Construct a funded test/benchmark genesis without exposing mutable maps.
     pub fn with_accounts(accounts: impl IntoIterator<Item = Account>) -> Self {
         let mut state = Self::default();
-        state.accounts = accounts.into_iter().map(|account| (account.id, account)).collect();
+        state.accounts = accounts
+            .into_iter()
+            .map(|account| (account.id, account))
+            .collect();
         state.rebuild_state_tree();
         state
     }
@@ -201,294 +419,6 @@ impl ExchangeState {
         self.accounts.insert(account.id, account);
     }
 
-    fn balance_mut(
-        &mut self,
-        account: AccountId,
-        asset: AssetId,
-    ) -> Result<&mut Balance, ExchangeError> {
-        Ok(self
-            .accounts
-            .get_mut(&account)
-            .ok_or(ExchangeError::AccountNotFound)?
-            .balances
-            .entry(asset)
-            .or_insert(Balance {
-                available: 0,
-                locked: 0,
-            }))
-    }
-
-    fn debit_available(
-        &mut self,
-        account: AccountId,
-        asset: AssetId,
-        amount: u64,
-    ) -> Result<(), ExchangeError> {
-        let balance = self.balance_mut(account, asset)?;
-        balance.available = balance
-            .available
-            .checked_sub(amount)
-            .ok_or(ExchangeError::InsufficientBalance)?;
-        Ok(())
-    }
-
-    fn credit_available(
-        &mut self,
-        account: AccountId,
-        asset: AssetId,
-        amount: u64,
-    ) -> Result<(), ExchangeError> {
-        let balance = self.balance_mut(account, asset)?;
-        balance.available = balance
-            .available
-            .checked_add(amount)
-            .ok_or(ExchangeError::ArithmeticOverflow)?;
-        Ok(())
-    }
-
-    fn lock(
-        &mut self,
-        account: AccountId,
-        asset: AssetId,
-        amount: u64,
-    ) -> Result<(), ExchangeError> {
-        self.debit_available(account, asset, amount)?;
-        let balance = self.balance_mut(account, asset)?;
-        balance.locked = balance
-            .locked
-            .checked_add(amount)
-            .ok_or(ExchangeError::ArithmeticOverflow)?;
-        Ok(())
-    }
-
-    fn spend_locked(
-        &mut self,
-        account: AccountId,
-        asset: AssetId,
-        amount: u64,
-    ) -> Result<(), ExchangeError> {
-        let balance = self.balance_mut(account, asset)?;
-        balance.locked = balance
-            .locked
-            .checked_sub(amount)
-            .ok_or(ExchangeError::InsufficientBalance)?;
-        Ok(())
-    }
-
-    fn unlock(
-        &mut self,
-        account: AccountId,
-        asset: AssetId,
-        amount: u64,
-    ) -> Result<(), ExchangeError> {
-        self.spend_locked(account, asset, amount)?;
-        self.credit_available(account, asset, amount)
-    }
-
-    fn check_nonce(&self, account: AccountId, nonce: u64) -> Result<(), ExchangeError> {
-        let current = self
-            .accounts
-            .get(&account)
-            .ok_or(ExchangeError::AccountNotFound)?
-            .nonce;
-        if current != nonce {
-            return Err(ExchangeError::InvalidNonce);
-        }
-        current
-            .checked_add(1)
-            .ok_or(ExchangeError::ArithmeticOverflow)?;
-        Ok(())
-    }
-
-    fn advance_nonce(&mut self, account: AccountId) {
-        self.accounts
-            .get_mut(&account)
-            .expect("validated account")
-            .nonce += 1;
-    }
-
-    fn transfer(
-        &mut self,
-        from: AccountId,
-        to: AccountId,
-        asset: AssetId,
-        amount: u64,
-        nonce: u64,
-    ) -> Result<(), ExchangeError> {
-        self.check_nonce(from, nonce)?;
-        to.public_key().map_err(|_| ExchangeError::AccountNotFound)?;
-        if amount == 0 {
-            return Err(ExchangeError::InvalidOrder);
-        }
-        self.debit_available(from, asset, amount)?;
-        self.accounts.entry(to).or_insert_with(|| Account { id: to, nonce: 0, balances: HashMap::new() });
-        self.credit_available(to, asset, amount)?;
-        self.advance_nonce(from);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn place_order(
-        &mut self,
-        account_id: AccountId,
-        market_id: MarketId,
-        order_type: OrderType,
-        side: Side,
-        price: u64,
-        quantity: u64,
-        nonce: u64,
-    ) -> Result<Vec<ExecutedTrade>, ExchangeError> {
-        self.check_nonce(account_id, nonce)?;
-        if price == 0 || quantity == 0 {
-            return Err(ExchangeError::InvalidOrder);
-        }
-        let market = self
-            .markets
-            .get(&market_id)
-            .ok_or(ExchangeError::MarketNotFound)?
-            .clone();
-        let reserve = match side {
-            Side::Buy => price
-                .checked_mul(quantity)
-                .ok_or(ExchangeError::ArithmeticOverflow)?,
-            Side::Sell => quantity,
-        };
-        let reserve_asset = match side {
-            Side::Buy => market.quote_asset,
-            Side::Sell => market.base_asset,
-        };
-        self.lock(account_id, reserve_asset, reserve)?;
-        let order_id = self.next_order_id;
-        self.next_order_id = self
-            .next_order_id
-            .checked_add(1)
-            .ok_or(ExchangeError::ArithmeticOverflow)?;
-        let order = Order {
-            id: order_id,
-            account: account_id,
-            market: market_id,
-            side,
-            price,
-            original_quantity: quantity,
-            remaining_quantity: quantity,
-        };
-        let result = self
-            .order_books
-            .get_mut(&market_id)
-            .ok_or(ExchangeError::OrderBookNotFound)?
-            .apply_order(order, order_type)
-            .map_err(|error| match error {
-                OrderBookError::KilledFOK => ExchangeError::FokUnfilled,
-                OrderBookError::SelfTrade => ExchangeError::SelfTrade,
-                _ => ExchangeError::InvalidOrder,
-            })?;
-
-        let mut trades = Vec::with_capacity(result.fills.len());
-        for fill in result.fills {
-            trades.push(ExecutedTrade {
-                market_id,
-                price: fill.price,
-                quantity: fill.quantity,
-                aggressor_side: side,
-                maker_order_id: fill.maker_order_id,
-                maker_account: fill.maker_account,
-                taker_order_id: order_id,
-                taker_account: account_id,
-            });
-            let trade_value = fill
-                .price
-                .checked_mul(fill.quantity)
-                .ok_or(ExchangeError::ArithmeticOverflow)?;
-            match side {
-                Side::Buy => {
-                    let reserved = price
-                        .checked_mul(fill.quantity)
-                        .ok_or(ExchangeError::ArithmeticOverflow)?;
-                    self.spend_locked(account_id, market.quote_asset, reserved)?;
-                    self.credit_available(account_id, market.quote_asset, reserved - trade_value)?;
-                    self.credit_available(account_id, market.base_asset, fill.quantity)?;
-                    self.spend_locked(fill.maker_account, market.base_asset, fill.quantity)?;
-                    self.credit_available(fill.maker_account, market.quote_asset, trade_value)?;
-                }
-                Side::Sell => {
-                    self.spend_locked(account_id, market.base_asset, fill.quantity)?;
-                    self.credit_available(account_id, market.quote_asset, trade_value)?;
-                    self.spend_locked(fill.maker_account, market.quote_asset, trade_value)?;
-                    self.credit_available(fill.maker_account, market.base_asset, fill.quantity)?;
-                }
-            }
-            if fill.maker_filled {
-                self.order_locations.remove(&fill.maker_order_id);
-            }
-        }
-        if result.remaining > 0 {
-            if order_type == OrderType::LO {
-                self.order_locations.insert(
-                    order_id,
-                    OrderLocation {
-                        market: market_id,
-                        side,
-                        price,
-                    },
-                );
-            } else {
-                let release = match side {
-                    Side::Buy => price
-                        .checked_mul(result.remaining)
-                        .ok_or(ExchangeError::ArithmeticOverflow)?,
-                    Side::Sell => result.remaining,
-                };
-                self.unlock(account_id, reserve_asset, release)?;
-            }
-        }
-        self.advance_nonce(account_id);
-        Ok(trades)
-    }
-
-    #[cfg(test)]
-    fn cancel_order(
-        &mut self,
-        account_id: AccountId,
-        market_id: MarketId,
-        order_id: OrderId,
-        nonce: u64,
-    ) -> Result<(), ExchangeError> {
-        self.check_nonce(account_id, nonce)?;
-        let location = self
-            .order_locations
-            .get(&order_id)
-            .ok_or(ExchangeError::OrderNotFound)?
-            .clone();
-        if location.market != market_id {
-            return Err(ExchangeError::OrderNotFound);
-        }
-        let market = self
-            .markets
-            .get(&market_id)
-            .ok_or(ExchangeError::MarketNotFound)?
-            .clone();
-        let order = self
-            .order_books
-            .get_mut(&market_id)
-            .ok_or(ExchangeError::OrderBookNotFound)?
-            .cancel_order(order_id, location.side, location.price, account_id)
-            .map_err(|_| ExchangeError::OrderNotFound)?;
-        let (asset, amount) = match order.side {
-            Side::Buy => (
-                market.quote_asset,
-                order
-                    .price
-                    .checked_mul(order.remaining_quantity)
-                    .ok_or(ExchangeError::ArithmeticOverflow)?,
-            ),
-            Side::Sell => (market.base_asset, order.remaining_quantity),
-        };
-        self.unlock(account_id, asset, amount)?;
-        self.order_locations.remove(&order_id);
-        self.advance_nonce(account_id);
-        Ok(())
-    }
-
     /// Apply a transaction atomically. Any failure leaves balances, orders and nonce unchanged.
     pub fn execute(&mut self, tx: &Transaction) -> Result<(), ExchangeError> {
         self.execute_with_receipt(tx).map(|_| ())
@@ -498,7 +428,57 @@ impl ExchangeState {
         &mut self,
         tx: &Transaction,
     ) -> Result<Vec<ExecutedTrade>, ExchangeError> {
+        let profile = crate::profile::enabled();
+        let started = profile.then(std::time::Instant::now);
+        let stage = if profile {
+            match tx.market_id().and_then(|id| self.markets.get(&id)) {
+                Some(market) if matches!(market.market_type, MarketType::Perp { .. }) => {
+                    "exchange_perp_transaction"
+                }
+                Some(_) => "exchange_spot_transaction",
+                None => "exchange_other_transaction",
+            }
+        } else {
+            ""
+        };
+        self.execution_work.set(0);
+        self.metering.set(true);
+        let result = self.execute_inner(tx);
+        self.metering.set(false);
+        if let Some(started) = started {
+            crate::profile::record(stage, started.elapsed(), 1);
+        }
+        result
+    }
+
+    fn execute_inner(&mut self, tx: &Transaction) -> Result<Vec<ExecutedTrade>, ExchangeError> {
+        tx.validate_shape().map_err(|_| ExchangeError::WorkLimit)?;
+        self.charge_work(1)?;
         match tx {
+            Transaction::UpdateQuotes {
+                account_id,
+                market_id,
+                cancel,
+                reduce,
+                place,
+                nonce,
+            } => self.update_quotes(*account_id, *market_id, cancel, reduce, place, *nonce),
+            Transaction::ReduceOrder {
+                account_id,
+                market_id,
+                order_id,
+                remaining_quantity,
+                nonce,
+            } => {
+                self.reduce_order_atomic(
+                    *account_id,
+                    *market_id,
+                    *order_id,
+                    *remaining_quantity,
+                    *nonce,
+                )?;
+                Ok(Vec::new())
+            }
             Transaction::Transfer {
                 from,
                 to,
@@ -517,21 +497,67 @@ impl ExchangeState {
                 Ok(Vec::new())
             }
             Transaction::ClaimAirdrop { account_id, nonce } => {
-                if *nonce != 0 { return Err(ExchangeError::InvalidNonce); }
-                if self.accounts.contains_key(account_id) { return Err(ExchangeError::AlreadyClaimed); }
+                if *nonce != 0 {
+                    return Err(ExchangeError::InvalidNonce);
+                }
+                if self.accounts.contains_key(account_id) {
+                    return Err(ExchangeError::AlreadyClaimed);
+                }
                 let faucet = self.faucet.ok_or(ExchangeError::FaucetUnavailable)?;
-                if self.faucet_claims >= faucet.max_claims { return Err(ExchangeError::FaucetExhausted); }
+                if self.faucet_claims >= faucet.max_claims {
+                    return Err(ExchangeError::FaucetExhausted);
+                }
+                let mut balances = HashMap::from([
+                    (
+                        USD,
+                        Balance {
+                            available: faucet.usd_per_claim,
+                            locked: 0,
+                        },
+                    ),
+                    (
+                        BTC,
+                        Balance {
+                            available: faucet.btc_per_claim,
+                            locked: 0,
+                        },
+                    ),
+                ]);
+                for asset in [market::ETH, market::BNB, market::XRP, market::SOL] {
+                    if self
+                        .markets
+                        .values()
+                        .any(|market| market.base_asset == asset)
+                    {
+                        let atoms =
+                            market::asset_atoms(asset).ok_or(ExchangeError::InvalidMarketConfig)?;
+                        let grant = u128::from(faucet.btc_per_claim)
+                            .checked_mul(u128::from(atoms))
+                            .ok_or(ExchangeError::ArithmeticOverflow)?
+                            / u128::from(BTC_ATOMS);
+                        balances.insert(
+                            asset,
+                            Balance {
+                                available: u64::try_from(grant)
+                                    .map_err(|_| ExchangeError::ArithmeticOverflow)?,
+                                locked: 0,
+                            },
+                        );
+                    }
+                }
                 let account = Account {
                     id: *account_id,
                     nonce: 1,
-                    balances: HashMap::from([
-                        (USD, Balance { available: faucet.usd_per_claim, locked: 0 }),
-                        (BTC, Balance { available: faucet.btc_per_claim, locked: 0 }),
-                    ]),
+                    used_nonces: [1, 0],
+                    balances: balances.into(),
                 };
                 self.faucet_claims += 1;
-                self.state_tree.put(StateKey::FaucetClaims, &self.faucet_claims.to_be_bytes());
-                self.state_tree.put(StateKey::Account(*account_id), &canonical::encode_account(&account));
+                self.state_tree
+                    .put(StateKey::FaucetClaims, &self.faucet_claims.to_be_bytes());
+                self.state_tree.put(
+                    StateKey::Account(*account_id),
+                    &canonical::encode_account(&account),
+                );
                 self.accounts.insert(*account_id, account);
                 Ok(Vec::new())
             }
@@ -543,30 +569,157 @@ impl ExchangeState {
                 price,
                 quantity,
                 nonce,
-            } => self.place_order_atomic(
-                *account_id,
-                *market_id,
-                *order_type,
-                *side,
-                *price,
-                *quantity,
-                *nonce,
-            ),
+            } => {
+                let market = self
+                    .markets
+                    .get(market_id)
+                    .ok_or(ExchangeError::MarketNotFound)?;
+                let market_type = market.market_type;
+                let pair = OraclePair::new(market.base_asset, market.quote_asset);
+                let price_units = market.price;
+                match market_type {
+                    MarketType::Spot => self.place_order_atomic(
+                        *account_id,
+                        *market_id,
+                        *order_type,
+                        *side,
+                        *price,
+                        *quantity,
+                        *nonce,
+                    ),
+                    MarketType::Perp { .. } => {
+                        let mark_e8 = self
+                            .oracle_mark(pair)
+                            .ok_or(ExchangeError::OracleUnavailable)?
+                            .index_e8;
+                        let mark_price = price_units
+                            .round_e8_to_tick(mark_e8)
+                            .map_err(|_| ExchangeError::InvalidMarketConfig)?;
+                        self.place_perp_order_atomic(
+                            *account_id,
+                            *market_id,
+                            *order_type,
+                            *side,
+                            *price,
+                            *quantity,
+                            *nonce,
+                            mark_price,
+                        )
+                    }
+                }
+            }
+            Transaction::PlacePerpOrder {
+                account_id,
+                market_id,
+                order_type,
+                side,
+                price,
+                quantity,
+                reduce_only,
+                nonce,
+            } => {
+                let market = self
+                    .markets
+                    .get(market_id)
+                    .ok_or(ExchangeError::MarketNotFound)?;
+                if !matches!(market.market_type, MarketType::Perp { .. }) {
+                    return Err(ExchangeError::UnsupportedMarketSettlement);
+                }
+                let pair = OraclePair::new(market.base_asset, market.quote_asset);
+                let mark = self
+                    .oracle_mark(pair)
+                    .ok_or(ExchangeError::OracleUnavailable)?;
+                let mark_price = market
+                    .price
+                    .round_e8_to_tick(mark.index_e8)
+                    .map_err(|_| ExchangeError::InvalidMarketConfig)?;
+                self.place_perp_order_with_flags(
+                    *account_id,
+                    *market_id,
+                    *order_type,
+                    *side,
+                    *price,
+                    *quantity,
+                    *nonce,
+                    mark_price,
+                    *reduce_only,
+                )
+            }
             Transaction::CancelOrder {
                 account_id,
                 market_id,
                 order_id,
                 nonce,
+            } => {
+                let market_type = self
+                    .markets
+                    .get(market_id)
+                    .ok_or(ExchangeError::MarketNotFound)?
+                    .market_type;
+                match market_type {
+                    MarketType::Spot => {
+                        self.cancel_order_atomic(*account_id, *market_id, *order_id, *nonce)
+                    }
+                    MarketType::Perp { .. } => {
+                        self.cancel_perp_order_atomic(*account_id, *market_id, *order_id, *nonce)
+                    }
+                }
+                .map(|()| Vec::new())
+            }
+            Transaction::DepositPerpCollateral {
+                account_id,
+                market_id,
+                amount,
+                nonce,
             } => self
-                .cancel_order_atomic(*account_id, *market_id, *order_id, *nonce)
+                .deposit_perp_collateral(*account_id, *market_id, *amount, *nonce)
                 .map(|()| Vec::new()),
+            Transaction::WithdrawPerpCollateral {
+                account_id,
+                market_id,
+                amount,
+                nonce,
+            } => self
+                .withdraw_perp_collateral(*account_id, *market_id, *amount, *nonce)
+                .map(|()| Vec::new()),
+            Transaction::SetMarginMode {
+                account_id,
+                mode,
+                nonce,
+            } => self
+                .set_margin_mode(*account_id, *mode, *nonce)
+                .map(|()| Vec::new()),
+            Transaction::LiquidatePerp {
+                liquidator,
+                target,
+                market_id,
+                quantity,
+                nonce,
+            } => self.liquidate_perp(*liquidator, *target, *market_id, *quantity, *nonce),
+        }
+    }
+
+    pub fn last_execution_work(&self) -> usize {
+        self.execution_work.get()
+    }
+
+    fn charge_work(&self, units: usize) -> Result<(), ExchangeError> {
+        if !self.metering.get() {
+            return Ok(());
+        }
+        let next = self.execution_work.get().saturating_add(units);
+        self.execution_work.set(next);
+        if next > limits::MAX_TRANSACTION_WORK {
+            Err(ExchangeError::WorkLimit)
+        } else {
+            Ok(())
         }
     }
 
     fn stage_accounts(
         &self,
         ids: impl IntoIterator<Item = AccountId>,
-    ) -> Result<Self, ExchangeError> {
+    ) -> Result<account_batch::AccountBatch, ExchangeError> {
         let mut accounts = HashMap::new();
         for id in ids {
             if let std::collections::hash_map::Entry::Vacant(entry) = accounts.entry(id) {
@@ -578,222 +731,14 @@ impl ExchangeState {
                 );
             }
         }
-        Ok(Self {
-            accounts,
-            markets: HashMap::new(),
-            order_books: HashMap::new(),
-            order_locations: HashMap::new(),
-            next_order_id: 0,
-            state_tree: StateTree::new(),
-            faucet: None,
-            faucet_claims: 0,
-        })
+        Ok(account_batch::AccountBatch { accounts })
     }
 
-    fn commit_accounts(&mut self, staged: Self) {
+    fn commit_accounts(&mut self, staged: account_batch::AccountBatch) {
         for (id, account) in staged.accounts {
-            self.state_tree
-                .put(StateKey::Account(id), &canonical::encode_account(&account));
+            self.state_tree.put_account(&account);
             self.accounts.insert(id, account);
         }
-    }
-
-    fn place_order_atomic(
-        &mut self,
-        account_id: AccountId,
-        market_id: MarketId,
-        order_type: OrderType,
-        side: Side,
-        price: u64,
-        quantity: u64,
-        nonce: u64,
-    ) -> Result<Vec<ExecutedTrade>, ExchangeError> {
-        self.check_nonce(account_id, nonce)?;
-        if price == 0 || quantity == 0 {
-            return Err(ExchangeError::InvalidOrder);
-        }
-        let market = self
-            .markets
-            .get(&market_id)
-            .ok_or(ExchangeError::MarketNotFound)?
-            .clone();
-        let reserve = match side {
-            Side::Buy => price
-                .checked_mul(quantity)
-                .ok_or(ExchangeError::ArithmeticOverflow)?,
-            Side::Sell => quantity,
-        };
-        let reserve_asset = match side {
-            Side::Buy => market.quote_asset,
-            Side::Sell => market.base_asset,
-        };
-        let order_id = self.next_order_id;
-        let next_order_id = order_id
-            .checked_add(1)
-            .ok_or(ExchangeError::ArithmeticOverflow)?;
-        let order = Order {
-            id: order_id,
-            account: account_id,
-            market: market_id,
-            side,
-            price,
-            original_quantity: quantity,
-            remaining_quantity: quantity,
-        };
-        let preview = self
-            .order_books
-            .get(&market_id)
-            .ok_or(ExchangeError::OrderBookNotFound)?
-            .preview_order(&order, order_type)
-            .map_err(map_order_error)?;
-        let mut staged = self.stage_accounts(
-            std::iter::once(account_id).chain(preview.fills.iter().map(|fill| fill.maker_account)),
-        )?;
-        staged.lock(account_id, reserve_asset, reserve)?;
-        let mut trades = Vec::with_capacity(preview.fills.len());
-        for fill in &preview.fills {
-            trades.push(ExecutedTrade {
-                market_id,
-                price: fill.price,
-                quantity: fill.quantity,
-                aggressor_side: side,
-                maker_order_id: fill.maker_order_id,
-                maker_account: fill.maker_account,
-                taker_order_id: order_id,
-                taker_account: account_id,
-            });
-            let trade_value = fill
-                .price
-                .checked_mul(fill.quantity)
-                .ok_or(ExchangeError::ArithmeticOverflow)?;
-            match side {
-                Side::Buy => {
-                    let reserved = price
-                        .checked_mul(fill.quantity)
-                        .ok_or(ExchangeError::ArithmeticOverflow)?;
-                    staged.spend_locked(account_id, market.quote_asset, reserved)?;
-                    staged.credit_available(
-                        account_id,
-                        market.quote_asset,
-                        reserved - trade_value,
-                    )?;
-                    staged.credit_available(account_id, market.base_asset, fill.quantity)?;
-                    staged.spend_locked(fill.maker_account, market.base_asset, fill.quantity)?;
-                    staged.credit_available(fill.maker_account, market.quote_asset, trade_value)?;
-                }
-                Side::Sell => {
-                    staged.spend_locked(account_id, market.base_asset, fill.quantity)?;
-                    staged.credit_available(account_id, market.quote_asset, trade_value)?;
-                    staged.spend_locked(fill.maker_account, market.quote_asset, trade_value)?;
-                    staged.credit_available(
-                        fill.maker_account,
-                        market.base_asset,
-                        fill.quantity,
-                    )?;
-                }
-            }
-        }
-        if preview.remaining > 0 && order_type != OrderType::LO {
-            let release = match side {
-                Side::Buy => price
-                    .checked_mul(preview.remaining)
-                    .ok_or(ExchangeError::ArithmeticOverflow)?,
-                Side::Sell => preview.remaining,
-            };
-            staged.unlock(account_id, reserve_asset, release)?;
-        }
-        staged.advance_nonce(account_id);
-
-        // All fallible settlement happened on the touched-account copies. The
-        // book cannot change between preview and apply in this single-threaded
-        // execution path, and apply has no fallible operations after validation.
-        let actual = self
-            .order_books
-            .get_mut(&market_id)
-            .expect("previewed book exists")
-            .apply_order(order, order_type)
-            .map_err(map_order_error)?;
-        debug_assert_eq!(actual.remaining, preview.remaining);
-        debug_assert_eq!(actual.fills, preview.fills);
-        for fill in &actual.fills {
-            if fill.maker_filled {
-                self.order_locations.remove(&fill.maker_order_id);
-            }
-        }
-        if actual.remaining > 0 && order_type == OrderType::LO {
-            self.order_locations.insert(
-                order_id,
-                OrderLocation {
-                    market: market_id,
-                    side,
-                    price,
-                },
-            );
-        }
-        self.next_order_id = next_order_id;
-        self.state_tree.put(
-            StateKey::NextOrderId,
-            &canonical::encode_next_order_id(next_order_id),
-        );
-        for fill in &actual.fills {
-            self.sync_order_leaf(fill.maker_order_id);
-        }
-        if actual.remaining > 0 && order_type == OrderType::LO {
-            self.sync_order_leaf(order_id);
-        }
-        self.commit_accounts(staged);
-        Ok(trades)
-    }
-
-    fn cancel_order_atomic(
-        &mut self,
-        account_id: AccountId,
-        market_id: MarketId,
-        order_id: OrderId,
-        nonce: u64,
-    ) -> Result<(), ExchangeError> {
-        self.check_nonce(account_id, nonce)?;
-        let location = self
-            .order_locations
-            .get(&order_id)
-            .ok_or(ExchangeError::OrderNotFound)?
-            .clone();
-        if location.market != market_id {
-            return Err(ExchangeError::OrderNotFound);
-        }
-        let market = self
-            .markets
-            .get(&market_id)
-            .ok_or(ExchangeError::MarketNotFound)?
-            .clone();
-        let order = self
-            .order_books
-            .get(&market_id)
-            .ok_or(ExchangeError::OrderBookNotFound)?
-            .find_order(order_id, location.side, location.price, account_id)
-            .ok_or(ExchangeError::OrderNotFound)?;
-        let (asset, amount) = match order.side {
-            Side::Buy => (
-                market.quote_asset,
-                order
-                    .price
-                    .checked_mul(order.remaining_quantity)
-                    .ok_or(ExchangeError::ArithmeticOverflow)?,
-            ),
-            Side::Sell => (market.base_asset, order.remaining_quantity),
-        };
-        let mut staged = self.stage_accounts([account_id])?;
-        staged.unlock(account_id, asset, amount)?;
-        staged.advance_nonce(account_id);
-        self.order_books
-            .get_mut(&market_id)
-            .expect("validated book exists")
-            .cancel_order(order_id, location.side, location.price, account_id)
-            .map_err(|_| ExchangeError::OrderNotFound)?;
-        self.order_locations.remove(&order_id);
-        self.state_tree.remove(StateKey::Order(order_id));
-        self.commit_accounts(staged);
-        Ok(())
     }
 
     pub fn get_nonce_for_account(&self, account_id: AccountId) -> Result<u64, ExchangeError> {
@@ -810,6 +755,15 @@ impl ExchangeState {
         self.state_tree.root()
     }
 
+    /// Internal block-execution boundary; normal account mutations remain
+    /// immediately visible, only their Merkle hashing is deferred.
+    pub(crate) fn begin_state_batch(&mut self) {
+        self.state_tree.begin_batch();
+    }
+    pub(crate) fn finish_state_batch(&mut self) {
+        self.state_tree.finish_batch();
+    }
+
     /// Rebuild after constructing a fixture or otherwise directly mutating
     /// the public state maps. Normal transaction execution maintains the tree.
     pub fn verify_state_tree(&self) -> bool {
@@ -820,6 +774,11 @@ impl ExchangeState {
 
     fn rebuild_state_tree(&mut self) {
         let mut tree = StateTree::new();
+        self.perp_owned_orders.clear();
+        self.perp_markets_by_account.clear();
+        self.perp_accounts_by_market.clear();
+        self.owned_orders.clear();
+        self.order_owners.clear();
         tree.put(
             StateKey::NextOrderId,
             &canonical::encode_next_order_id(self.next_order_id),
@@ -833,9 +792,68 @@ impl ExchangeState {
         for (&id, market) in &self.markets {
             tree.put(StateKey::Market(id), &canonical::encode_market(market));
         }
-        for book in self.order_books.values() {
+        for (&(market_id, account_id), perp_account) in &self.perp_accounts {
+            self.perp_markets_by_account
+                .entry(account_id)
+                .or_default()
+                .insert(market_id);
+            self.perp_accounts_by_market
+                .entry(market_id)
+                .or_default()
+                .insert(account_id);
+            tree.put(
+                StateKey::PerpAccount(market_id, account_id),
+                &canonical::encode_perp_account(perp_account),
+            );
+        }
+        for (&account, &mode) in &self.margin_modes {
+            tree.put(
+                StateKey::MarginMode(account),
+                &[match mode {
+                    MarginMode::Isolated => 0,
+                    MarginMode::Cross => 1,
+                }],
+            );
+        }
+        for (&account, &collateral) in &self.cross_collateral {
+            tree.put(
+                StateKey::CrossCollateral(account),
+                &collateral.to_be_bytes(),
+            );
+        }
+        for (&asset, &balance) in &self.insurance_assets {
+            tree.put(StateKey::InsuranceAsset(asset), &balance.to_be_bytes());
+        }
+        if self.bad_debt_usd != 0 {
+            tree.put(StateKey::BadDebtUsd, &self.bad_debt_usd.to_be_bytes());
+        }
+        for (&pair, &mark) in &self.oracle_marks {
+            tree.put(
+                StateKey::OracleMark(pair),
+                &canonical::encode_oracle_mark(pair, mark),
+            );
+        }
+        for (&market_id, clock) in &self.funding_clocks {
+            tree.put(StateKey::FundingClock(market_id), &clock.encode());
+        }
+        for (&market_id, book) in &self.order_books {
             for order in book.bids.values().chain(book.asks.values()).flatten() {
+                self.owned_orders
+                    .entry(order.account)
+                    .or_default()
+                    .insert(order.id);
+                self.order_owners.insert(order.id, order.account);
                 tree.put(StateKey::Order(order.id), &canonical::encode_order(order));
+                if self
+                    .markets
+                    .get(&market_id)
+                    .is_some_and(|market| matches!(market.market_type, MarketType::Perp { .. }))
+                {
+                    self.perp_owned_orders
+                        .entry(order.account)
+                        .or_default()
+                        .insert(order.id);
+                }
             }
         }
         self.state_tree = tree;
@@ -843,18 +861,31 @@ impl ExchangeState {
 
     fn sync_order_leaf(&mut self, id: OrderId) {
         let Some(location) = self.order_locations.get(&id) else {
-            self.state_tree.remove(StateKey::Order(id));
+            self.remove_order_leaf(id);
             return;
         };
-        let book = self.order_books.get(&location.market).expect("resting order has a book");
+        let book = self
+            .order_books
+            .get(&location.market)
+            .expect("resting order has a book");
         let levels = match location.side {
             Side::Buy => &book.bids,
             Side::Sell => &book.asks,
         };
         let order = levels
             .get(&location.price)
-            .and_then(|orders| orders.iter().find(|order| order.id == id))
+            .and_then(|orders| {
+                orders
+                    .binary_search_by_key(&id, |order| order.id)
+                    .ok()
+                    .and_then(|index| orders.get(index))
+            })
             .expect("resting order has a book entry");
+        self.owned_orders
+            .entry(order.account)
+            .or_default()
+            .insert(id);
+        self.order_owners.insert(id, order.account);
         self.state_tree
             .put(StateKey::Order(id), &canonical::encode_order(order));
     }
@@ -898,622 +929,7 @@ impl ExchangeState {
     }
 }
 
-//StateTree
-
-type StateRoot = [u8; 32];
-#[derive(Clone, Copy)]
-enum StateKey {
-    Account(AccountId),
-    Order(OrderId),
-    Market(MarketId),
-    NextOrderId,
-    FaucetClaims,
-}
-
-use std::sync::Arc;
-
-#[derive(Debug, Clone, Default)]
-struct StateTree {
-    root: Option<Arc<Node>>,
-}
-
-#[derive(Debug)]
-enum Node {
-    Leaf {
-        key_hash: Digest,
-        value_hash: Digest,
-        hash: Digest,
-    },
-    Branch {
-        split_bit: u16,
-        min_key: Digest,
-        left: Arc<Node>,
-        right: Arc<Node>,
-        hash: Digest,
-    },
-}
-
-impl Node {
-    fn hash(&self) -> Digest {
-        match self {
-            Node::Leaf { hash, .. } | Node::Branch { hash, .. } => *hash,
-        }
-    }
-    fn min_key(&self) -> Digest {
-        match self {
-            Node::Leaf { key_hash, .. } => *key_hash,
-            Node::Branch { min_key, .. } => *min_key,
-        }
-    }
-}
-
-impl StateTree {
-    fn new() -> Self {
-        Self::default()
-    }
-    fn root(&self) -> StateRoot {
-        static EMPTY_ROOT: OnceLock<Digest> = OnceLock::new();
-        self.root
-            .as_ref()
-            .map(|node| node.hash())
-            .unwrap_or_else(|| *EMPTY_ROOT.get_or_init(|| hash_parts(&[b"light-dex/state/empty/v1"])))
-    }
-
-    fn get_value_hash(&self, key: StateKey) -> Option<Digest> {
-        let key_hash = hash_key(key);
-        let mut node = self.root.as_deref()?;
-        loop {
-            match node {
-                Node::Leaf {
-                    key_hash: stored_key,
-                    value_hash,
-                    ..
-                } => {
-                    return (*stored_key == key_hash).then_some(*value_hash);
-                }
-                Node::Branch {
-                    split_bit,
-                    left: left_node,
-                    right: right_node,
-                    ..
-                } => {
-                    node = if bit_at(&key_hash, *split_bit) == 0 {
-                        left_node
-                    } else {
-                        right_node
-                    };
-                }
-            }
-        }
-    }
-    fn put(&mut self, key: StateKey, value: &[u8]) {
-        let key_hash = hash_key(key);
-        let value_hash = hash_value(value);
-        self.root = Some(match &self.root {
-            Some(root) => insert(root, key_hash, value_hash),
-            None => leaf(key_hash, value_hash),
-        });
-    }
-
-    fn remove(&mut self, key: StateKey) -> bool {
-        let Some(root) = &self.root else {
-            return false;
-        };
-        let (next, removed) = remove(root, &hash_key(key));
-        self.root = next;
-        removed
-    }
-}
-
-fn leaf(key_hash: Digest, value_hash: Digest) -> Arc<Node> {
-    let hash = hash_parts(&[b"light-dex/state/leaf/v1", &key_hash, &value_hash]);
-    Arc::new(Node::Leaf {
-        key_hash,
-        value_hash,
-        hash,
-    })
-}
-
-fn branch(split_bit: u16, left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
-    let min_key = left.min_key();
-    let hash = hash_parts(&[
-        b"light-dex/state/branch/v1",
-        &split_bit.to_be_bytes(),
-        &left.hash(),
-        &right.hash(),
-    ]);
-    Arc::new(Node::Branch {
-        split_bit,
-        min_key,
-        left,
-        right,
-        hash,
-    })
-}
-
-fn first_differing_bit(a: &Digest, b: &Digest) -> Option<u16> {
-    a.iter().zip(b).enumerate().find_map(|(index, (&x, &y))| {
-        let difference = x ^ y;
-        (difference != 0).then(|| (index * 8 + difference.leading_zeros() as usize) as u16)
-    })
-}
-
-fn join(new_leaf: Arc<Node>, existing: Arc<Node>, split_bit: u16) -> Arc<Node> {
-    if bit_at(&new_leaf.min_key(), split_bit) == 0 {
-        branch(split_bit, new_leaf, existing)
-    } else {
-        branch(split_bit, existing, new_leaf)
-    }
-}
-
-fn insert(node: &Arc<Node>, key_hash: Digest, value_hash: Digest) -> Arc<Node> {
-    match node.as_ref() {
-        Node::Leaf {
-            key_hash: existing_key,
-            value_hash: existing_value,
-            ..
-        } => {
-            if *existing_key == key_hash {
-                if *existing_value == value_hash {
-                    Arc::clone(node)
-                } else {
-                    leaf(key_hash, value_hash)
-                }
-            } else {
-                let split_bit = first_differing_bit(existing_key, &key_hash)
-                    .expect("Different keys must differ in a bit");
-                join(leaf(key_hash, value_hash), Arc::clone(node), split_bit)
-            }
-        }
-        Node::Branch {
-            split_bit,
-            min_key,
-            left: left_node,
-            right: right_node,
-            ..
-        } => {
-            if let Some(difference) = first_differing_bit(min_key, &key_hash) {
-                if difference < *split_bit {
-                    return join(leaf(key_hash, value_hash), Arc::clone(node), difference);
-                }
-            }
-            if bit_at(&key_hash, *split_bit) == 0 {
-                let replacement = insert(left_node, key_hash, value_hash);
-                if Arc::ptr_eq(left_node, &replacement) {
-                    Arc::clone(node)
-                } else {
-                    branch(*split_bit, replacement, Arc::clone(right_node))
-                }
-            } else {
-                let replacement = insert(right_node, key_hash, value_hash);
-                if Arc::ptr_eq(right_node, &replacement) {
-                    Arc::clone(node)
-                } else {
-                    branch(*split_bit, Arc::clone(left_node), replacement)
-                }
-            }
-        }
-    }
-}
-
-fn remove(node: &Arc<Node>, key_hash: &Digest) -> (Option<Arc<Node>>, bool) {
-    match node.as_ref() {
-        Node::Leaf {
-            key_hash: existing_key,
-            ..
-        } => {
-            if existing_key == key_hash {
-                (None, true)
-            } else {
-                (Some(Arc::clone(node)), false)
-            }
-        }
-
-        Node::Branch {
-            split_bit,
-            left,
-            right,
-            ..
-        } => {
-            if bit_at(key_hash, *split_bit) == 0 {
-                let (replacement, removed) = remove(left, key_hash);
-
-                if !removed {
-                    return (Some(Arc::clone(node)), false);
-                }
-
-                // If the left subtree disappeared, this branch now
-                // has only one child and must collapse.
-                let next = match replacement {
-                    Some(left) => branch(*split_bit, left, Arc::clone(right)),
-                    None => Arc::clone(right),
-                };
-
-                (Some(next), true)
-            } else {
-                let (replacement, removed) = remove(right, key_hash);
-
-                if !removed {
-                    return (Some(Arc::clone(node)), false);
-                }
-
-                let next = match replacement {
-                    Some(right) => branch(*split_bit, Arc::clone(left), right),
-                    None => Arc::clone(left),
-                };
-
-                (Some(next), true)
-            }
-        }
-    }
-}
-
-fn bit_at(hash: &Digest, index: u16) -> u8 {
-    debug_assert!(index < 256);
-    (hash[(index / 8) as usize] >> (7 - (index % 8))) & 1
-}
-
-fn hash_parts(parts: &[&[u8]]) -> Digest {
-    let mut hasher = Sha256::new();
-    for part in parts {
-        hasher.update(part);
-    }
-    hasher.finalize().into()
-}
-
-fn hash_key(key: StateKey) -> Digest {
-    const DOMAIN: &[u8] = b"light-dex/state/key/v2";
-
-    match key {
-        StateKey::Account(id) => hash_parts(&[DOMAIN, &[0], &id.bytes()]),
-        StateKey::Order(id) => hash_parts(&[DOMAIN, &[1], &id.to_be_bytes()]),
-        StateKey::Market(id) => hash_parts(&[DOMAIN, &[2], &id.to_be_bytes()]),
-        StateKey::NextOrderId => hash_parts(&[DOMAIN, &[3]]),
-        StateKey::FaucetClaims => hash_parts(&[DOMAIN, &[4]]),
-    }
-}
-
-fn hash_value(value: &[u8]) -> Digest {
-    hash_parts(&[
-        b"light-dex/state/value/v1",
-        &(value.len() as u64).to_be_bytes(),
-        value,
-    ])
-}
+// The authenticated state tree is independent of spot settlement.
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
-
-    fn place(
-        account_id: u64,
-        side: Side,
-        price: u64,
-        quantity: u64,
-        nonce: u64,
-        order_type: OrderType,
-    ) -> Transaction {
-        Transaction::PlaceOrder {
-            account_id: account_id.into(),
-            market_id: BTC_USD,
-            side,
-            price,
-            quantity,
-            nonce,
-            order_type,
-        }
-    }
-    fn balance(exchange: &ExchangeState, account: u64, asset: u64) -> (u64, u64) {
-        let b = &exchange.accounts[&account.into()].balances[&asset];
-        (b.available, b.locked)
-    }
-
-    fn execute_reference(
-        state: &mut ExchangeState,
-        tx: &Transaction,
-    ) -> Result<Vec<ExecutedTrade>, ExchangeError> {
-        let mut staged = state.clone();
-        let trades = match tx {
-            Transaction::ClaimAirdrop { .. } => staged.execute_with_receipt(tx)?,
-            Transaction::Transfer {
-                from,
-                to,
-                asset,
-                amount,
-                nonce,
-            } => {
-                staged.transfer(*from, *to, *asset, *amount, *nonce)?;
-                Vec::new()
-            }
-            Transaction::PlaceOrder {
-                account_id,
-                market_id,
-                order_type,
-                side,
-                price,
-                quantity,
-                nonce,
-            } => staged.place_order(
-                *account_id,
-                *market_id,
-                *order_type,
-                *side,
-                *price,
-                *quantity,
-                *nonce,
-            )?,
-            Transaction::CancelOrder {
-                account_id,
-                market_id,
-                order_id,
-                nonce,
-            } => {
-                staged.cancel_order(*account_id, *market_id, *order_id, *nonce)?;
-                Vec::new()
-            }
-        };
-        *state = staged;
-        state.rebuild_state_tree();
-        Ok(trades)
-    }
-
-    #[test]
-    fn staged_execution_matches_whole_state_clone_reference() {
-        let mut rng = StdRng::seed_from_u64(0x5eed_2026);
-        let mut fast = ExchangeState::default();
-        let mut reference = ExchangeState::default();
-        for _ in 0..600 {
-            let account_id = rng.random_range(0..20);
-            let nonce = reference.accounts[&account_id.into()].nonce + u64::from(rng.random_ratio(1, 8));
-            let tx = match rng.random_range(0..5) {
-                0 => Transaction::Transfer {
-                    from: account_id.into(),
-                    to: rng.random_range(0..20).into(),
-                    asset: rng.random_range(0..2),
-                    amount: rng.random_range(1..500),
-                    nonce,
-                },
-                1 => {
-                    let owned = reference.order_books[&BTC_USD]
-                        .bids
-                        .values()
-                        .chain(reference.order_books[&BTC_USD].asks.values())
-                        .flat_map(|level| level.iter())
-                        .find(|order| order.account == account_id.into())
-                        .map(|order| order.id);
-                    Transaction::CancelOrder {
-                        account_id: account_id.into(),
-                        market_id: BTC_USD,
-                        order_id: owned
-                            .unwrap_or_else(|| rng.random_range(0..reference.next_order_id + 2)),
-                        nonce,
-                    }
-                }
-                _ => place(
-                    account_id,
-                    if rng.random_bool(0.5) {
-                        Side::Buy
-                    } else {
-                        Side::Sell
-                    },
-                    rng.random_range(90..110),
-                    rng.random_range(1..4),
-                    nonce,
-                    match rng.random_range(0..3) {
-                        0 => OrderType::LO,
-                        1 => OrderType::IOC,
-                        _ => OrderType::FOK,
-                    },
-                ),
-            };
-            assert_eq!(
-                fast.execute_with_receipt(&tx),
-                execute_reference(&mut reference, &tx),
-                "{tx:?}"
-            );
-            assert_eq!(fast.state_digest(), reference.state_digest(), "{tx:?}");
-            assert_eq!(
-                fast.order_locations.len(),
-                reference.order_locations.len(),
-                "{tx:?}"
-            );
-            let mut rebuilt = fast.clone();
-            rebuilt.rebuild_state_tree();
-            assert_eq!(fast.state_digest(), rebuilt.state_digest(), "{tx:?}");
-        }
-    }
-
-    #[test]
-    fn state_tree_tracks_resting_orders_fills_and_cancellation() {
-        let mut state = ExchangeState::default();
-        let initial = state.state_digest();
-        assert!(state.state_tree.get_value_hash(StateKey::Account(0.into())).is_some());
-
-        state.execute(&place(1, Side::Sell, 100, 2, 0, OrderType::LO)).unwrap();
-        assert!(state.state_tree.get_value_hash(StateKey::Order(0)).is_some());
-        let after_rest = state.state_digest();
-        assert_ne!(initial, after_rest);
-
-        state.execute(&place(2, Side::Buy, 100, 1, 0, OrderType::IOC)).unwrap();
-        let partial = state.state_digest();
-        assert_ne!(after_rest, partial);
-        assert!(state.state_tree.get_value_hash(StateKey::Order(0)).is_some());
-
-        state.execute(&Transaction::CancelOrder {
-            account_id: 1.into(),
-            market_id: BTC_USD,
-            order_id: 0,
-            nonce: 1,
-        }).unwrap();
-        assert!(state.state_tree.get_value_hash(StateKey::Order(0)).is_none());
-
-        let mut rebuilt = state.clone();
-        rebuilt.rebuild_state_tree();
-        assert_eq!(state.state_digest(), rebuilt.state_digest());
-    }
-
-    #[test]
-    fn state_tree_root_is_independent_of_insertion_order() {
-        let mut forward = StateTree::new();
-        let mut reverse = StateTree::new();
-        for id in 0..64 {
-            forward.put(StateKey::Account(id.into()), &id.to_be_bytes());
-        }
-        for id in (0u64..64).rev() {
-            reverse.put(StateKey::Account(id.into()), &id.to_be_bytes());
-        }
-        assert_eq!(forward.root(), reverse.root());
-        for id in 0..64 {
-            assert!(forward.remove(StateKey::Account(id.into())));
-        }
-        assert_eq!(forward.root(), StateTree::new().root());
-    }
-
-    #[test]
-    fn genesis_account_update_keeps_commitment_in_sync() {
-        let mut state = ExchangeState::default();
-        let before = state.state_digest();
-        let mut account = state.accounts()[&0.into()].clone();
-        account.balances.get_mut(&USD).unwrap().available += 1;
-        state.upsert_genesis_account(account);
-        assert_ne!(state.state_digest(), before);
-        assert!(state.verify_state_tree());
-    }
-
-    #[test]
-    fn claim_faucet_mints_with_a_committed_claim_limit() {
-        let faucet = FaucetConfig {
-            max_claims: 2,
-            usd_per_claim: 50,
-            btc_per_claim: 3,
-        };
-        let mut state = ExchangeState::with_claim_faucet(faucet).unwrap();
-        assert!(state.accounts.is_empty());
-        assert_eq!(state.faucet_remaining_claims(), Some(2));
-        let first = address::Address::fixture(901);
-        let second = address::Address::fixture(902);
-        state.execute(&Transaction::ClaimAirdrop { account_id: first, nonce: 0 }).unwrap();
-        assert_eq!(state.accounts[&first].nonce, 1);
-        assert_eq!(state.accounts[&first].balances[&USD].available, 50);
-        assert_eq!(state.accounts[&first].balances[&BTC].available, 3);
-        assert_eq!(state.faucet_remaining_claims(), Some(1));
-        let root = state.state_digest();
-        assert_eq!(state.execute(&Transaction::ClaimAirdrop { account_id: first, nonce: 0 }), Err(ExchangeError::AlreadyClaimed));
-        assert_eq!(state.state_digest(), root);
-        state.execute(&Transaction::ClaimAirdrop { account_id: second, nonce: 0 }).unwrap();
-        assert_eq!(state.faucet_remaining_claims(), Some(0));
-        assert_eq!(state.execute(&Transaction::ClaimAirdrop { account_id: address::Address::fixture(903), nonce: 0 }), Err(ExchangeError::FaucetExhausted));
-        assert!(state.verify_state_tree());
-    }
-
-    #[test]
-    fn failed_transfer_keeps_sender_nonce_and_balance() {
-        let mut exchange = ExchangeState::default();
-        let initial = balance(&exchange, 0, USD);
-        assert!(exchange
-            .execute(&Transaction::Transfer {
-                from: 0.into(),
-                to: 10_000.into(),
-                asset: USD,
-                amount: 1_000_001,
-                nonce: 0
-            })
-            .is_err());
-        assert_eq!(exchange.accounts[&0.into()].nonce, 0);
-        assert_eq!(balance(&exchange, 0, USD), initial);
-    }
-
-    #[test]
-    fn transfer_creates_address_account_only_after_success() {
-        let mut exchange = ExchangeState::default();
-        let recipient = crate::exchange::address::Address::fixture(10_000);
-        assert!(!exchange.accounts.contains_key(&recipient));
-        let transfer = Transaction::Transfer { from: 0.into(), to: recipient, asset: USD, amount: 25, nonce: 0 };
-        exchange.execute(&transfer).unwrap();
-        assert_eq!(exchange.accounts[&recipient].nonce, 0);
-        assert_eq!(exchange.accounts[&recipient].balances[&USD].available, 25);
-        assert_eq!(exchange.accounts[&0.into()].nonce, 1);
-        assert!(exchange.verify_state_tree());
-        assert!(exchange.execute(&transfer).is_err());
-        assert_eq!(exchange.accounts[&recipient].balances[&USD].available, 25);
-    }
-
-    #[test]
-    fn resting_match_and_cancel_conserve_balances() {
-        let mut exchange = ExchangeState::default();
-        exchange
-            .execute(&place(0, Side::Sell, 100, 3, 0, OrderType::LO))
-            .unwrap();
-        assert_eq!(balance(&exchange, 0, BTC), (997, 3));
-        assert_eq!(
-            exchange.order_books[&BTC_USD].asks[&100][0].remaining_quantity,
-            3
-        );
-        exchange
-            .execute(&place(1, Side::Buy, 120, 2, 0, OrderType::LO))
-            .unwrap();
-        assert_eq!(balance(&exchange, 0, BTC), (997, 1));
-        assert_eq!(balance(&exchange, 0, USD), (1_000_200, 0));
-        assert_eq!(balance(&exchange, 1, BTC), (1002, 0));
-        assert_eq!(balance(&exchange, 1, USD), (999_800, 0));
-        exchange
-            .execute(&Transaction::CancelOrder {
-                account_id: 0.into(),
-                market_id: BTC_USD,
-                order_id: 0,
-                nonce: 1,
-            })
-            .unwrap();
-        assert_eq!(balance(&exchange, 0, BTC), (998, 0));
-        assert!(exchange.order_books[&BTC_USD].asks.is_empty());
-    }
-
-    #[test]
-    fn buy_reservation_partial_fill_and_ioc_release() {
-        let mut exchange = ExchangeState::default();
-        exchange
-            .execute(&place(0, Side::Buy, 100, 4, 0, OrderType::LO))
-            .unwrap();
-        assert_eq!(balance(&exchange, 0, USD), (999_600, 400));
-        exchange
-            .execute(&place(1, Side::Sell, 90, 2, 0, OrderType::IOC))
-            .unwrap();
-        assert_eq!(balance(&exchange, 0, USD), (999_600, 200));
-        assert_eq!(balance(&exchange, 0, BTC), (1002, 0));
-        assert_eq!(balance(&exchange, 1, USD), (1_000_200, 0));
-        assert_eq!(balance(&exchange, 1, BTC), (998, 0));
-        exchange
-            .execute(&place(2, Side::Buy, 90, 1, 0, OrderType::IOC))
-            .unwrap();
-        assert_eq!(balance(&exchange, 2, USD), (1_000_000, 0));
-        assert!(exchange.order_books[&BTC_USD].asks.is_empty());
-    }
-
-    #[test]
-    fn fok_failure_is_atomic() {
-        let mut exchange = ExchangeState::default();
-        let before = exchange.state_digest();
-        assert_eq!(
-            exchange.execute(&place(0, Side::Buy, 100, 1, 0, OrderType::FOK)),
-            Err(ExchangeError::FokUnfilled)
-        );
-        assert_eq!(exchange.state_digest(), before);
-        assert_eq!(exchange.accounts[&0.into()].nonce, 0);
-    }
-
-    #[test]
-    fn sell_reserves_base_only_and_rejects_self_trade() {
-        let mut exchange = ExchangeState::default();
-        exchange
-            .execute(&place(0, Side::Sell, 100_000, 1, 0, OrderType::LO))
-            .unwrap();
-        assert_eq!(balance(&exchange, 0, BTC), (999, 1));
-        let before = exchange.state_digest();
-        assert_eq!(
-            exchange.execute(&place(0, Side::Buy, 100_000, 1, 1, OrderType::LO)),
-            Err(ExchangeError::SelfTrade)
-        );
-        assert_eq!(exchange.state_digest(), before);
-    }
-}
+mod tests;

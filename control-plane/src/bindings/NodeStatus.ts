@@ -2,9 +2,23 @@
 import type { AccountNonce } from "./AccountNonce";
 import type { AgentBalance } from "./AgentBalance";
 import type { BlockSummary } from "./BlockSummary";
+import type { FundingSnapshot } from "./FundingSnapshot";
+import type { MarketSnapshot } from "./MarketSnapshot";
 import type { OpenOrderSnapshot } from "./OpenOrderSnapshot";
+import type { OraclePriceStatus } from "./OraclePriceStatus";
 import type { OrderBookSnapshot } from "./OrderBookSnapshot";
+import type { PerpPositionSnapshot } from "./PerpPositionSnapshot";
+import type { PerpRiskSnapshot } from "./PerpRiskSnapshot";
 import type { Trade } from "./Trade";
 import type { TransactionOutcome } from "./TransactionOutcome";
+import type { VenueFeedStatus } from "./VenueFeedStatus";
 
-export type NodeStatus = { node_id: number, pid: number, chain_id: string, signing_enabled: boolean, authentication_rejections: number, faucet_remaining_claims: number | null, network_ready: boolean, peer_count: number, expected_peers: number, chain_height: number, latest_sequence: number | null, mempool_size: number, seen_transactions: number, current_view: number, current_primary: number, next_sequence: number, active_proposal: boolean, consensus_started: boolean, transactions_received: number, blocks_committed: number, transactions_committed: number, transactions_failed: number, trades_committed: number, average_commit_latency_ms: number, last_commit_latency_ms: number | null, recent_commit_latency_ms: Array<number>, catch_up_events: number, blocks_caught_up: number, recent_blocks: Array<BlockSummary>, account_nonces: Array<AccountNonce>, agent_balances: Array<AgentBalance>, recent_transaction_outcomes: Array<TransactionOutcome>, order_books: Array<OrderBookSnapshot>, recent_trades: Array<Trade>, open_orders: Array<OpenOrderSnapshot>, };
+export type NodeStatus = { node_id: number, pid: number, chain_id: string, signing_enabled: boolean, authentication_rejections: number, faucet_remaining_claims: number | null, market_data: Array<VenueFeedStatus>,
+/**
+ * Locally observed only; this index is not yet committed by consensus.
+ */
+provisional_index_usd_e8: number | null, oracle_prices: Array<OraclePriceStatus>, perp_risk: Array<PerpRiskSnapshot>, perp_positions: Array<PerpPositionSnapshot>, funding: Array<FundingSnapshot>, insurance_usd_atoms: number, bad_debt_usd_atoms: number, network_ready: boolean, peer_count: number, expected_peers: number, peer_queued_bytes: number, peer_write_timeouts: number, peer_write_errors: number, peer_queue_full: number, peer_truncated_frames: number, peer_reconnects: number, chain_height: number, latest_sequence: number | null, mempool_size: number, seen_transactions: number, current_view: number, current_primary: number, next_sequence: number, active_proposal: boolean, consensus_started: boolean, transactions_received: number, blocks_committed: number, transactions_committed: number,
+/**
+ * Successful order instructions, including idempotent missing cancels.
+ */
+order_actions_committed: number, transactions_failed: number, trades_committed: number, average_commit_latency_ms: number, last_commit_latency_ms: number | null, recent_commit_latency_ms: Array<number>, catch_up_events: number, blocks_caught_up: number, branch_sync_attempts: number, branch_sync_failures: number, proposal_parent_misses: number, recent_blocks: Array<BlockSummary>, markets: Array<MarketSnapshot>, account_nonces: Array<AccountNonce>, agent_balances: Array<AgentBalance>, recent_transaction_outcomes: Array<TransactionOutcome>, order_books: Array<OrderBookSnapshot>, recent_trades: Array<Trade>, open_orders: Array<OpenOrderSnapshot>, total_open_orders: number, open_orders_complete: boolean, };

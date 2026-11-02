@@ -184,26 +184,31 @@ fn make_accounts(count: usize) -> ExchangeState {
 }
 
 fn make_accounts_with_balances(count: usize, usd: u64, btc: u64) -> ExchangeState {
-    ExchangeState::with_accounts((0..count as u64).map(|id| Account {
-                id: id.into(),
-                nonce: 0,
-                balances: std::collections::HashMap::from([
-                    (
-                        USD,
-                        Balance {
-                            available: usd,
-                            locked: 0,
-                        },
-                    ),
-                    (
-                        BTC,
-                        Balance {
-                            available: btc,
-                            locked: 0,
-                        },
-                    ),
-                ]),
-            }))
+    ExchangeState::with_accounts((0..count as u64).map(|id| {
+        Account {
+            id: id.into(),
+            nonce: 0,
+            used_nonces: [0; 2],
+            balances: std::collections::HashMap::from([
+                (
+                    USD,
+                    Balance {
+                        available: usd,
+                        locked: 0,
+                    },
+                ),
+                (
+                    BTC,
+                    Balance {
+                        available: btc,
+                        locked: 0,
+                    },
+                ),
+            ])
+            .into_iter()
+            .collect(),
+        }
+    }))
 }
 
 fn place(
@@ -593,7 +598,7 @@ fn run_custom(config: FixtureConfig, samples: usize) -> Result<Vec<Row>, String>
         );
     }
 
-    if let Some((&best_ask, level)) = base.order_books()[&BTC_USD].asks.first_key_value() {
+    if let Some((&best_ask, level)) = base.order_books()[&BTC_USD].asks.iter().next() {
         let crossing = place(0, Side::Buy, best_ask, 1, transfer.nonce(), OrderType::IOC);
         measure(
             &mut rows,
@@ -690,6 +695,51 @@ fn optional_usize(args: &[String], flag: &str) -> Result<Option<usize>, String> 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<_>>();
+    // A narrow profiler target, not a throughput result: keep setup out of
+    // almost all samples and repeatedly execute/commit a multi-maker sweep.
+    if let Some(fills) = optional_usize(&args, "--profile-fills")? {
+        if !(1..=512).contains(&fills) {
+            return Err("profile-fills must be 1–512".into());
+        }
+        let seconds = optional_usize(&args, "--profile-seconds")?
+            .unwrap_or(10)
+            .clamp(1, 60);
+        let base = make_asks(fills, true);
+        let tx = if args.iter().any(|arg| arg == "--profile-batched") {
+            Transaction::UpdateQuotes {
+                reduce: vec![],
+                account_id: 0.into(),
+                market_id: BTC_USD,
+                cancel: vec![],
+                nonce: 0,
+                place: vec![light_dex::blockchain::QuoteOrder {
+                    order_type: OrderType::IOC,
+                    side: Side::Buy,
+                    price: 100,
+                    quantity: fills as u64,
+                    reduce_only: false,
+                }],
+            }
+        } else {
+            place(0, Side::Buy, 100, fills as u64, 0, OrderType::IOC)
+        };
+        let started = Instant::now();
+        let mut iterations = 0;
+        while started.elapsed() < Duration::from_secs(seconds as u64) {
+            let mut state = base.fork();
+            assert_eq!(
+                state.execute_with_receipt(black_box(&tx)).unwrap().len(),
+                fills
+            );
+            black_box(state.state_digest());
+            iterations += 1;
+        }
+        println!(
+            "profile-only: {iterations} sweeps of {fills} fills in {:?}",
+            started.elapsed()
+        );
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
             "Usage: exchange_scaling_bench [--samples N] [--out FILE] [--accounts N --resting-orders K [--price-levels L] [--history-transfers T] [--history-trades F]]\nWithout fixture flags, runs the original scaling sweep. Custom mode benchmarks one exact-size fixture. Account 0 is the taker; the other accounts place one-unit resting asks."
