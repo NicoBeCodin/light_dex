@@ -1,6 +1,6 @@
 # Light DEX
 
-Light DEX is a research project for learning how a trading blockchain works. It combines a Rust validator, an order-book exchange, and a browser control plane for running experiments.
+Light DEX combines a Rust validator, an order-book exchange, and a browser control plane for running experiments. I'm building it to learn more about decentralized exchanges and consensus protocols.
 
 The question driving this project is how exchange execution, consensus, networking and validator hardware affect one another. The goal is to change those pieces, run a workload, and inspect both the results and the code behind them.
 
