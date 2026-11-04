@@ -641,3 +641,141 @@ dialog::backdrop {
   gap: 16px;
   flex-wrap: wrap;
 }
+
+.account-risk {
+  padding: 16px;
+  border-bottom: 1px solid var(--line);
+}
+.risk-group + .risk-group {
+  margin-top: 18px;
+}
+.risk-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  margin-bottom: 12px;
+}
+.risk-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.risk-grid small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+  margin-bottom: 4px;
+}
+.risk-grid strong {
+  font-size: 14px;
+}
+#collateral {
+  margin-top: 18px;
+}
+#collateral summary {
+  color: var(--muted);
+  cursor: pointer;
+  padding: 10px 0;
+}
+#leverage-button {
+  padding: 4px 8px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+#order-estimate {
+  font-size: 11px;
+  min-height: 16px;
+}
+dialog form {
+  min-width: min(340px, 70vw);
+}
+dialog h2 {
+  font-size: 17px;
+  margin: 0;
+}
+dialog .panel-heading {
+  padding: 0 0 12px;
+}
+dialog .panel-heading button {
+  border: 0;
+  padding: 2px 8px;
+  font-size: 22px;
+}
+.tx-notifications {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 100;
+  width: min(380px, calc(100vw - 24px));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: none;
+}
+.tx-toast {
+  position: relative;
+  background: #141c25;
+  border: 1px solid #3e4b60;
+  border-left: 3px solid var(--blue);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px #0008;
+  padding: 16px 36px 14px 16px;
+  pointer-events: auto;
+  overflow-wrap: anywhere;
+}
+.tx-toast strong {
+  display: block;
+  font-size: 13px;
+}
+.tx-toast > div {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.tx-toast > div:last-child {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tx-toast > div:empty {
+  display: none;
+}
+.tx-toast button {
+  font-size: 11px;
+  padding: 4px 8px;
+}
+.tx-toast.success {
+  border-left-color: var(--green);
+}
+.tx-toast.error {
+  border-left-color: var(--red);
+}
+.tx-toast.waiting {
+  border-left-color: #edc47b;
+}
+.tx-toast .toast-dismiss {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 20px;
+  padding: 0 4px;
+}
+@media (max-width: 900px) {
+  .risk-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+@media (max-width: 500px) {
+  .risk-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .tx-notifications {
+    right: 12px;
+    bottom: 12px;
+  }
+}

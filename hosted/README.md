@@ -29,6 +29,13 @@ rather than multiplying upstream subscriptions for every visitor. Caddy terminat
 HTTPS in front of the loopback gateway. Validator transport and read endpoints
 stay on the private host network.
 
+Positions can be closed with a reduce-only IOC and a selected slippage bound;
+unfilled quantity remains open. The leverage control sizes a new order from a
+USD margin amount, within the market limit. It does not change existing positions
+or the protocol's market-wide initial-margin requirement. Account risk shows
+committed collateral, equity, unrealized PnL, initial and maintenance requirements,
+and margin headroom (not a guaranteed withdrawal amount).
+
 ## Storage and recovery
 
 Every hosted validator durably saves its consensus safety state before emitting

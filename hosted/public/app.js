@@ -1,3 +1,6 @@
+import { sizeFromMargin, closeOrder, decimalInput } from "./trade-math.mjs";
+import { transactionNotice } from "./notifications.mjs";
+
 const $ = (id) => document.getElementById(id),
   esc = (s) =>
     String(s ?? "").replace(
@@ -21,7 +24,9 @@ let meta,
   accountSocket,
   busy = false,
   nextNonce = 0,
-  lastDigest;
+  lastDigest,
+  closeMarketId,
+  leverage = 1;
 const charts = new Map(),
   transactions = [];
 function pendingKey() {
@@ -36,6 +41,11 @@ function syncPending() {
   $("claim-assets").disabled = busy || hasPending() || !wallet || !!account || !meta.writes_enabled;
   for (const id of ["set-margin", "deposit", "withdraw"])
     $(id).disabled = busy || hasPending() || !wallet || !account || !meta.writes_enabled;
+  document.querySelectorAll("[data-close-position], [data-cancel]").forEach((button) => {
+    button.disabled = busy || hasPending() || !wallet || !meta.writes_enabled;
+  });
+  $("confirm-close").disabled = busy || hasPending() || !wallet || !meta.writes_enabled;
+  $("import-wallet").disabled = busy || hasPending();
 }
 function message(text = "") {
   $("message").textContent = text;
@@ -143,6 +153,7 @@ async function walletChanged() {
     await refreshAccount();
   }
   syncPending();
+  loadLeverage();
 }
 async function sign(transaction) {
   if (!wasm) throw Error("Signing module is not ready");
@@ -181,72 +192,107 @@ async function send(kind, fields) {
 }
 async function track(signed, nonce) {
   const started = performance.now();
-  $("receipt-panel").hidden = false;
-  $("receipt-progress").innerHTML =
-    '<span class="done">Signed in browser</span><span>Admitted</span><span>Committed</span><span>Executed</span>';
-  let result,
-    submitted = false;
-  let lastError = "";
-  for (let attempt = 0; attempt < 40; attempt++) {
-    if (!submitted || attempt % 5 === 0) {
-      try {
-        result = await api("transactions", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(signed),
-        });
-        if (!result.accepted) throw Error(result.error || "Transaction rejected");
-        lastDigest = result.digest;
-        submitted = true;
-        $("receipt-progress").children[1].classList.add("done");
-        $("receipt-detail").textContent =
-          `Digest: ${lastDigest}\nAdmission confirmed. Waiting for durable commitment…`;
-      } catch (e) {
-        lastError = e.message;
-        if (/signature|invalid|Daily|allowance|disabled|nonce|balance/i.test(lastError)) {
-          const current = await api(`rpc/accounts/${wallet.address}`).catch(() => null);
-          if (current && current.nonce > nonce) {
-            localStorage.removeItem(pendingKey());
-            account = current;
-            nextNonce = current.nonce;
-            renderAccount();
+  const kind = Object.keys(signed.transaction)[0];
+  const label =
+    {
+      PlacePerpOrder: "Perp order",
+      PlaceOrder: "Order",
+      CancelOrder: "Cancel order",
+      ClaimAirdrop: "Test assets",
+      DepositPerpCollateral: "Deposit",
+      WithdrawPerpCollateral: "Withdrawal",
+      SetMarginMode: "Margin mode",
+    }[kind] || "Transaction";
+  const notice = transactionNotice(label);
+  notice.update("pending", "Submitting signed transaction");
+  let submitted = false;
+  try {
+    $("receipt-panel").hidden = false;
+    $("receipt-progress").innerHTML =
+      '<span class="done">Signed in browser</span><span>Admitted</span><span>Committed</span><span>Executed</span>';
+    let result;
+    let lastError = "";
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if (!submitted || attempt % 5 === 0) {
+        try {
+          result = await api("transactions", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(signed),
+          });
+          if (!result.accepted) throw Error(result.error || "Transaction rejected");
+          lastDigest = result.digest;
+          submitted = true;
+          notice.update("pending", "Admitted. Waiting for commit.", lastDigest);
+          $("receipt-progress").children[1].classList.add("done");
+          $("receipt-detail").textContent =
+            `Digest: ${lastDigest}\nAdmission confirmed. Waiting for durable commitment…`;
+        } catch (e) {
+          lastError = e.message;
+          if (/signature|invalid|Daily|allowance|disabled|nonce|balance/i.test(lastError)) {
+            const current = await api(`rpc/accounts/${wallet.address}`).catch(() => null);
+            if (current && current.nonce > nonce) {
+              localStorage.removeItem(pendingKey());
+              account = current;
+              nextNonce = current.nonce;
+              renderAccount();
+            }
+            throw e;
           }
-          throw e;
         }
       }
-    }
-    if (submitted) {
-      const outcome = await api(`transactions/${lastDigest}`).catch(() => null);
-      if (outcome?.status === "committed") {
-        const elapsed = Math.round(performance.now() - started);
-        $("receipt-clock").textContent = `${elapsed.toLocaleString()} ms this attempt`;
-        $("receipt-progress").children[2].classList.add("done");
-        if (outcome.receipt.success === true) {
-          $("receipt-progress").children[3].classList.add("done");
-          nextNonce = Math.max(nextNonce, nonce + 1);
-        } else if (outcome.receipt.success === false) {
-          $("receipt-progress").children[3].textContent = "Execution failed";
+      if (submitted) {
+        const outcome = await api(`transactions/${lastDigest}`).catch(() => null);
+        if (outcome?.status === "committed") {
+          if (typeof outcome.receipt?.success !== "boolean") {
+            lastError = "Committed, but the execution result is not available yet";
+            await new Promise((r) => setTimeout(r, 500));
+            continue;
+          }
+          const elapsed = Math.round(performance.now() - started);
+          $("receipt-clock").textContent = `${elapsed.toLocaleString()} ms this attempt`;
+          $("receipt-progress").children[2].classList.add("done");
+          if (outcome.receipt.success === true) {
+            $("receipt-progress").children[3].classList.add("done");
+            nextNonce = Math.max(nextNonce, nonce + 1);
+          } else if (outcome.receipt.success === false) {
+            $("receipt-progress").children[3].textContent = "Execution failed";
+          }
+          $("receipt-detail").textContent = JSON.stringify(outcome.receipt, null, 2);
+          transactions.unshift({ ...outcome.receipt, latency: elapsed });
+          renderAccount();
+          localStorage.removeItem(`ldex-pending:${meta.chain_id}:${wallet.address}`);
+          syncPending();
+          await new Promise((r) => setTimeout(r, 600));
+          await refreshAccount();
+          if (outcome.receipt.success === false)
+            throw Error(outcome.receipt.error || "Execution failed");
+          const fields = signed.transaction.PlacePerpOrder;
+          const remaining =
+            fields?.reduce_only &&
+            account?.positions?.find((p) => p.market_id === fields.market_id);
+          const detail = fields?.reduce_only
+            ? remaining
+              ? "Executed. Position remains open; liquidity may have filled only part of the order."
+              : "Executed. Position closed."
+            : "Executed";
+          notice.update("success", `${elapsed.toLocaleString()} ms · ${detail}`, lastDigest);
+          message("Committed.");
+          return outcome;
         }
-        $("receipt-detail").textContent = JSON.stringify(outcome.receipt, null, 2);
-        transactions.unshift({ ...outcome.receipt, latency: elapsed });
-        renderAccount();
-        localStorage.removeItem(`ldex-pending:${meta.chain_id}:${wallet.address}`);
-        syncPending();
-        await new Promise((r) => setTimeout(r, 600));
-        await refreshAccount();
-        if (outcome.receipt.success === false)
-          throw Error(outcome.receipt.error || "Execution failed");
-        message("Committed.");
-        return outcome;
       }
+      $("receipt-clock").textContent =
+        `Waiting · ${Math.round((performance.now() - started) / 1000)} s`;
+      await new Promise((r) => setTimeout(r, 500));
     }
-    $("receipt-clock").textContent =
-      `Waiting · ${Math.round((performance.now() - started) / 1000)} s`;
-    await new Promise((r) => setTimeout(r, 500));
+    throw Error(
+      `Confirmation is still pending${lastError ? ": " + lastError : ""}. The signed transaction is saved and will be retried when you reload.`,
+    );
+  } catch (error) {
+    notice.update(hasPending() ? "waiting" : "error", error.message, submitted ? lastDigest : null);
+    error.txNotified = true;
+    throw error;
   }
-  throw Error(
-    `Confirmation is still pending${lastError ? ": " + lastError : ""}. The signed transaction is saved and will be retried when you reload.`,
-  );
 }
 function watchAccount() {
   if (accountSocket) {
@@ -295,6 +341,11 @@ async function watchMarket() {
   $("base-symbol").textContent = symbols[m.config.base_asset];
   $("collateral").hidden = m.config.market_type.kind !== "perp";
   $("reduce-row").hidden = m.config.market_type.kind !== "perp";
+  $("leverage-button").hidden = m.config.market_type.kind !== "perp";
+  $("order-margin-row").hidden = m.config.market_type.kind !== "perp";
+  $("order-margin").value = "";
+  $("order-estimate").textContent = "";
+  loadLeverage();
   $("order-price").value = "";
   $("order-quantity").value = "";
   marketSocket = new WebSocket(
@@ -427,8 +478,50 @@ function drawChart() {
 function table(head, rows, empty) {
   return `<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.join("") || `<tr><td colspan="${head.length}" class="empty">${esc(empty)}</td></tr>`}</tbody></table>`;
 }
+function dollars(atoms) {
+  return Number.isSafeInteger(Number(atoms))
+    ? (Number(atoms) / 1e6).toLocaleString("en-US", {
+        style: "currency",
+        currency: "USD",
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      })
+    : "Outside display range";
+}
+function renderRisk() {
+  const root = $("account-risk");
+  root.hidden = !wallet || !account;
+  if (root.hidden) return;
+  const risks = account.risk || [];
+  root.innerHTML = risks.length
+    ? risks
+        .map((r) => {
+          const m = meta.markets.find((m) => m.id === r.market_id);
+          const title = r.mode === "Cross" ? "Cross account" : `${m ? name(m) : "Perp"} · Isolated`;
+          const equity = Number(r.equity_usd_atoms),
+            maintenance = Number(r.maintenance_required_usd_atoms);
+          const used =
+            maintenance > 0
+              ? equity > 0
+                ? `${((maintenance / equity) * 100).toFixed(1)}%`
+                : "Below maintenance"
+              : "0%";
+          const cards = [
+            ["Equity", r.equity_usd_atoms],
+            ["Collateral", r.collateral_usd_atoms],
+            ["Unrealized PnL", equity - Number(r.collateral_usd_atoms)],
+            ["Initial margin", r.initial_required_usd_atoms],
+            ["Maintenance margin", r.maintenance_required_usd_atoms],
+            ["Margin headroom", equity - Number(r.initial_required_usd_atoms)],
+          ];
+          return `<section class="risk-group"><div class="risk-title"><strong>${esc(title)}</strong><span class="${r.liquidatable ? "sell" : "muted"}">${r.liquidatable ? "Liquidatable" : `Maintenance / equity ${used}`}</span></div><div class="risk-grid">${cards.map(([label, value]) => `<div><small>${label}</small><strong class="${Number(value) < 0 ? "sell" : ""}">${esc(dollars(value))}</strong></div>`).join("")}</div></section>`;
+        })
+        .join("")
+    : '<div class="risk-title"><strong>Perp collateral</strong><span>$0.00</span></div>';
+}
 function renderAccount() {
   syncPending();
+  renderRisk();
   if (!wallet) {
     $("account-content").innerHTML =
       '<p class="empty">Create a demo wallet to see your balances and orders.</p>';
@@ -468,16 +561,16 @@ function renderAccount() {
       "No resting orders",
     );
   if (accountTab === "positions")
-    $("account-content").innerHTML =
-      table(
-        ["Market", "Position", "Entry price", "Realized PnL (USD)"],
-        (account.positions || []).map((p) => {
-          const m = meta.markets.find((m) => m.id === p.market_id);
-          return `<tr><td>${esc(name(m))}</td><td>${quantity(p.size_atoms, m)}</td><td>${price(p.entry_price, m)}</td><td>${format(p.realized_pnl_usd_atoms, 6)}</td></tr>`;
-        }),
-        "No perpetual positions",
-      ) +
-      `<div class="empty">${(account.risk || []).map((r) => `${esc(r.mode)} equity $${format(r.equity_usd_atoms, 6)} · Initial margin $${format(r.initial_required_usd_atoms, 6)} · Maintenance $${format(r.maintenance_required_usd_atoms, 6)}`).join("<br>")}</div>`;
+    $("account-content").innerHTML = table(
+      ["Market", "Side", "Size", "Entry price", "Margin", "Realized PnL", ""],
+      (account.positions || []).map((p) => {
+        const m = meta.markets.find((m) => m.id === p.market_id);
+        const long = Number(p.size_atoms) > 0;
+        const risk = account.risk?.find((r) => r.mode === "Cross" || r.market_id === p.market_id);
+        return `<tr><td>${esc(name(m))}</td><td class="${long ? "buy" : "sell"}">${long ? "Long" : "Short"}</td><td>${quantity(Math.abs(Number(p.size_atoms)), m)}</td><td>${price(p.entry_price, m)}</td><td>${esc(risk?.mode || "-")}</td><td class="${Number(p.realized_pnl_usd_atoms) < 0 ? "sell" : "buy"}">${esc(dollars(p.realized_pnl_usd_atoms))}</td><td><button data-close-position="${p.market_id}">Close at market</button></td></tr>`;
+      }),
+      "No perpetual positions",
+    );
   if (accountTab === "balances")
     $("account-content").innerHTML = table(
       ["Asset", "Available", "Locked"],
@@ -491,6 +584,7 @@ function renderAccount() {
       }),
       "No balances",
     );
+  syncPending();
 }
 async function networkRefresh() {
   try {
@@ -563,13 +657,89 @@ function action(fn) {
   return async (event) => {
     event?.preventDefault();
     message();
+    const inlineError = event?.currentTarget?.closest("dialog")?.querySelector("[data-form-error]");
+    if (inlineError) inlineError.hidden = true;
     try {
       await fn(event);
     } catch (e) {
       message(e.message);
+      if (inlineError) {
+        inlineError.textContent = e.message;
+        inlineError.hidden = false;
+      }
+      if (!e.txNotified) transactionNotice("Request").update("error", e.message);
     }
   };
 }
+function leverageKey() {
+  return `ldex-leverage:${meta.chain_id}:${wallet?.address || "guest"}:${marketId}`;
+}
+function loadLeverage() {
+  if (!meta) return;
+  const limit = selected()?.config.market_type.max_leverage || 1;
+  const saved = Number(localStorage.getItem(leverageKey()) || 1);
+  leverage = Number.isInteger(saved) ? Math.max(1, Math.min(saved, limit)) : 1;
+  $("leverage-button").textContent = `Leverage · ${leverage}×`;
+}
+function sizeOrder() {
+  const m = selected();
+  if (m.config.market_type.kind !== "perp" || !$("order-margin").value) return;
+  const margin = atoms($("order-margin").value, { decimals: 6, step: 1 });
+  const limit = atoms($("order-price").value, m.config.price);
+  const size = sizeFromMargin(margin, leverage, limit, m.config);
+  $("order-quantity").value = decimalInput(size, m.config.quantity.decimals);
+  $("order-estimate").textContent = `${leverage}× sizing · ${dollars(margin)} order margin`;
+}
+$("leverage-button").onclick = action(() => {
+  const max = selected().config.market_type.max_leverage;
+  $("leverage-value").max = max;
+  $("leverage-value").value = leverage;
+  $("leverage-margin").value = $("order-margin").value || "100";
+  $("leverage-limit").textContent = `Market limit: ${max}×`;
+  $("leverage-dialog").showModal();
+});
+$("leverage-form").onsubmit = action(() => {
+  const next = Number($("leverage-value").value),
+    m = selected();
+  const margin = atoms($("leverage-margin").value, { decimals: 6, step: 1 });
+  const limit = atoms($("order-price").value, m.config.price);
+  sizeFromMargin(margin, next, limit, m.config); // Validate before changing saved inputs.
+  leverage = next;
+  localStorage.setItem(leverageKey(), String(leverage));
+  $("order-margin").value = $("leverage-margin").value;
+  loadLeverage();
+  sizeOrder();
+  $("leverage-dialog").close();
+});
+for (const id of ["order-margin", "order-price"])
+  $(id).addEventListener("input", () => {
+    try {
+      sizeOrder();
+    } catch (e) {
+      $("order-estimate").textContent = e.message;
+    }
+  });
+$("order-quantity").addEventListener("input", () => {
+  $("order-margin").value = "";
+  $("order-estimate").textContent = "";
+});
+$("close-position-form").onsubmit = action(async () => {
+  if (busy || hasPending()) throw Error("Wait for the pending transaction first");
+  const id = closeMarketId;
+  const m = meta.markets.find((m) => m.id === id);
+  const slippage = Number($("close-slippage").value) * 100;
+  const [fresh, book] = await Promise.all([
+    api(`rpc/accounts/${wallet.address}`),
+    api(`rpc/markets/${id}`),
+  ]);
+  const p = fresh.positions.find((p) => p.market_id === id);
+  if (!p) throw Error("This position is already closed");
+  account = fresh;
+  nextNonce = Math.max(nextNonce, fresh.nonce || 0);
+  const order = closeOrder(p, book.book, m.config, Math.round(slippage));
+  $("close-position-dialog").close();
+  await send("PlacePerpOrder", { account_id: wallet.address, market_id: id, ...order });
+});
 $("create-wallet").onclick = createWallet;
 $("wallet-menu").onclick = () => $("wallet-dialog").showModal();
 $("close-wallet").onclick = () => $("wallet-dialog").close();
@@ -588,6 +758,7 @@ $("export-wallet").onclick = action(async () => {
 });
 $("import-wallet").onclick = () => $("wallet-file").click();
 $("wallet-file").onchange = action(async (event) => {
+  if (busy || hasPending()) throw Error("Confirm the pending transaction before changing wallets");
   const file = event.target.files[0];
   if (!file || file.size > 4096) throw Error("Invalid wallet backup");
   const data = JSON.parse(await file.text());
@@ -627,6 +798,7 @@ $("market-select").onchange = action(async () => {
 });
 $("order-form").onsubmit = action(async () => {
   const m = selected();
+  sizeOrder();
   const fields = {
     account_id: wallet.address,
     market_id: marketId,
@@ -681,6 +853,16 @@ document.addEventListener("click", async (e) => {
   try {
     const b = e.target.closest("button");
     if (!b) return;
+    if (b.dataset.dismiss) $(b.dataset.dismiss).close();
+    if (b.dataset.closePosition !== undefined) {
+      closeMarketId = Number(b.dataset.closePosition);
+      const m = meta.markets.find((m) => m.id === closeMarketId);
+      const position = account?.positions.find((p) => p.market_id === closeMarketId);
+      if (!position) throw Error("This position is no longer open");
+      $("close-position-summary").textContent =
+        `${name(m)} · ${Number(position.size_atoms) > 0 ? "Long" : "Short"} ${quantity(Math.abs(Number(position.size_atoms)), m)} ${symbols[m.config.base_asset]}`;
+      $("close-position-dialog").showModal();
+    }
     if (b.dataset.page) showPage(b.dataset.page);
     if (b.dataset.book) {
       bookTab = b.dataset.book;
@@ -710,6 +892,7 @@ document.addEventListener("click", async (e) => {
     if (b.dataset.block) await inspect(b.dataset.block);
   } catch (error) {
     message(error.message);
+    if (!error.txNotified) transactionNotice("Request").update("error", error.message);
   }
 });
 async function boot() {

@@ -68,7 +68,10 @@
             <div id="book-content"></div>
           </section>
           <section class="panel order-panel">
-            <div class="panel-heading"><h2>Place an order</h2></div>
+            <div class="panel-heading">
+              <h2>Place an order</h2>
+              <button id="leverage-button" hidden>Leverage · 1×</button>
+            </div>
             <p id="wallet-label" class="muted">Create a wallet to start trading.</p>
             <form id="order-form">
               <div class="sides">
@@ -82,6 +85,11 @@
                   <option value="FOK">Fill or kill</option>
                   <option value="PostOnly">Post only</option>
                 </select></label
+              ><label id="order-margin-row" hidden
+                >Order margin (USD)<input
+                  id="order-margin"
+                  inputmode="decimal"
+                  placeholder="Optional: size using leverage" /></label
               ><label
                 >Price (USD)<input
                   id="order-price"
@@ -97,9 +105,12 @@
                   placeholder="Order size" /></label
               ><label class="check" id="reduce-row" hidden
                 ><input id="reduce-only" type="checkbox" /> Reduce only</label
-              ><button class="primary" id="submit-order" disabled>Submit order</button>
+              >
+              <div id="order-estimate" class="muted"></div>
+              <button class="primary" id="submit-order" disabled>Submit order</button>
             </form>
-            <div id="collateral" hidden>
+            <details id="collateral" hidden>
+              <summary>Collateral &amp; margin mode</summary>
               <hr />
               <h3>Perpetual collateral</h3>
               <label
@@ -114,10 +125,11 @@
               <div class="buttons">
                 <button id="deposit">Deposit</button><button id="withdraw">Withdraw</button>
               </div>
-            </div>
+            </details>
           </section>
         </div>
         <section class="panel account-panel">
+          <div id="account-risk" class="account-risk" hidden></div>
           <div class="tabs">
             <button data-account="orders" class="selected">Open orders</button
             ><button data-account="positions">Positions</button
@@ -198,5 +210,59 @@
         Close
       </button>
     </dialog>
+    <dialog id="leverage-dialog">
+      <form id="leverage-form">
+        <div class="panel-heading">
+          <h2>Order leverage</h2>
+          <button type="button" data-dismiss="leverage-dialog" aria-label="Close">×</button>
+        </div>
+        <label
+          >Multiplier<input id="leverage-value" type="number" min="1" step="1" value="1" required
+        /></label>
+        <label
+          >Order margin (USD)<input id="leverage-margin" inputmode="decimal" value="100" required
+        /></label>
+        <p id="leverage-limit" class="muted"></p>
+        <p class="muted">
+          Sizes this order. Does not change existing positions or the chain's margin requirements.
+        </p>
+        <p data-form-error class="sell" role="alert" hidden></p>
+        <div class="buttons">
+          <button class="primary">Apply</button
+          ><button type="button" data-dismiss="leverage-dialog">Cancel</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="close-position-dialog">
+      <form id="close-position-form">
+        <div class="panel-heading">
+          <h2>Close at market</h2>
+          <button type="button" data-dismiss="close-position-dialog" aria-label="Close">×</button>
+        </div>
+        <p id="close-position-summary"></p>
+        <label
+          >Maximum slippage (%)<input
+            id="close-slippage"
+            type="number"
+            min="0"
+            max="5"
+            step="0.1"
+            value="1"
+            required
+        /></label>
+        <p class="muted">Reduce-only IOC. Any unfilled quantity remains open.</p>
+        <p data-form-error class="sell" role="alert" hidden></p>
+        <div class="buttons">
+          <button id="confirm-close" class="primary">Close position</button
+          ><button type="button" data-dismiss="close-position-dialog">Cancel</button>
+        </div>
+      </form>
+    </dialog>
+    <div
+      id="tx-notifications"
+      class="tx-notifications"
+      aria-live="polite"
+      aria-atomic="false"
+    ></div>
   </body>
 </html>

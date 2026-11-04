@@ -30,6 +30,7 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: control-plane/package-lock.json
+      - run: node --test hosted/*.test.mjs
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: control-plane/src-tauri
