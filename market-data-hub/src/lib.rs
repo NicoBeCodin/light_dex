@@ -25,7 +25,7 @@ pub const DEFAULT_URLS: [&str; 3] = [
 /// Each feed has one upstream connection per hub, irrespective of validator count.
 /// The hub only filters and relays raw frames; nodes still parse and vote on
 /// their own oracle observations.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct FeedSpec {
     pub base_asset: u64,
     pub venue: String,
@@ -61,13 +61,26 @@ impl HubHandle {
         }
         let mut listeners = Vec::with_capacity(feeds.len());
         let mut addresses = HashMap::new();
-        for feed in &feeds {
+        let port_base: u16 = std::env::var("LIGHT_DEX_FEED_PORT_BASE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        for (index, feed) in feeds.iter().enumerate() {
             if !matches!(feed.venue.as_str(), "binance" | "okx" | "coinbase")
                 || feed.symbol.is_empty()
             {
                 return Err(io::Error::other("invalid market data feed"));
             }
-            let listener = TcpListener::bind(SocketAddr::new(bind_ip, 0))?;
+            let listener = TcpListener::bind(SocketAddr::new(
+                bind_ip,
+                if port_base == 0 {
+                    0
+                } else {
+                    port_base
+                        .checked_add(index as u16)
+                        .ok_or_else(|| io::Error::other("feed port overflow"))?
+                },
+            ))?;
             addresses.insert(
                 (feed.base_asset, feed.venue.clone()),
                 listener.local_addr()?,

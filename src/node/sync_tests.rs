@@ -1,5 +1,6 @@
 use super::*;
 use crate::consensus::hotstuff::HotStuff;
+use crate::message::verify_line;
 use std::net::TcpListener;
 
 #[test]
@@ -32,6 +33,7 @@ fn lagging_hotstuff_replica_replays_a_verified_batch() {
     node.apply_sync_response(
         0,
         BlockSyncResponse {
+            checkpoint: None,
             from_sequence: 0,
             chain_height: 2,
             blocks: vec![genesis, next],
@@ -71,6 +73,7 @@ fn bad_sync_block_does_not_advance_the_chain() {
     node.apply_sync_response(
         0,
         BlockSyncResponse {
+            checkpoint: None,
             from_sequence: 0,
             chain_height: 2,
             blocks: vec![forged],
@@ -105,6 +108,7 @@ fn authenticated_block_fetch_round_trip() {
             })
         ));
         let response = BlockSyncResponse {
+            checkpoint: None,
             from_sequence: 0,
             chain_height: 1,
             blocks: vec![Block::new_initial_block()],
@@ -201,6 +205,7 @@ fn conflicting_anchor_is_not_accepted() {
     node.apply_sync_response(
         0,
         BlockSyncResponse {
+            checkpoint: None,
             from_sequence: 0,
             chain_height: 1,
             blocks: vec![conflicting],
@@ -227,6 +232,7 @@ fn mismatched_signed_anchor_rejects_following_blocks() {
     node.apply_sync_response(
         0,
         BlockSyncResponse {
+            checkpoint: None,
             from_sequence: 1,
             chain_height: 2,
             anchor_digest: Some([0; 32]),

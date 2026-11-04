@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta
+      name="description"
+      content="Trade test assets on Light DEX, a live Rust trading blockchain. Inspect orders, finality, validators and committed blocks."
+    />
+    <title>Light DEX · Live network</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="/">◈ <strong>LIGHT DEX</strong><span>TEST NETWORK</span></a>
+      <nav>
+        <button data-page="markets" class="selected">Markets</button
+        ><button data-page="network">Network</button><button data-page="explorer">Explorer</button>
+      </nav>
+      <div class="wallet-actions">
+        <button id="create-wallet">Create demo wallet</button
+        ><button id="wallet-menu" hidden>Wallet</button>
+      </div>
+    </header>
+    <div class="notice">
+      <span><i id="live-dot"></i><span id="network-state">Connecting to Tokyo</span></span
+      ><span>Test assets · 4 validators · 2 regions</span
+      ><a href="https://github.com/NicoBeCodin/light_dex" target="_blank" rel="noreferrer"
+        >Source code ↗</a
+      >
+    </div>
+    <main>
+      <section id="onboarding" class="welcome">
+        <div class="steps">
+          <span id="step-wallet">1 · Create wallet</span
+          ><button id="claim-assets" disabled>2 · Claim test assets</button
+          ><span>3 · Place an order</span>
+        </div>
+      </section>
+      <div id="message" role="status" aria-live="polite"></div>
+      <section id="page-markets">
+        <div class="market-banner">
+          <label>Market<select id="market-select" aria-label="Market"></select></label>
+          <div><small>Last trade</small><strong id="last-price">-</strong></div>
+          <div><small>Committed mark</small><strong id="mark-price">-</strong></div>
+          <div><small>Spread</small><strong id="spread">-</strong></div>
+          <div><small>Successful order TPS · 60s</small><strong id="market-tps">-</strong></div>
+          <div><small>Tokyo gateway p95 · 5m</small><strong id="market-p95">-</strong></div>
+        </div>
+        <div class="trading-grid">
+          <section class="panel chart-panel">
+            <div class="panel-heading">
+              <h2>Market activity</h2>
+              <span>5 minutes · Committed trades</span>
+            </div>
+            <div id="chart" class="chart"></div>
+            <div class="chart-footer">
+              <span id="chart-range">Waiting for trades</span
+              ><span id="source-label">Source validator: - · via Tokyo</span>
+            </div>
+          </section>
+          <section class="panel book-panel">
+            <div class="tabs">
+              <button data-book="book" class="selected">Order book</button
+              ><button data-book="trades">Recent trades</button>
+            </div>
+            <div id="book-content"></div>
+          </section>
+          <section class="panel order-panel">
+            <div class="panel-heading"><h2>Place an order</h2></div>
+            <p id="wallet-label" class="muted">Create a wallet to start trading.</p>
+            <form id="order-form">
+              <div class="sides">
+                <label><input type="radio" name="side" value="Buy" checked /> Buy / Long</label
+                ><label><input type="radio" name="side" value="Sell" /> Sell / Short</label>
+              </div>
+              <label
+                >Order type<select id="order-type">
+                  <option value="LO">Limit</option>
+                  <option value="IOC">Immediate or cancel</option>
+                  <option value="FOK">Fill or kill</option>
+                  <option value="PostOnly">Post only</option>
+                </select></label
+              ><label
+                >Price (USD)<input
+                  id="order-price"
+                  inputmode="decimal"
+                  required
+                  placeholder="Limit price" /></label
+              ><label
+                >Quantity <span id="base-symbol">BTC</span
+                ><input
+                  id="order-quantity"
+                  inputmode="decimal"
+                  required
+                  placeholder="Order size" /></label
+              ><label class="check" id="reduce-row" hidden
+                ><input id="reduce-only" type="checkbox" /> Reduce only</label
+              ><button class="primary" id="submit-order" disabled>Submit order</button>
+            </form>
+            <div id="collateral" hidden>
+              <hr />
+              <h3>Perpetual collateral</h3>
+              <label
+                >Margin mode<select id="margin-mode">
+                  <option value="Cross">Cross</option>
+                  <option value="Isolated">Isolated</option>
+                </select></label
+              ><button id="set-margin">Set margin mode</button
+              ><label
+                >Amount (USD)<input id="collateral-amount" inputmode="decimal" value="1000"
+              /></label>
+              <div class="buttons">
+                <button id="deposit">Deposit</button><button id="withdraw">Withdraw</button>
+              </div>
+            </div>
+          </section>
+        </div>
+        <section class="panel account-panel">
+          <div class="tabs">
+            <button data-account="orders" class="selected">Open orders</button
+            ><button data-account="positions">Positions</button
+            ><button data-account="balances">Balances</button
+            ><button data-account="activity">My transactions</button>
+          </div>
+          <div id="account-content" class="scroll">
+            <p class="empty">Your balances, positions and orders will appear here.</p>
+          </div>
+        </section>
+        <section class="panel receipt-panel" id="receipt-panel" hidden>
+          <div class="panel-heading">
+            <h2>Your latest transaction</h2>
+            <span id="receipt-clock"></span>
+          </div>
+          <div id="receipt-progress"></div>
+          <pre id="receipt-detail"></pre>
+          <button id="open-receipt">Open in Explorer ↗</button
+          ><button id="retry-pending" hidden>Retry confirmation</button>
+        </section>
+      </section>
+      <section id="page-network" hidden>
+        <div class="section-title"><h1>Network</h1></div>
+        <div id="network-metrics" class="metrics"></div>
+        <div id="validators" class="validators"></div>
+        <section class="panel explanation">
+          <h2>Measurement</h2>
+          <p>
+            Order TPS: successful order-book transactions. Latency: Tokyo submission to observed
+            durable commit.
+          </p>
+          <p>
+            Quorum: 3 of 4 validators. Two hosts, one operator. Losing either host stops commits.
+          </p>
+          <div id="network-details"></div>
+        </section>
+      </section>
+      <section id="page-explorer" hidden>
+        <div class="section-title"><h1>Explorer</h1></div>
+        <form id="search-form" class="search">
+          <input
+            id="search-input"
+            placeholder="Block sequence or transaction digest"
+            aria-label="Block sequence or transaction digest"
+            required
+          /><button>Search</button>
+        </form>
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>Recent blocks</h2>
+            <span id="explorer-source">Via Tokyo</span>
+          </div>
+          <div id="explorer-list"></div>
+        </section>
+        <section class="panel" id="explorer-detail" hidden>
+          <h2>Details</h2>
+          <pre id="explorer-json"></pre>
+        </section>
+      </section>
+    </main>
+    <footer>
+      <span>Light DEX</span
+      ><a href="https://nicobecodin.github.io/" target="_blank" rel="noreferrer">Build logs ↗</a
+      ><span id="revision"></span>
+    </footer>
+    <dialog id="wallet-dialog">
+      <h2>Your demo wallet</h2>
+      <p>Key stored in this browser. Export a backup to keep it.</p>
+      <code id="full-address"></code>
+      <div class="buttons">
+        <button id="copy-address">Copy address</button
+        ><button id="export-wallet">Export backup</button
+        ><button id="import-wallet">Import backup</button>
+      </div>
+      <input type="file" id="wallet-file" accept="application/json" hidden /><button
+        id="close-wallet"
+      >
+        Close
+      </button>
+    </dialog>
+  </body>
+</html>

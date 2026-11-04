@@ -54,6 +54,7 @@ struct PreparedBlock {
 #[derive(Debug)]
 pub struct BlockchainState {
     pub blocks: Vec<Block>,
+    pub base_height: usize,
     pub certificates: Vec<Option<CommitCertificate>>,
     pub mempool: Mempool,
     signed_mempool: HashMap<Digest, String>,
@@ -87,7 +88,7 @@ impl BlockchainState {
             .is_some_and(|(digest, root, _)| {
                 *digest == block.to_digest()
                     && *root == self.exchange_state.state_digest()
-                    && block.sequence == self.blocks.len() as u64
+                    && block.sequence == self.height() as u64
                     && block.previous_hash
                         == self.blocks.last().map(Block::to_digest).unwrap_or_default()
             })
@@ -196,12 +197,6 @@ impl BlockchainState {
             .any(|tx| !digests.insert(tx.to_digest()))
         {
             return Err("duplicate transaction in block".into());
-        }
-        if digests
-            .iter()
-            .any(|digest| self.committed_transactions.contains(digest))
-        {
-            return Err("already committed transaction".into());
         }
         let mut exchange = parent_exchange.fork();
         exchange.begin_state_batch();
@@ -328,7 +323,7 @@ impl BlockchainState {
             Some((digest, root, prepared))
                 if digest == block_digest
                     && root == parent_root
-                    && block.sequence == self.blocks.len() as u64
+                    && block.sequence == self.height() as u64
                     && block.previous_hash
                         == self.blocks.last().map(Block::to_digest).unwrap_or_default() =>
             {
@@ -376,9 +371,12 @@ impl BlockchainState {
 
         self.blocks.push(block.clone());
         self.certificates.push(certificate);
+        self.maybe_checkpoint()?;
         Ok(outcomes)
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+pub mod checkpoint;

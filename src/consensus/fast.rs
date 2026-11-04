@@ -19,7 +19,7 @@ use crate::{
     node::NodeId,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FastMode {
     Hotstuff2,
     Votor,
@@ -95,7 +95,7 @@ pub enum FastMessage {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum FastProof {
     Hotstuff2 {
         prepare: FastQc,
@@ -107,7 +107,28 @@ pub enum FastProof {
     },
 }
 
+/// Changes to these fields can constrain a validator's future votes. Peer vote
+/// collection alone is reconstructible; a duplicate transaction notification
+/// must not turn into a synchronous disk write.
+#[derive(Clone, PartialEq, Eq)]
+struct SafetyStamp {
+    view: u64,
+    height: u64,
+    ready: bool,
+    active: Option<Digest>,
+    voted: HashMap<(u64, u64, VoteKind), Digest>,
+    votor_choice: HashMap<u64, Digest>,
+    high: Option<(u64, u64, Digest, VoteKind)>,
+    locked: Option<(u64, u64, Digest, VoteKind)>,
+    rotation: Option<(u64, u64, Digest, VoteKind)>,
+}
+#[derive(Serialize, Deserialize)]
 pub struct FastConsensus {
+    #[serde(skip)]
+    safety: Option<super::safety_journal::SafetyStore>,
+    #[serde(skip)]
+    last_safety: Option<SafetyStamp>,
+    pending_durable: Vec<(Block, CommitCertificate)>,
     mode: FastMode,
     // Let every HotStuff2 replica collect authenticated votes. A QC formed
     // near the submitting client can be relayed while the proposer waits on
@@ -125,25 +146,93 @@ pub struct FastConsensus {
     ready: bool,
     active: Option<Digest>,
     armed: Option<(u64, u64)>,
+    #[serde(with = "super::safety_journal::map_entries")]
     proposals: HashMap<Digest, Proposal>,
+    #[serde(with = "super::safety_journal::map_entries")]
     pending_proposals: HashMap<(u64, u64), (NodeId, Proposal, Option<FastQc>)>,
     high_qc: Option<FastQc>,
     locked_qc: Option<FastQc>,
+    #[serde(with = "super::safety_journal::map_entries")]
     votes: HashMap<(u64, u64, VoteKind, Digest), HashSet<NodeId>>,
+    #[serde(with = "super::safety_journal::map_entries")]
     voted: HashMap<(u64, u64, VoteKind), Digest>,
     // Until a height is finalized, a Votor first-round vote constrains every
     // later view. Otherwise a delayed 80% certificate could conflict with a
     // different block decided after a view change.
+    #[serde(with = "super::safety_journal::map_entries")]
     votor_choice: HashMap<u64, Digest>,
     certified: HashSet<(u64, u64, VoteKind, Digest, usize)>,
+    #[serde(with = "super::safety_journal::map_entries")]
     new_views: HashMap<u64, BTreeMap<NodeId, (Option<FastQc>, Option<Proposal>)>>,
+    #[serde(with = "super::safety_journal::map_entries")]
     proof: HashMap<Digest, FastProof>,
     committed: HashSet<Digest>,
+    #[serde(with = "super::safety_journal::map_entries")]
     pending_qcs: HashMap<Digest, Vec<FastQc>>,
     evidence: EvidenceStore,
 }
 
 impl FastConsensus {
+    pub fn recover(
+        path: &std::path::Path,
+        node_id: NodeId,
+        manifest: &SessionManifest,
+        state: &mut crate::blockchain::BlockchainState,
+    ) -> std::io::Result<Self> {
+        let store =
+            super::safety_journal::SafetyStore::open(path, manifest.chain_id_bytes()?, node_id)?;
+        let mut engine: Self = match store.read()? {
+            Some(engine) => engine,
+            None => {
+                if !state.blocks.is_empty() {
+                    return Err(std::io::Error::other(
+                        "cannot resume without consensus safety state",
+                    ));
+                }
+                Self::new(
+                    FastMode::Hotstuff2,
+                    node_id,
+                    manifest.validators.len() as u64,
+                )
+            }
+        };
+        if engine.node_id != node_id
+            || engine.mode != FastMode::Hotstuff2
+            || engine.node_count != manifest.validators.len() as u64
+        {
+            return Err(std::io::Error::other(
+                "recovered consensus configuration mismatch",
+            ));
+        }
+        engine.pending_durable.sort_by_key(|(b, _)| b.sequence);
+        for (block, certificate) in &engine.pending_durable {
+            if block.sequence < state.base_height as u64 {
+                continue;
+            }
+            if let Some(existing) = state.block_at(block.sequence as usize) {
+                if existing.to_digest() != block.to_digest() {
+                    return Err(std::io::Error::other("conflicting durable decision"));
+                }
+            } else {
+                state
+                    .commit_block_with_certificate(block, certificate.clone())
+                    .map_err(std::io::Error::other)?;
+            }
+        }
+        if engine.height < state.height() as u64 {
+            engine.catch_up_to_height(state.height() as u64);
+        }
+        if engine.height != state.height() as u64 {
+            return Err(std::io::Error::other(
+                "safety state does not match committed history",
+            ));
+        }
+        engine.started = false;
+        engine.armed = None;
+        engine.safety = Some(store);
+        Ok(engine)
+    }
+
     fn trace_stage(&self, stage: &'static str, height: u64, digest: Digest) {
         if std::env::var_os("LIGHT_DEX_HANDOFF_TRACE").is_none() {
             return;
@@ -197,6 +286,9 @@ impl FastConsensus {
             certificate_handoff: mode == FastMode::Hotstuff2
                 && std::env::var_os("LIGHT_DEX_FAST_CERT_HANDOFF").is_some(),
             automatic_rotation_interval: None,
+            safety: None,
+            last_safety: None,
+            pending_durable: Vec::new(),
             rotation_qc: None,
             node_id,
             node_count,
@@ -429,7 +521,7 @@ impl FastConsensus {
         self.certified.clear();
         self.pending_qcs.clear();
         self.committed.clear();
-        self.new_views.retain(|view, _| *view >= self.view);
+        self.new_views.clear();
         self.evidence.prune_fast_before(self.height, self.view);
         self.high_qc = None;
         self.locked_qc = None;
@@ -828,7 +920,8 @@ impl FastConsensus {
         if !self.certificate_handoff
             || self.mode != FastMode::Hotstuff2
             || from >= self.node_count
-            || view <= self.view
+            || view < self.view
+            || view == self.view && self.ready
             || previous.view.checked_add(1) != Some(view)
             || height != self.height
             || previous.height.checked_add(1) != Some(height)
@@ -1007,6 +1100,60 @@ impl FastConsensus {
 }
 
 impl Consensus for FastConsensus {
+    fn persist_before_actions(
+        &mut self,
+        actions: &[ConsensusAction],
+        durable_height: u64,
+    ) -> std::io::Result<()> {
+        if self.safety.is_none() {
+            return Ok(());
+        }
+        self.pending_durable
+            .retain(|(block, _)| block.sequence >= durable_height);
+        for action in actions {
+            if let ConsensusAction::Commit(proposal) = action {
+                let digest = proposal.to_digest();
+                if !self
+                    .pending_durable
+                    .iter()
+                    .any(|(b, _)| b.to_digest() == digest)
+                {
+                    let Some(FastProof::Hotstuff2 { prepare, finality }) = self.proof.get(&digest)
+                    else {
+                        return Err(std::io::Error::other("missing durable decision evidence"));
+                    };
+                    self.pending_durable.push((
+                        proposal.block.clone(),
+                        CommitCertificate::Hotstuff2 {
+                            prepare: prepare.clone(),
+                            finality: finality.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+        let qc_stamp = |qc: &FastQc| (qc.view, qc.height, qc.digest, qc.kind);
+        let stamp = SafetyStamp {
+            view: self.view,
+            height: self.height,
+            ready: self.ready,
+            active: self.active,
+            voted: self.voted.clone(),
+            votor_choice: self.votor_choice.clone(),
+            high: self.high_qc.as_ref().map(qc_stamp),
+            locked: self.locked_qc.as_ref().map(qc_stamp),
+            rotation: self.rotation_qc.as_ref().map(qc_stamp),
+        };
+        // In leader-only collector mode, a local vote can change with no send
+        // action. The stamp therefore checks votes and locks, not just actions.
+        if actions.is_empty() && self.last_safety.as_ref() == Some(&stamp) {
+            return Ok(());
+        }
+        self.safety.as_ref().unwrap().write(self)?;
+        self.last_safety = Some(stamp);
+        Ok(())
+    }
+
     fn set_signer(&mut self, manifest: Arc<SessionManifest>, key: SigningKey) {
         self.automatic_rotation_interval = manifest.auto_view_change_blocks;
         self.evidence.set_signer(manifest, key, self.node_id);
@@ -1028,6 +1175,13 @@ impl Consensus for FastConsensus {
         self.node_count = count;
     }
     fn restore_from_height(&mut self, height: u64) {
+        if self.safety.is_some() {
+            assert_eq!(
+                self.height, height,
+                "recovered consensus and block heights differ"
+            );
+            return;
+        }
         self.height = height;
         self.armed = None;
         self.rotation_qc = None;
@@ -1048,7 +1202,7 @@ impl Consensus for FastConsensus {
         self.pending_proposals
             .retain(|(_, sequence), _| *sequence >= height);
         self.votor_choice.retain(|sequence, _| *sequence >= height);
-        self.new_views.retain(|view, _| *view >= self.view);
+        self.new_views.clear();
         self.proof.clear();
         self.committed.clear();
         self.high_qc = self.high_qc.take().filter(|qc| qc.height >= height);
@@ -1056,10 +1210,61 @@ impl Consensus for FastConsensus {
         self.evidence.prune_fast_before(height, self.view);
         self.timer()
     }
+    fn adopt_verified_tip(
+        &mut self,
+        block: &Block,
+        certificate: &CommitCertificate,
+    ) -> Vec<ConsensusAction> {
+        let CommitCertificate::Hotstuff2 { finality, .. } = certificate else {
+            return vec![];
+        };
+        if self.mode != FastMode::Hotstuff2
+            || block.sequence.checked_add(1) != Some(self.height)
+            || finality.height != block.sequence
+            || finality.digest != block.to_digest()
+        {
+            return vec![];
+        }
+        if let Some(manifest) = self.evidence.manifest() {
+            if crate::crypto::verify_commit_certificate(block, certificate, manifest).is_err() {
+                return vec![];
+            }
+        } else if !self.valid_qc(finality) {
+            return vec![];
+        }
+        let rotation = self
+            .automatic_rotation_interval
+            .is_some_and(|n| n > 0 && block.sequence > 0 && block.sequence % n == 0);
+        let Some(target) = finality.view.checked_add(u64::from(rotation)) else {
+            return vec![];
+        };
+        if target < self.view {
+            return self.timer();
+        }
+        if rotation && !self.certificate_handoff {
+            if self.view > finality.view {
+                return self.timer();
+            }
+            self.view = finality.view;
+            return self.advance_view(target);
+        }
+        let mut actions = self.activate_certified_view(target);
+        if rotation {
+            actions.push(ConsensusAction::Broadcast(self.message(
+                FastMessage::RotationNotice {
+                    view: target,
+                    height: self.height,
+                    previous: finality.clone(),
+                },
+            )));
+        }
+        actions
+    }
     fn supports_catch_up(&self) -> bool {
         true
     }
     fn on_start(&mut self) -> Vec<ConsensusAction> {
+        self.armed = None;
         self.started = true;
         if self.height == 0 && self.node_id == self.current_primary() {
             let block = self
@@ -1554,6 +1759,50 @@ mod tests {
     }
 
     #[test]
+    fn catch_up_adopts_certified_rotation_without_waiting_for_a_timeout() {
+        let mut block = Block::new_initial_block();
+        block.sequence = 4;
+        let digest = block.to_digest();
+        let make = |kind| FastQc {
+            view: 6,
+            height: 4,
+            digest,
+            kind,
+            voters: vec![0, 1, 2],
+            signatures: vec![String::new(); 3],
+        };
+        let finality = make(VoteKind::Final);
+        let certificate = CommitCertificate::Hotstuff2 {
+            prepare: make(VoteKind::Prepare),
+            finality: finality.clone(),
+        };
+        let mut engine = FastConsensus::new(FastMode::Hotstuff2, 3, 4);
+        engine.certificate_handoff = true;
+        engine.started = true;
+        engine.automatic_rotation_interval = Some(4);
+        engine.catch_up_to_height(5);
+        let actions = engine.adopt_verified_tip(&block, &certificate);
+        assert_eq!(engine.view, 7);
+        assert!(engine.ready);
+        assert!(engine.can_propose());
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ConsensusAction::TryPropose))
+        );
+        engine.view = 9;
+        engine.ready = false;
+        engine.adopt_verified_tip(&block, &certificate);
+        assert_eq!(engine.view, 9);
+        assert!(!engine.ready);
+        // A replica may already promise the target view while waiting for its
+        // StartView. The same-view certified rotation must be able to unblock it.
+        engine.view = 7;
+        engine.ready = false;
+        engine.on_rotation_notice(0, 7, 5, finality);
+        assert!(engine.ready);
+    }
+    #[test]
     fn repeated_pending_qcs_do_not_grow_and_stronger_qc_wins() {
         let mut engine = FastConsensus::new(FastMode::Votor, 1, 7);
         let mut qc = FastQc {
@@ -1572,5 +1821,133 @@ mod tests {
         qc.signatures.push(String::new());
         engine.defer_qc(qc.clone());
         assert_eq!(engine.pending_qcs[&qc.digest][0].voters, qc.voters);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    #[test]
+    fn recovery_preserves_votes_locks_and_proposal_bodies() {
+        let directory =
+            std::env::temp_dir().join(format!("ldex-recovery-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        let manifest = Arc::new(
+            crate::crypto::create_session(&directory.join("session"), "hotstuff2", 4).unwrap(),
+        );
+        let path = directory.join("safety.state");
+        let mut state = crate::blockchain::BlockchainState::new_signed(manifest.clone());
+        let mut engine = FastConsensus::recover(&path, 0, &manifest, &mut state).unwrap();
+        let key =
+            crate::crypto::read_secret(&directory.join("session/keys/validator-0.key")).unwrap();
+        engine.set_signer(manifest.clone(), key.clone());
+        let block = Block::new_initial_block_signed(
+            &manifest.chain_id,
+            crate::message::hex_decode(&manifest.initial_state_root).unwrap(),
+        );
+        let digest = block.to_digest();
+        engine.proposals.insert(digest, Proposal { block });
+        engine.view = 3;
+        engine.voted.insert((3, 0, VoteKind::Prepare), digest);
+        engine.locked_qc = Some(FastQc {
+            view: 3,
+            height: 0,
+            digest,
+            kind: VoteKind::Prepare,
+            voters: vec![0, 1, 2],
+            signatures: vec!["test-evidence".into(); 3],
+        });
+        engine.persist_before_actions(&[], 0).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        for _ in 0..100 {
+            engine.persist_before_actions(&[], 0).unwrap();
+        }
+        assert_eq!(
+            modified,
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            "unchanged notifications must not rewrite safety state"
+        );
+        // A changed local vote still has to reach disk even with no send action.
+        engine.voted.insert((3, 0, VoteKind::Final), digest);
+        engine.persist_before_actions(&[], 0).unwrap();
+        drop(engine);
+        let mut recovered = FastConsensus::recover(&path, 0, &manifest, &mut state).unwrap();
+        recovered.set_signer(manifest.clone(), key);
+        assert_eq!(recovered.view, 3);
+        assert_eq!(
+            recovered.voted.get(&(3, 0, VoteKind::Prepare)),
+            Some(&digest)
+        );
+        assert_eq!(recovered.voted.get(&(3, 0, VoteKind::Final)), Some(&digest));
+        assert_eq!(recovered.locked_qc.as_ref().unwrap().digest, digest);
+        assert!(recovered.proposals.contains_key(&digest));
+        assert!(recovered.vote(VoteKind::Prepare, [9; 32]).is_empty());
+        drop(recovered);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pending_commit_recovery_tests {
+    use super::*;
+    #[test]
+    fn restart_finishes_a_certified_decision_before_block_append() {
+        let directory =
+            std::env::temp_dir().join(format!("ldex-decision-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        let manifest = Arc::new(
+            crate::crypto::create_session(&directory.join("session"), "hotstuff2", 1).unwrap(),
+        );
+        let path = directory.join("safety.state");
+        let block_path = directory.join("node.json");
+        let mut state =
+            crate::blockchain::BlockchainState::load_signed(block_path.clone(), manifest.clone())
+                .unwrap();
+        let key =
+            crate::crypto::read_secret(&directory.join("session/keys/validator-0.key")).unwrap();
+        let mut engine = FastConsensus::recover(&path, 0, &manifest, &mut state).unwrap();
+        engine.set_signer(manifest.clone(), key.clone());
+        let mut queue = std::collections::VecDeque::from(engine.on_start());
+        let mut decided = false;
+        for _ in 0..100 {
+            let Some(action) = queue.pop_front() else {
+                break;
+            };
+            match action {
+                ConsensusAction::Commit(_) => {
+                    engine.persist_before_actions(&[action], 0).unwrap();
+                    decided = true;
+                    break;
+                }
+                ConsensusAction::Broadcast(message) | ConsensusAction::Send { message, .. } => {
+                    let signed =
+                        crate::crypto::sign_consensus(message.clone(), 0, &manifest, &key).unwrap();
+                    engine.record_verified(signed);
+                    let actions = engine.on_event(ConsensusEvent::Message { from: 0, message });
+                    engine.persist_before_actions(&actions, 0).unwrap();
+                    queue.extend(actions);
+                }
+                _ => {}
+            }
+        }
+        assert!(decided, "test did not reach a commit decision");
+        assert!(state.blocks.is_empty());
+        drop(engine);
+        drop(state);
+        let mut state =
+            crate::blockchain::BlockchainState::load_signed(block_path.clone(), manifest.clone())
+                .unwrap();
+        let recovered = FastConsensus::recover(&path, 0, &manifest, &mut state).unwrap();
+        assert_eq!(state.height(), 1);
+        assert_eq!(recovered.height, 1);
+        let root = state.exchange_state.state_digest();
+        drop(recovered);
+        drop(state);
+        let state = crate::blockchain::BlockchainState::load_signed(block_path, manifest).unwrap();
+        assert_eq!(state.height(), 1);
+        assert_eq!(state.exchange_state.state_digest(), root);
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

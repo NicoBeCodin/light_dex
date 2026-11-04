@@ -131,7 +131,7 @@ impl<C: Consensus> Node<C> {
                 .reconnects
                 .load(std::sync::atomic::Ordering::Relaxed),
 
-            chain_height: self.state.blocks.len(),
+            chain_height: self.state.height(),
 
             latest_sequence: self.state.blocks.last().map(|b| b.sequence),
 

@@ -24,7 +24,7 @@ pub fn asset_atoms(asset: AssetId) -> Option<u64> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Market {
     pub id: MarketId,
     pub base_asset: AssetId,

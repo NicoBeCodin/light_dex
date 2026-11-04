@@ -3,13 +3,13 @@ use im::HashMap;
 pub type AssetId = u64;
 pub type AccountId = super::address::Address;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Balance {
     pub available: u64,
     pub locked: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Account {
     pub id: AccountId,
     /// One more than the largest consumed nonce. This is a client hint, not

@@ -125,6 +125,7 @@ mod tests {
             while let Ok(NodeEvent::ReadQuery { reply, .. }) = receiver.recv() {
                 let height = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u64 + 1;
                 let _ = reply.send(Arc::new(ReadSnapshot {
+                    activity: serde_json::Value::Null,
                     node_id: 0,
                     height,
                     digest: None,

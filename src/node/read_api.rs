@@ -23,6 +23,7 @@ pub use published::{ReadSnapshot, ReadUpdate};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReadQuery {
     Summary,
+    Activity,
     Market(u64),
     Account(Address),
     Candidates(u64),
@@ -268,7 +269,9 @@ pub(super) fn start(
     updates: broadcast::Sender<Arc<ReadUpdate>>,
     key: [u8; 32],
 ) -> std::io::Result<SocketAddr> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let listener = TcpListener::bind(
+        std::env::var("LIGHT_DEX_READ_LISTEN").unwrap_or_else(|_| "127.0.0.1:0".into()),
+    )?;
     let address = listener.local_addr()?;
     listener.set_nonblocking(true)?;
     let state = ApiState {
@@ -288,6 +291,7 @@ pub(super) fn start(
             let listener = tokio::net::TcpListener::from_std(listener).expect("read API listener");
             let app = Router::new()
                 .route("/v1/node/summary", get(summary))
+                .route("/v1/activity/stream", get(stream_activity))
                 .route("/v1/markets/{id}", get(market))
                 .route("/v1/accounts/{address}", get(account))
                 .route("/v1/liquidations/{id}", get(candidates))
@@ -352,6 +356,7 @@ impl ReadSnapshot {
         let height = self.height;
         let digest = &self.digest;
         match query {
+            ReadQuery::Activity => self.activity.clone(),
             ReadQuery::Summary => json!({
                 "node_id": self.node_id, "height": height, "digest": digest,
                 "view": self.view, "primary": self.primary,
@@ -378,7 +383,7 @@ impl ReadSnapshot {
                 let pair = OraclePair::new(market.base_asset, market.quote_asset);
                 let mark = self.exchange.oracle_mark(pair).map(|mark| mark.index_e8);
                 json!({"node_id":self.node_id,"height":height,"digest":digest,"market_id":id,
-                    "config":market.config(),"book":book,"recent_trades":trades,"committed_mark_e8":mark})
+                    "config":market.config(),"book":book,"recent_trades":trades,"committed_mark_e8":mark,"oracle_update_digest":self.exchange.oracle_mark(pair).map(|m|crate::message::hex_encode(&m.update_digest))})
             }
             ReadQuery::Account(address) => {
                 let Some(account) = self.exchange.accounts().get(&address) else {
@@ -528,4 +533,50 @@ mod tests {
         assert!(long_distance > 0 && short_distance > 0);
         assert!(estimated_trigger(mark, 0, 10, 10_000, 1, 500, buffer).is_none());
     }
+}
+
+async fn stream_activity(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<Response, StatusCode> {
+    if !authorized(&headers, &state) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    // Receipt events must not use the coalescing watch channel used by books.
+    // Subscribe before reading the initial snapshot so commits cannot fall
+    // between those two operations. A lagging reader is disconnected explicitly.
+    let mut updates = state.updates.subscribe();
+    let initial = project(state, ReadQuery::Activity).await?;
+    Ok(ws
+        .max_message_size(1024)
+        .on_upgrade(move |mut socket| async move {
+            let mut height = initial.value["height"].as_u64().unwrap_or(0);
+            if socket
+                .send(WsMessage::Text(initial.text.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            while let Ok(update) = updates.recv().await {
+                if update.height <= height {
+                    continue;
+                }
+                let Some(value) = &update.activity else {
+                    continue;
+                };
+                if !matches!(
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        socket.send(WsMessage::Text(value.to_string().into()))
+                    )
+                    .await,
+                    Ok(Ok(()))
+                ) {
+                    break;
+                }
+                height = update.height;
+            }
+        }))
 }

@@ -9,7 +9,6 @@ use std::{
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::{TryRngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
@@ -23,8 +22,8 @@ use crate::{
     message::{hex_decode, hex_encode},
 };
 
-pub const PROTOCOL_VERSION: u8 = 17;
-const TX_DOMAIN: &[u8] = b"light-dex/transaction-signature/v10";
+pub const PROTOCOL_VERSION: u8 = 18;
+const TX_DOMAIN: &[u8] = light_dex_protocol_codec::TRANSACTION_DOMAIN;
 const CONSENSUS_DOMAIN: &[u8] = b"light-dex/consensus-signature/v10";
 const PEER_DOMAIN: &[u8] = b"light-dex/peer-handshake/v10";
 

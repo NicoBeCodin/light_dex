@@ -42,6 +42,13 @@ impl Journal {
     pub(super) fn start(path: PathBuf) -> Self {
         let (tx, rx) = mpsc::sync_channel::<Request>(2);
         let sync_mode = SyncMode::from_env();
+        let max_bytes = std::env::var("LIGHT_DEX_JOURNAL_MAX_BYTES")
+            .ok()
+            .map(|text| {
+                let value = text.parse::<u64>().expect("invalid journal byte limit");
+                assert!(value > 0, "journal byte limit must be positive");
+                value
+            });
         std::thread::Builder::new()
             .name("durable-journal".into())
             .spawn(move || {
@@ -58,6 +65,7 @@ impl Journal {
                             &request.block,
                             request.certificate.as_ref(),
                             sync_mode,
+                            max_bytes,
                         )
                     };
                     if let Err(error) = &result {
@@ -101,6 +109,7 @@ fn append(
     block: &Block,
     certificate: Option<&CommitCertificate>,
     sync_mode: SyncMode,
+    max_bytes: Option<u64>,
 ) -> Result<(), String> {
     let parent = path.parent().ok_or("invalid journal directory")?;
     if file.is_none() {
@@ -140,6 +149,9 @@ fn append(
     let file = file.as_mut().unwrap();
     let stage_started = Instant::now();
     let previous_len = file.metadata().map_err(|e| e.to_string())?.len();
+    if max_bytes.is_some_and(|limit| previous_len.saturating_add(bytes.len() as u64) > limit) {
+        return Err("journal storage budget reached; commit not published".into());
+    }
     crate::profile::record("journal_metadata", stage_started.elapsed(), 1);
     let stage_started = Instant::now();
     let write_result = file.write_all(&bytes);
@@ -174,7 +186,15 @@ mod tests {
             let path = directory.join("node.json");
             let journal = BlockchainState::journal_path(&path);
             let mut file = None;
-            append(&journal, &mut file, &Block::new_initial_block(), None, mode).unwrap();
+            append(
+                &journal,
+                &mut file,
+                &Block::new_initial_block(),
+                None,
+                mode,
+                None,
+            )
+            .unwrap();
             drop(file);
             let mut tail = OpenOptions::new().append(true).open(&journal).unwrap();
             tail.write_all(b"{\"interrupted\":").unwrap();
@@ -185,5 +205,34 @@ mod tests {
             assert!(std::fs::read(&journal).unwrap().ends_with(b"\n"));
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn exceeding_storage_budget_keeps_existing_journal_unchanged() {
+        let dir = std::env::temp_dir().join(format!("ldex-budget-{}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("chain.journal");
+        let mut file = None;
+        let block = Block::new_initial_block();
+        append(&path, &mut file, &block, None, SyncMode::All, None).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            append(
+                &path,
+                &mut file,
+                &block,
+                None,
+                SyncMode::All,
+                Some(before.len() as u64)
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

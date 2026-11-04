@@ -48,18 +48,44 @@ pub struct OrderBookSnapshot {
     pub asks: Vec<BookLevel>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBook {
     pub asks: OrdMap<u64, Vector<Order>>,
     pub bids: OrdMap<u64, Vector<Order>>,
     // Rebuildable, non-consensus indexes. u128 keeps level aggregation exact
     // even when the public u64 snapshot quantity saturates.
+    #[serde(skip)]
     bid_totals: OrdMap<u64, u128>,
+    #[serde(skip)]
     ask_totals: OrdMap<u64, u128>,
+    #[serde(skip)]
     owner_prices: OrdMap<(AccountId, bool, u64), usize>,
 }
 
 impl OrderBook {
+    pub(super) fn rebuild_snapshot_indexes(&mut self) {
+        self.bid_totals.clear();
+        self.ask_totals.clear();
+        self.owner_prices.clear();
+        for (buy, levels) in [(true, &self.bids), (false, &self.asks)] {
+            for (&price, orders) in levels {
+                let mut total = 0u128;
+                for order in orders {
+                    total += u128::from(order.remaining_quantity);
+                    *self
+                        .owner_prices
+                        .entry((order.account, buy, price))
+                        .or_default() += 1;
+                }
+                if buy {
+                    self.bid_totals.insert(price, total);
+                } else {
+                    self.ask_totals.insert(price, total);
+                }
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             asks: OrdMap::new(),

@@ -3,7 +3,7 @@ use super::market_config::DecimalStep;
 /// Converts wire price/quantity atoms into the collateral asset's atoms.
 /// For BTC-USD: price 100001 means $10,000.1, quantity 1 means 0.0001 BTC,
 /// and quote_decimals 6 returns the notional in micro-USD.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PerpUnits {
     pub price: DecimalStep,
     pub quantity: DecimalStep,

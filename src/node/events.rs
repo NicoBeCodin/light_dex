@@ -33,8 +33,10 @@ impl<C: Consensus> Node<C> {
                         "Node {} failed forwarding signed tx to primary {primary}: {error}",
                         self.node_id
                     );
-                    let actions = self.consensus.on_event(ConsensusEvent::LeaderUnavailable);
-                    self.execute_consensus_actions(&actions, node_tx)?;
+                    // One broken data lane does not establish leader failure.
+                    // Admission gossip can still reach it through another peer;
+                    // the consensus timer and stalled-progress probe detect loss.
+                    self.forward_cursor.get_or_insert(0);
                 }
             } else {
                 self.trace_tx_stage(digest, "forwarded", None);
@@ -88,9 +90,20 @@ impl<C: Consensus> Node<C> {
                 let mut response = sync::build_sync_response(
                     &self.state.blocks,
                     &self.state.certificates,
-                    from_sequence,
+                    from_sequence.saturating_sub(self.state.base_height as u64),
                     limit,
                 );
+                response.chain_height = self.state.height() as u64;
+                response.from_sequence = from_sequence;
+                response.anchor_digest = from_sequence
+                    .checked_sub(1)
+                    .and_then(|seq| self.state.block_at(seq as usize))
+                    .map(Block::to_digest);
+                if from_sequence < self.state.base_height as u64 {
+                    response.blocks.clear();
+                    response.certificates.clear();
+                    response.checkpoint = self.state.checkpoint();
+                }
                 if want_branch && self.consensus.is_chained() {
                     response.speculative = self.consensus.certified_branch();
                 }
@@ -613,7 +626,7 @@ impl<C: Consensus> Node<C> {
                     if let ConsensusEvent::Message { from, message } = &event {
                         if let Some(height) = message.fast_height() {
                             if height > self.consensus.next_sequence()
-                                || height > self.state.blocks.len() as u64
+                                || height > self.state.height() as u64
                             {
                                 self.defer_fast_message(*from, message.clone());
                                 if !self.pending_commit {
@@ -731,7 +744,7 @@ impl<C: Consensus> Node<C> {
                                 continue;
                             }
                             if height > self.consensus.next_sequence()
-                                || height > self.state.blocks.len() as u64
+                                || height > self.state.height() as u64
                             {
                                 self.defer_fast_message(
                                     from,
@@ -796,7 +809,7 @@ impl<C: Consensus> Node<C> {
                     if let ConsensusEvent::Message { from, message } = &event {
                         if let Some(height) = message.fast_height() {
                             if height > self.consensus.next_sequence()
-                                || height > self.state.blocks.len() as u64
+                                || height > self.state.height() as u64
                             {
                                 self.defer_fast_message(*from, message.clone());
                                 self.start_sync(*from, &node_tx);
@@ -903,7 +916,7 @@ impl<C: Consensus> Node<C> {
                         if let Some(block) = message.proposed_block() {
                             if !self.consensus.is_chained()
                                 && self.consensus.supports_catch_up()
-                                && block.sequence > self.state.blocks.len() as u64
+                                && block.sequence > self.state.height() as u64
                             {
                                 self.start_sync(*from, &node_tx);
                                 continue;
@@ -1212,6 +1225,8 @@ impl<C: Consensus> Node<C> {
                     // A quiet cluster should still elect a live primary.
                     let primary = self.consensus.current_primary();
                     if self.consensus.consensus_started(false)
+                        && self.last_commit_at.elapsed()
+                            >= Duration::from_millis(self.consensus.get_timeout())
                         && primary != self.node_id
                         && self.last_primary_probe.elapsed()
                             >= Duration::from_millis(self.consensus.get_timeout())

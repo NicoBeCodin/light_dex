@@ -25,14 +25,14 @@ pub enum Side {
     Sell,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OrderLocation {
     pub market: MarketId,
     pub side: Side,
     pub price: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Order {
     pub id: OrderId,
     pub account: AccountId,

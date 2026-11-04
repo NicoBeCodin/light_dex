@@ -85,7 +85,7 @@ pub struct ExecutedTrade {
     pub taker_account: AccountId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OracleMark {
     pub index_e8: u64,
     pub update_digest: Digest,
@@ -117,34 +117,53 @@ impl RestingExposure {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExchangeState {
+    #[serde(with = "snapshot::map_entries")]
     accounts: StateMap<AccountId, Account>,
+    #[serde(with = "snapshot::map_entries")]
     perp_accounts: StateMap<(MarketId, AccountId), IsolatedPerpAccount>,
+    #[serde(with = "snapshot::map_entries")]
     margin_modes: StateMap<AccountId, MarginMode>,
+    #[serde(with = "snapshot::map_entries")]
     cross_collateral: StateMap<AccountId, i128>,
+    #[serde(with = "snapshot::map_entries")]
     insurance_assets: StateMap<AssetId, u64>,
     bad_debt_usd: u64,
     // Derived from resting perp orders. The orders themselves are committed
     // in the state tree; this index avoids scanning the book on every quote.
+    #[serde(skip)]
     perp_resting_exposure: StateMap<(MarketId, AccountId), RestingExposure>,
     /// Rebuildable index of resting perp order IDs by owner.
+    #[serde(skip)]
     perp_owned_orders: StateMap<AccountId, OrdSet<OrderId>>,
+    #[serde(with = "snapshot::map_entries")]
     markets: StateMap<MarketId, Market>,
+    #[serde(with = "snapshot::map_entries")]
     order_books: StateMap<MarketId, OrderBook>,
+    #[serde(skip)]
     order_locations: StateMap<OrderId, OrderLocation>,
     next_order_id: OrderId,
+    #[serde(skip)]
     state_tree: StateTree,
     faucet: Option<FaucetConfig>,
     faucet_claims: u64,
+    #[serde(with = "snapshot::map_entries")]
     oracle_marks: StateMap<OraclePair, OracleMark>,
+    #[serde(with = "snapshot::map_entries")]
     funding_clocks: StateMap<MarketId, perp::FundingClock>,
     // Derived lookup indexes, excluded from canonical consensus state.
+    #[serde(skip)]
     perp_markets_by_account: StateMap<AccountId, OrdSet<MarketId>>,
+    #[serde(skip)]
     perp_accounts_by_market: StateMap<MarketId, OrdSet<AccountId>>,
+    #[serde(skip)]
     owned_orders: StateMap<AccountId, OrdSet<OrderId>>,
+    #[serde(skip)]
     order_owners: StateMap<OrderId, AccountId>,
+    #[serde(skip)]
     execution_work: limits::WorkCounter,
+    #[serde(skip)]
     metering: limits::MeterFlag,
 }
 
@@ -933,3 +952,5 @@ impl ExchangeState {
 
 #[cfg(test)]
 mod tests;
+
+mod snapshot;

@@ -16,7 +16,11 @@ impl SyncWriter {
             .name("block-sync-writer".into())
             .spawn(move || {
                 while let Ok(mut job) = receiver.recv() {
-                    if let Ok(line) = crate::message::sign_compressed_line(&job.response, &key) {
+                    if let Ok(line) = crate::message::sign_compressed_line_with_limit(
+                        &job.response,
+                        &key,
+                        72 * 1024 * 1024,
+                    ) {
                         let _ = job.stream.set_write_timeout(Some(Duration::from_secs(10)));
                         let _ = job.stream.write_all(line.as_bytes());
                     }

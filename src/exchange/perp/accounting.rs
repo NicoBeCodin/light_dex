@@ -3,7 +3,7 @@ use crate::exchange::perp_units::{PerpUnits, UnitError};
 
 /// One linear perp position. `size` is in market quantity atoms; cost basis and
 /// PnL are in collateral/quote atoms. `entry_price` is display-only.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PerpPosition {
     units: PerpUnits,
     size: i128,
@@ -254,7 +254,7 @@ pub fn equity(
 /// Isolated collateral is held in quote atoms (micro-USD for BTC-USD).
 /// Realized PnL is settled into collateral on each fill;
 /// `position.realized_pnl` is a historical total.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IsolatedPerpAccount {
     collateral: i128,
     position: PerpPosition,

@@ -43,6 +43,8 @@ fn main() {
             )?;
             let audit = serde_json::json!({
                 "node_id": node_id,
+                "height":state.height(),
+                "retained_from":state.base_height,
                 "block_digests": state.blocks.iter().map(|block| light_dex::message::hex_encode(&block.to_digest())).collect::<Vec<_>>(),
                 "state_root": light_dex::message::hex_encode(&state.exchange_state.state_digest()),
             });
@@ -61,7 +63,9 @@ fn main() {
         .parse()
         .expect("invalid --node");
 
+    let peers_file = arg_value(&args, "--peers-file");
     let parent_addr: SocketAddr = arg_value(&args, "--parent")
+        .or_else(|| peers_file.as_ref().map(|_| "127.0.0.1:0".into()))
         .expect("missing --parent")
         .parse()
         .expect("invalid --parent");
@@ -80,6 +84,32 @@ fn main() {
     let manifest_path =
         PathBuf::from(arg_value(&args, "--chain-config").expect("missing --chain-config"));
     let manifest = Arc::new(SessionManifest::load(&manifest_path).expect("invalid chain manifest"));
+    let static_peers = peers_file.map(|path| {
+        let peers: std::collections::BTreeMap<NodeId, SocketAddr> = serde_json::from_slice(
+            &std::fs::read(path).expect("cannot read static peer configuration"),
+        )
+        .expect("invalid static peer configuration");
+        assert_eq!(
+            peers.keys().copied().collect::<Vec<_>>(),
+            manifest.validators.keys().copied().collect::<Vec<_>>(),
+            "static peers must exactly match validator membership"
+        );
+        assert!(
+            peers
+                .values()
+                .all(|address| address.port() != 0 && !address.ip().is_unspecified()),
+            "static peers require concrete addresses and ports"
+        );
+        assert_eq!(
+            peers
+                .values()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            peers.len(),
+            "static peer addresses must be distinct"
+        );
+        peers
+    });
     let signing_key = read_secret(&PathBuf::from(
         arg_value(&args, "--validator-key").expect("missing --validator-key"),
     ))
@@ -91,6 +121,32 @@ fn main() {
             .expect("validator not in manifest")
     );
     let data_dir = PathBuf::from(arg_value(&args, "--data-dir").expect("missing --data-dir"));
+    let recover = args.iter().any(|arg| arg == "--recover-hotstuff2");
+    let _process_lease = if recover {
+        assert_eq!(
+            manifest.consensus, "hotstuff2",
+            "persistent recovery currently supports HotStuff2 only"
+        );
+        assert!(
+            static_peers.is_some(),
+            "recovery requires a fixed peer configuration"
+        );
+        std::fs::create_dir_all(&data_dir).expect("cannot create validator data directory");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lease = options
+            .open(data_dir.join(format!("validator-{node_id}.process")))
+            .expect("cannot open process lease");
+        lease.try_lock().expect("validator identity already in use");
+        Some(lease)
+    } else {
+        None
+    };
 
     let auth_key = light_dex::message::hex_decode::<32>(
         &env::var("LIGHT_DEX_AUTH_KEY").expect("missing cluster authentication key"),
@@ -109,7 +165,7 @@ fn main() {
         .attach_signing(manifest.clone(), signing_key.clone())
         .expect("failed configuring peer authentication");
 
-    let state = BlockchainState::load_signed(
+    let mut state = BlockchainState::load_signed(
         data_dir.join(format!("node-{node_id}.json")),
         manifest.clone(),
     )
@@ -127,15 +183,28 @@ fn main() {
         use std::os::unix::fs::OpenOptionsExt;
         started.mode(0o600);
     }
-    started
-        .open(data_dir.join(format!("validator-{node_id}.started")))
-        .and_then(|file| file.sync_all())
-        .and_then(|_| std::fs::File::open(&data_dir)?.sync_all())
-        .expect("validator already started in this session; unsafe recovery refused");
+    let marker = data_dir.join(format!("validator-{node_id}.started"));
+    let safety_path = data_dir.join(format!("validator-{node_id}.safety"));
+    if recover && marker.exists() {
+        assert!(
+            safety_path.exists(),
+            "existing validator has no recoverable consensus safety state"
+        );
+    } else if !recover {
+        started
+            .open(&marker)
+            .and_then(|file| file.sync_all())
+            .and_then(|_| std::fs::File::open(&data_dir)?.sync_all())
+            .expect("validator already started in this session; unsafe recovery refused");
+    }
     let mut consensus: Box<dyn Consensus> = match algorithm.as_str() {
         "pbft" => Box::new(Pbft::new(node_id, 1)),
         "hotstuff" if manifest.chained_hotstuff => Box::new(ChainedHotStuff::new(node_id, 1)),
         "hotstuff" => Box::new(HotStuff::new(node_id, 1)),
+        "hotstuff2" if recover => Box::new(
+            FastConsensus::recover(&safety_path, node_id, &manifest, &mut state)
+                .expect("failed recovering consensus safety state"),
+        ),
         "hotstuff2" => Box::new(FastConsensus::new(FastMode::Hotstuff2, node_id, 1)),
         "votor" => Box::new(FastConsensus::new(FastMode::Votor, node_id, 1)),
         _ => {
@@ -143,6 +212,14 @@ fn main() {
         }
     };
     consensus.set_timeout(timeout_ms);
+    if let Some(peers) = &static_peers {
+        consensus.set_node_count(manifest.validators.len() as u64);
+        for (&id, &address) in peers {
+            if id != node_id {
+                network.peers_address.insert(id, address);
+            }
+        }
+    }
     println!(
         "Node {node_id} using {} consensus",
         if manifest.chained_hotstuff {
@@ -151,6 +228,21 @@ fn main() {
             algorithm.as_str()
         }
     );
+
+    if recover {
+        network.startup_quorum =
+            Some(light_dex::consensus::quorum_size(manifest.validators.len() as u64) as usize);
+        consensus
+            .persist_before_actions(&[], state.height() as u64)
+            .expect("cannot persist initial consensus state");
+        if !marker.exists() {
+            started
+                .open(&marker)
+                .and_then(|file| file.sync_all())
+                .and_then(|_| std::fs::File::open(&data_dir)?.sync_all())
+                .expect("cannot mark persistent validator started");
+        }
+    }
 
     let mut node = Node::new(node_id, pid, network, state, consensus, block_time_ms)
         .expect("failed creating node");
@@ -204,12 +296,12 @@ fn main() {
 
     println!("Initialized node {node_id} pid={pid}");
 
-    node.register_with_parent()
-        .expect("failed registering with controller");
-
-    node.discover_peers().expect("failed discovering peers");
-
-    node.wait_for_start().expect("failed waiting for START");
+    if static_peers.is_none() {
+        node.register_with_parent()
+            .expect("failed registering with controller");
+        node.discover_peers().expect("failed discovering peers");
+        node.wait_for_start().expect("failed waiting for START");
+    }
 
     node.run().expect("node failed");
 }

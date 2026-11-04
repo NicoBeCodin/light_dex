@@ -18,6 +18,7 @@ impl BlockchainState {
     pub fn new() -> Self {
         BlockchainState {
             blocks: Vec::new(),
+            base_height: 0,
             certificates: Vec::new(),
             mempool: Mempool::default(),
             signed_mempool: HashMap::new(),
@@ -94,6 +95,19 @@ impl BlockchainState {
                 state.commit_block(&block)?;
             }
         }
+        for checkpoint_path in [
+            path.with_extension("checkpoint"),
+            path.with_extension("checkpoint.previous"),
+        ] {
+            if checkpoint_path.exists() {
+                match super::checkpoint::Checkpoint::read(&checkpoint_path)
+                    .and_then(|checkpoint| state.install_checkpoint(checkpoint))
+                {
+                    Ok(()) => break,
+                    Err(error) => eprintln!("Checkpoint recovery rejected: {error}"),
+                }
+            }
+        }
         let journal = Self::journal_path(&path);
         if journal.exists() {
             let mut bytes = fs::read(&journal).map_err(|error| error.to_string())?;
@@ -119,6 +133,9 @@ impl BlockchainState {
                 if state.manifest.is_some() {
                     let committed: CommittedBlock =
                         serde_json::from_slice(line).map_err(|error| error.to_string())?;
+                    if committed.block.sequence < state.height() as u64 {
+                        continue;
+                    }
                     state.commit_block_with_certificate(&committed.block, committed.certificate)?;
                 } else {
                     let block: Block =

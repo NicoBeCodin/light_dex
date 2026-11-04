@@ -111,8 +111,16 @@ pub fn sign_consensus_line(message: &Message, key: &[u8; 32]) -> io::Result<Stri
 }
 
 pub fn sign_compressed_line<T: Serialize>(value: &T, key: &[u8; 32]) -> io::Result<String> {
+    sign_compressed_line_with_limit(value, key, MAX_CONSENSUS_PAYLOAD)
+}
+
+pub fn sign_compressed_line_with_limit<T: Serialize>(
+    value: &T,
+    key: &[u8; 32],
+    limit: usize,
+) -> io::Result<String> {
     let payload = serde_json::to_vec(value).map_err(io::Error::other)?;
-    if payload.len() > MAX_CONSENSUS_PAYLOAD {
+    if payload.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "peer payload too large",
@@ -140,6 +148,17 @@ pub fn sign_compressed_line<T: Serialize>(value: &T, key: &[u8; 32]) -> io::Resu
 }
 
 pub fn verify_line<T: DeserializeOwned>(line: &str, key: &[u8; 32]) -> io::Result<T> {
+    verify_line_with_limit(line, key, MAX_CONSENSUS_PAYLOAD)
+}
+
+pub fn verify_line_with_limit<T: DeserializeOwned>(
+    line: &str,
+    key: &[u8; 32],
+    limit: usize,
+) -> io::Result<T> {
+    if line.len() > limit.saturating_mul(2) {
+        return Err(io::Error::other("envelope too large"));
+    }
     let envelope: AuthEnvelope = serde_json::from_str(line).map_err(io::Error::other)?;
     let (payload, compressed) = match (&envelope.payload, &envelope.compressed_payload) {
         (Some(payload), None) => (payload, false),
@@ -161,15 +180,18 @@ pub fn verify_line<T: DeserializeOwned>(line: &str, key: &[u8; 32]) -> io::Resul
         .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "authentication failed"))?;
     if compressed {
         let bytes = BASE64.decode(payload).map_err(io::Error::other)?;
-        if bytes.len() > MAX_CONSENSUS_PAYLOAD {
+        if bytes.len() > limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "compressed consensus payload too large",
             ));
         }
-        let decoded = zstd::bulk::decompress(&bytes, MAX_CONSENSUS_PAYLOAD)?;
+        let decoded = zstd::bulk::decompress(&bytes, limit)?;
         serde_json::from_slice(&decoded).map_err(io::Error::other)
     } else {
+        if payload.len() > limit {
+            return Err(io::Error::other("payload too large"));
+        }
         serde_json::from_str(payload).map_err(io::Error::other)
     }
 }

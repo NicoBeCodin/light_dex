@@ -18,6 +18,7 @@ pub mod chained;
 pub mod fast;
 pub mod hotstuff;
 pub mod pbft;
+pub mod safety_journal;
 
 pub fn quorum_size(node_count: u64) -> u64 {
     assert!(node_count > 0, "consensus needs at least one validator");
@@ -25,6 +26,13 @@ pub fn quorum_size(node_count: u64) -> u64 {
 }
 
 pub trait Consensus {
+    fn persist_before_actions(
+        &mut self,
+        _actions: &[ConsensusAction],
+        _durable_height: u64,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
     fn set_chain_id(&mut self, _chain_id: String) {}
     fn set_signer(&mut self, _manifest: Arc<SessionManifest>, _key: SigningKey) {}
     fn record_verified(&mut self, _message: SignedConsensusMessage) {}
@@ -37,6 +45,16 @@ pub trait Consensus {
     /// Called after chain/hash/state-validated blocks are copied from a peer.
     fn catch_up_to_height(&mut self, height: u64) -> Vec<ConsensusAction> {
         self.restore_from_height(height);
+        vec![]
+    }
+
+    /// Called only after catch-up advanced the durable state. A verified tip
+    /// may justify the current view or its configured rotation boundary.
+    fn adopt_verified_tip(
+        &mut self,
+        _block: &Block,
+        _certificate: &CommitCertificate,
+    ) -> Vec<ConsensusAction> {
         vec![]
     }
 
@@ -100,6 +118,13 @@ pub trait Consensus {
 }
 
 impl<T: Consensus + ?Sized> Consensus for Box<T> {
+    fn persist_before_actions(
+        &mut self,
+        actions: &[ConsensusAction],
+        height: u64,
+    ) -> std::io::Result<()> {
+        (**self).persist_before_actions(actions, height)
+    }
     fn set_chain_id(&mut self, chain_id: String) {
         (**self).set_chain_id(chain_id)
     }
@@ -120,6 +145,13 @@ impl<T: Consensus + ?Sized> Consensus for Box<T> {
     }
     fn catch_up_to_height(&mut self, height: u64) -> Vec<ConsensusAction> {
         (**self).catch_up_to_height(height)
+    }
+    fn adopt_verified_tip(
+        &mut self,
+        block: &Block,
+        certificate: &CommitCertificate,
+    ) -> Vec<ConsensusAction> {
+        (**self).adopt_verified_tip(block, certificate)
     }
     fn supports_catch_up(&self) -> bool {
         (**self).supports_catch_up()
@@ -409,13 +441,15 @@ impl ConsensusMessage {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct EvidenceStore {
+    #[serde(skip)]
     signer: Option<(Arc<SessionManifest>, SigningKey, NodeId)>,
+    #[serde(with = "safety_journal::map_entries")]
     messages: HashMap<EvidenceKey, BTreeMap<NodeId, SignedConsensusMessage>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum EvidenceKey {
     PbftPrepare(u64, u64, [u8; 32]),
     PbftCommit(u64, u64, [u8; 32]),
@@ -452,9 +486,17 @@ impl EvidenceStore {
     /// Fast-mode certificates are copied into the durable block journal.
     /// Votes for older heights cannot contribute to a later certificate.
     pub fn prune_fast_before(&mut self, height: u64, view: u64) {
-        self.messages.retain(|key, _| match key {
+        self.messages.retain(|key, messages| match key {
             EvidenceKey::FastVote(_, _, sequence, _, _) => *sequence >= height,
-            EvidenceKey::FastNewView(_, new_view) => *new_view >= view,
+            EvidenceKey::FastNewView(_, new_view) => {
+                messages.retain(|_, signed| {
+                    signed
+                        .message
+                        .fast_height()
+                        .is_some_and(|sequence| sequence >= height)
+                });
+                *new_view >= view && !messages.is_empty()
+            }
             _ => true,
         });
     }

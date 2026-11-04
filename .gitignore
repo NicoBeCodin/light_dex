@@ -24,3 +24,14 @@ __pycache__/
 /control-plane/vite.config.d.ts
 /research/
 /control-plane/.local/
+
+# Persistent validator safety files are local runtime data.
+**/validator-*.safety
+**/validator-*.lease
+**/validator-*.pending
+**/validator-*.process
+
+/protocol-codec/target/
+/hosted/.local/
+
+/hosted/__pycache__/

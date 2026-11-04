@@ -4,6 +4,7 @@ use super::*;
 use std::collections::BTreeSet;
 
 pub struct ReadSnapshot {
+    pub activity: serde_json::Value,
     pub node_id: NodeId,
     pub height: u64,
     pub digest: Option<String>,
@@ -20,7 +21,7 @@ pub struct ReadSnapshot {
 
 impl<C: Consensus> Node<C> {
     pub(in crate::node) fn read_snapshot(&mut self, fresh: bool) -> Arc<ReadSnapshot> {
-        let height = self.state.blocks.len() as u64;
+        let height = self.state.height() as u64;
         if !fresh {
             if let Some(snapshot) = &self.published_read {
                 if snapshot.height == height {
@@ -28,7 +29,13 @@ impl<C: Consensus> Node<C> {
                 }
             }
         }
+        let activity = self
+            .last_activity
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"height":height,"outcomes":[]}));
         let snapshot = Arc::new(ReadSnapshot {
+            activity,
             node_id: self.node_id,
             height,
             digest: self
@@ -53,6 +60,7 @@ impl<C: Consensus> Node<C> {
 
 #[derive(Debug, Default)]
 pub struct ReadUpdate {
+    pub activity: Option<Arc<serde_json::Value>>,
     pub height: u64,
     pub markets: BTreeSet<u64>,
     pub accounts: BTreeSet<Address>,
@@ -103,7 +111,7 @@ impl ReadUpdate {
     }
     pub fn affects(&self, query: ReadQuery, dependencies: &BTreeSet<u64>) -> bool {
         match query {
-            ReadQuery::Summary => true,
+            ReadQuery::Summary | ReadQuery::Activity => true,
             ReadQuery::Market(id) => self.markets.contains(&id),
             ReadQuery::Account(owner) => {
                 self.accounts.contains(&owner) || !self.oracle_markets.is_disjoint(dependencies)

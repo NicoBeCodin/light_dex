@@ -28,9 +28,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &env::var("LIGHT_DEX_COINBASE_WS_URL").unwrap_or_else(|_| DEFAULT_URLS[2].into()),
         ),
     ];
-    let hub = HubHandle::start(host, upstream)?;
+    let hub = if let Some(path) = args
+        .windows(2)
+        .find(|pair| pair[0] == "--feeds-file")
+        .map(|p| &p[1])
+    {
+        let feeds = serde_json::from_slice(&std::fs::read(path)?)?;
+        HubHandle::start_many(host, feeds)?
+    } else {
+        HubHandle::start(host, upstream)?
+    };
     for venue in ["binance", "okx", "coinbase"] {
-        println!("{venue}: {}", hub.url(venue).unwrap());
+        if let Some(url) = hub.url(venue) {
+            println!("{venue}: {url}");
+        }
     }
     loop {
         thread::sleep(Duration::from_secs(60));

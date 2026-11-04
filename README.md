@@ -6,6 +6,8 @@ The question driving this project is how exchange execution, consensus, networki
 
 ## Try it
 
+[Open the live demo](https://light-dex.13.230.102.125.sslip.io). It uses test assets, four validators on two hosts, and one operator. The [hosting guide](hosted/README.md) explains persistence and deployment.
+
 Install Rust and Node.js, then run:
 
 ```bash
@@ -33,10 +35,10 @@ The validator code lives in `src/`, and the control plane lives in `control-plan
 
 These are examples from individual experiments, not a capacity guarantee. They use different workloads and configurations.
 
-One cross-region experiment reached 198 committed TPS and 821 ms end-to-end p95 with four HotStuff2 validators, split between an IdeaPad and Tokyo, at 200 offered spot-order TPS. Other baseline runs varied substantially. See [Research and measurements](RESEARCH.md) for the setup, limitations and a command to run the benchmark.
+One cross-region experiment reached 198 committed TPS and 821 ms end-to-end p95 with four HotStuff2 validators, split between an IdeaPad and Tokyo, at 200 offered spot-order TPS. Those historical runs predate the hosted durability path and are not measurements of the live demo. Other baseline runs varied substantially. See [Research and measurements](RESEARCH.md) for the setup, limitations and a command to run the benchmark.
 
 ## Current limits
 
-This is a research simulator, not an exchange for real funds. Consensus variants and performance changes are experimental. Validator votes and locks are not durably journaled for safe live restart, mixed protocol versions are unsupported, and the project has not received an independent security audit.
+This is a research simulator, not an exchange for real funds. Consensus variants and performance changes are experimental. The hosted HotStuff2 mode persists votes and locks for fixed-membership restart; the other launch modes remain session-based. Mixed protocol versions are unsupported, and the project has not received an independent security audit.
 
 Market-making agents can read public exchange data; they do not place orders on those external exchanges. Signed sessions use generated local keys and start with a configured research faucet. Local processes run under the same operating-system user, so they are not isolated from one another's session files.

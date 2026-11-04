@@ -43,7 +43,7 @@ impl<C: Consensus> Node<C> {
                     .collect::<Vec<_>>();
                 json!({
                     "node_id": self.node_id,
-                    "height": self.state.blocks.len(),
+                    "height": self.state.height(),
                     "view": self.consensus.current_view(),
                     "primary": self.consensus.current_primary(),
                     "chain_id": self.signing.as_ref().map(|(manifest, _)| manifest.chain_id.as_str()),
@@ -54,8 +54,7 @@ impl<C: Consensus> Node<C> {
             ExplorerQuery::Block(sequence) => {
                 let Some(block) = self
                     .state
-                    .blocks
-                    .get(sequence as usize)
+                    .block_at(sequence as usize)
                     .filter(|block| block.sequence == sequence)
                 else {
                     return json!({"error": "block not found"});
@@ -68,7 +67,7 @@ impl<C: Consensus> Node<C> {
                     .collect::<Vec<_>>();
                 json!({
                     "node_id": self.node_id,
-                    "height": self.state.blocks.len(),
+                    "height": self.state.height(),
                     "block": self.explorer_block_summary(block),
                     "transactions": transactions,
                 })
@@ -89,7 +88,7 @@ impl<C: Consensus> Node<C> {
                 };
                 json!({
                     "node_id": self.node_id,
-                    "height": self.state.blocks.len(),
+                    "height": self.state.height(),
                     "block": self.explorer_block_summary(block),
                     "transaction": self.explorer_transaction_summary(block.sequence, index, tx),
                     "payload": tx,
@@ -119,8 +118,7 @@ impl<C: Consensus> Node<C> {
     fn explorer_block_summary(&self, block: &Block) -> Value {
         let certificate = self
             .state
-            .certificates
-            .get(block.sequence as usize)
+            .certificate_at(block.sequence as usize)
             .and_then(Option::as_ref);
         let (algorithm, view, votes) = match certificate {
             Some(CommitCertificate::Pbft { view, proofs, .. }) => {

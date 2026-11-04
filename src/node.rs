@@ -20,7 +20,7 @@ use crate::{
     blockchain::{Block, BlockchainState, Digest, Trade, Transaction},
     consensus::{CommitCertificate, Consensus, ConsensusAction, ConsensusEvent},
     exchange::orderbook::OrderBookSnapshot,
-    message::{Message, sign_consensus_line, sign_line, verify_line},
+    message::{Message, sign_consensus_line, sign_line},
     network::{Network, NetworkEvent},
 };
 use ed25519_dalek::SigningKey;
@@ -53,6 +53,8 @@ const SYNC_BATCH_TRANSACTIONS: usize = 2048;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BlockSyncResponse {
+    #[serde(default)]
+    checkpoint: Option<crate::blockchain::checkpoint::Checkpoint>,
     from_sequence: u64,
     chain_height: u64,
     anchor_digest: Option<Digest>,
@@ -146,6 +148,7 @@ pub struct Node<C: Consensus> {
     market_data_quotes: HashMap<(OraclePair, Venue), (VenueQuote, Instant)>,
     read_updates: Option<tokio::sync::broadcast::Sender<Arc<read_api::ReadUpdate>>>,
     published_read: Option<Arc<read_api::ReadSnapshot>>,
+    last_activity: Option<Arc<serde_json::Value>>,
     status_writer: Option<status_worker::StatusWriter>,
     sync_writer: Option<sync_worker::SyncWriter>,
     pending_commit: bool,
@@ -307,7 +310,7 @@ impl<C: Consensus> Node<C> {
         mut consensus: C,
         block_time_ms: u64,
     ) -> Result<Node<C>, std::io::Error> {
-        consensus.restore_from_height(state.blocks.len() as u64);
+        consensus.restore_from_height(state.height() as u64);
         let commit_trace =
             if node_id == 0 && std::env::var("LIGHT_DEX_COMMIT_TRACE").as_deref() == Ok("1") {
                 state
@@ -373,6 +376,7 @@ impl<C: Consensus> Node<C> {
             market_data_quotes: HashMap::new(),
             read_updates: None,
             published_read: None,
+            last_activity: None,
             status_writer: None,
             sync_writer: None,
             pending_commit: false,
@@ -530,6 +534,7 @@ impl<C: Consensus> Node<C> {
         let mut successful = 0u64;
         let projection_started = std::time::Instant::now();
         let mut read_update = read_api::ReadUpdate::new(block, &self.state.exchange_state);
+        let mut activity_outcomes = Vec::with_capacity(block.transactions.len());
         for (tx, result) in block.transactions.iter().zip(outcomes) {
             read_update.observe(tx, &result, &self.state.exchange_state);
             if self.commit_trace.is_some() {
@@ -578,6 +583,15 @@ impl<C: Consensus> Node<C> {
             if let Ok(fills) = &result {
                 self.metrics.trades_committed += fills.len() as u64;
             }
+            let kind = match tx {
+                Transaction::PlaceOrder { .. } => "Spot order",
+                Transaction::PlacePerpOrder { .. } => "Perp order",
+                Transaction::UpdateQuotes { .. } => "Update quotes",
+                Transaction::CancelOrder { .. } => "Cancel order",
+                Transaction::ReduceOrder { .. } => "Reduce order",
+                _ => "Other",
+            };
+            activity_outcomes.push(serde_json::json!({"digest":crate::message::hex_encode(&tx.to_digest()),"block_sequence":block.sequence,"account":tx.account_id(),"nonce":tx.nonce(),"success":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:?}")),"kind":kind}));
             self.recent_transaction_outcomes
                 .push_back(TransactionOutcome {
                     digest: tx
@@ -625,16 +639,23 @@ impl<C: Consensus> Node<C> {
                 committed_at
             );
         }
+        let activity = Arc::new(
+            serde_json::json!({"height":block.sequence+1,"block_sequence":block.sequence,"outcomes":activity_outcomes}),
+        );
+        self.last_activity = Some(activity.clone());
+        read_update.activity = Some(activity);
         self.published_read = None;
         if let Some(updates) = &self.read_updates {
             let _ = updates.send(Arc::new(read_update));
         }
-        println!(
-            "Node {} committed seq {} txs={}",
-            self.node_id,
-            block.sequence,
-            block.transactions.len()
-        );
+        if std::env::var_os("LIGHT_DEX_QUIET").is_none() {
+            println!(
+                "Node {} committed seq {} txs={}",
+                self.node_id,
+                block.sequence,
+                block.transactions.len()
+            );
+        }
         Ok(())
     }
 
@@ -915,6 +936,8 @@ impl<C: Consensus> Node<C> {
         actions: &[ConsensusAction],
         node_tx: &crate::priority::Sender<NodeEvent>,
     ) -> Result<(), std::io::Error> {
+        self.consensus
+            .persist_before_actions(actions, self.state.height() as u64)?;
         let previous = self.consensus.current_primary();
         for action in actions {
             if self.pending_commit {
@@ -989,11 +1012,10 @@ impl<C: Consensus> Node<C> {
         if self.speculative.contains_key(&digest) {
             return Ok(());
         }
-        if (block.sequence as usize) < self.state.blocks.len() {
+        if (block.sequence as usize) < self.state.height() {
             return self
                 .state
-                .blocks
-                .get(block.sequence as usize)
+                .block_at(block.sequence as usize)
                 .filter(|known| known.to_digest() == digest)
                 .map(|_| ())
                 .ok_or_else(|| "conflicting committed block".into());
@@ -1108,7 +1130,7 @@ impl<C: Consensus> Node<C> {
 
     fn retry_pending_fast(&mut self, local_events: &mut VecDeque<NodeEvent>) -> Option<NodeId> {
         let height = self.consensus.next_sequence();
-        let durable_height = self.state.blocks.len() as u64;
+        let durable_height = self.state.height() as u64;
         let mut remaining = VecDeque::new();
         let mut sync_peer = None;
         while let Some((from, message, received)) = self.pending_fast.pop_front() {
@@ -1257,11 +1279,13 @@ impl<C: Consensus> Node<C> {
             );
         }
 
-        println!(
-            "Node {} is primary, mempool={}, trying to produce block",
-            self.node_id,
-            self.state.mempool.len()
-        );
+        if std::env::var_os("LIGHT_DEX_QUIET").is_none() {
+            println!(
+                "Node {} is primary, mempool={}, trying to produce block",
+                self.node_id,
+                self.state.mempool.len()
+            );
+        }
 
         let mut pairs = self
             .feed_urls
@@ -1293,7 +1317,19 @@ impl<C: Consensus> Node<C> {
             })
             .take(32)
             .collect();
-        let block = if self.consensus.is_chained() {
+        let block = if self.state.height() == 0 && !self.consensus.is_chained() {
+            // Independently supervised hosts can become ready in different views.
+            // Every eligible leader must be able to retry the deterministic genesis.
+            Some(if let Some((manifest, _)) = &self.signing {
+                Block::new_initial_block_signed(
+                    &manifest.chain_id,
+                    crate::message::hex_decode(&manifest.initial_state_root)
+                        .expect("validated root"),
+                )
+            } else {
+                Block::new_initial_block()
+            })
+        } else if self.consensus.is_chained() {
             let Some(parent_digest) = self.consensus.speculative_parent() else {
                 return Ok(());
             };
@@ -1322,20 +1358,24 @@ impl<C: Consensus> Node<C> {
             self.state.build_block_with_oracle(oracle_updates)
         };
         let Some(block) = block else {
-            println!(
-                "Node {}: no block built because mempool is empty",
-                self.node_id
-            );
+            if std::env::var_os("LIGHT_DEX_QUIET").is_none() {
+                println!(
+                    "Node {}: no block built because mempool is empty",
+                    self.node_id
+                );
+            }
 
             return Ok(());
         };
 
-        println!(
-            "Node {} proposing block {} with {} txs",
-            self.node_id,
-            block.sequence,
-            block.transactions.len()
-        );
+        if std::env::var_os("LIGHT_DEX_QUIET").is_none() {
+            println!(
+                "Node {} proposing block {} with {} txs",
+                self.node_id,
+                block.sequence,
+                block.transactions.len()
+            );
+        }
         self.trace_block_stage(&block, "proposed");
 
         if self.consensus.is_chained() {

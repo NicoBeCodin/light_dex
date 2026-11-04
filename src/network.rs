@@ -39,6 +39,7 @@ impl PeerLane {
 pub struct Network {
     pub node_id: NodeId,
     pub parent_address: SocketAddr,
+    pub startup_quorum: Option<usize>,
     pub listener: TcpListener,
     pub advertised_address: SocketAddr,
     pub auth_key: [u8; 32],
@@ -494,6 +495,7 @@ impl Network {
         Ok(Network {
             node_id,
             parent_address,
+            startup_quorum: None,
             listener,
             advertised_address,
             auth_key,
@@ -899,7 +901,10 @@ impl Network {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.peers_stream.len() == self.peers_address.len()
+        self.startup_quorum.map_or(
+            self.peers_stream.len() == self.peers_address.len(),
+            |quorum| self.peers_stream.len() + 1 >= quorum,
+        )
     }
 }
 
