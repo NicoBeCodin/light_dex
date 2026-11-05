@@ -7,6 +7,7 @@ import { readFile } from "node:fs/promises";
 // No wallet, faucet claim or validator is touched by this test.
 const source = (await readFile(new URL("./public/app.js", import.meta.url), "utf8"))
   .replace(/^import .*;\n/gm, "")
+  .replaceAll("import.meta.url", JSON.stringify("http://localhost/app.js"))
   .replace(
     /boot\(\);\s*$/,
     `

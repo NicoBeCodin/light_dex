@@ -33,8 +33,11 @@ rather than multiplying upstream subscriptions for every visitor. Caddy terminat
 HTTPS in front of the loopback gateway. Validator transport and read endpoints
 stay on the private host network.
 
-The market picker has search, Spot/Perps/Favorites filters and keyboard navigation.
-It uses the existing catalog without opening extra market subscriptions.
+The anchored market picker has search, Spot/Perps/Favorites filters and keyboard
+navigation. Price snapshots load when it opens and are cached for 15 seconds;
+the selected market remains the only market stream. UI assets use a content hash
+and are uploaded before switching the entry HTML, so cached pages keep a
+consistent set of scripts and styles.
 The selected market loads an HTTP snapshot immediately, then streams changes.
 If the stream stops updating, a five-second snapshot fallback keeps the book
 visible. Reconnecting does not clear order inputs. Market reads start before

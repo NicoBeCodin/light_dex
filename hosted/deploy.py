@@ -4,6 +4,7 @@ Run from a trusted operator computer with the two SSH aliases configured.
 Never resets an existing chain; build release binaries before invoking.
 """
 import argparse, io, json, os, pathlib, shlex, subprocess, tarfile, tomllib
+from frontend import frontend_files
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCAL = ROOT / 'hosted/.local'
 HOSTS = [('tokyo-ls', [0,1], 'Tokyo'), ('ideapad-home', [2,3], 'Home')]
@@ -84,14 +85,16 @@ def main():
           'session/manifest.json':session/'manifest.json','auth.key':session/'auth.key',
         }
         for i in ids:files[f'session/keys/validator-{i}.key']=session/f'keys/validator-{i}.key'
-        for p in (ROOT/'hosted/public').iterdir():
-            if p.is_file():files['public/'+p.name]=p
+        _, frontend = frontend_files(ROOT/'hosted/public')
         buffer=io.BytesIO()
         with tarfile.open(fileobj=buffer,mode='w:gz') as tar:
             for name,p in files.items():
                 info=tar.gettarinfo(str(p),arcname=name);info.mode=0o700 if name.startswith('bin/') else 0o600
                 with p.open('rb') as f:tar.addfile(info,f)
-        ssh(host,f'install -d -m 700 {base}/staging; tar xzf - -C {base}/staging; cp -r {base}/staging/public/. {base}/public/; cp -r {base}/staging/session/. {base}/session/; cp {base}/staging/auth.key {base}/auth.key; for f in {base}/staging/bin/*; do mv -f "$f" {base}/bin/; done',buffer.getvalue())
+            for name, data in frontend.items():
+                info=tarfile.TarInfo(name);info.mode=0o644;info.size=len(data)
+                tar.addfile(info,io.BytesIO(data))
+        ssh(host,f'install -d -m 700 {base}/staging; tar xzf - -C {base}/staging; cp -r {base}/staging/public/assets {base}/public/; cp {base}/staging/public/index.html {base}/public/index.html.next; mv {base}/public/index.html.next {base}/public/index.html; cp -r {base}/staging/session/. {base}/session/; cp {base}/staging/auth.key {base}/auth.key; for f in {base}/staging/bin/*; do mv -f "$f" {base}/bin/; done',buffer.getvalue())
         put(host,base+'/peers.json',json.dumps(peers));put(host,base+'/feeds.json',json.dumps(feeds))
         environment={'LIGHT_DEX_QUIET':'1','LIGHT_DEX_AUTH_KEY':(session/'auth.key').read_text().strip(),'LIGHT_DEX_FAST_CERT_HANDOFF':'1','LIGHT_DEX_CHECKPOINT_INTERVAL':'1000','LIGHT_DEX_JOURNAL_MAX_BYTES':str(256*1024*1024),'LIGHT_DEX_FEED_PORT_BASE':'49000','LIGHT_DEX_REVISION':subprocess.check_output(['git','rev-parse','--short','HEAD'],cwd=ROOT,text=True).strip()+'+hosted'}
         if args.compact_proposals:environment['LIGHT_DEX_COMPACT_PROPOSALS']='1'
@@ -128,6 +131,10 @@ def main():
         Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss://{origin.removeprefix('https://')}; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'"
     }}
     @status path /api/v1/network
+    @document path / /index.html
+    header @document Cache-Control no-cache
+    @assets path /assets/*
+    header @assets Cache-Control "public, max-age=31536000, immutable"
     header @status Access-Control-Allow-Origin https://nicobecodin.github.io
     reverse_proxy 127.0.0.1:1422 {{
         header_up X-Real-IP {{remote_host}}

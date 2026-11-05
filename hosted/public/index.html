@@ -13,7 +13,7 @@
   </head>
   <body>
     <header>
-      <a class="brand" href="/">◈ <strong>LIGHT DEX</strong><span>TEST NETWORK</span></a>
+      <a class="brand" href="/"><strong>LIGHT DEX</strong><span>TEST NETWORK</span></a>
       <nav>
         <button data-page="markets" class="selected">Markets</button
         ><button data-page="network">Network</button><button data-page="explorer">Explorer</button>
@@ -54,14 +54,14 @@
           <div><small>Last trade</small><strong id="last-price">-</strong></div>
           <div><small>Committed mark</small><strong id="mark-price">-</strong></div>
           <div><small>Spread</small><strong id="spread">-</strong></div>
-          <div><small>Successful order TPS · 60s</small><strong id="market-tps">-</strong></div>
-          <div><small>Tokyo gateway p95 · 5m</small><strong id="market-p95">-</strong></div>
+          <div><small>Order TPS · 60s</small><strong id="market-tps">-</strong></div>
+          <div><small>Commit p95 · 5m</small><strong id="market-p95">-</strong></div>
         </div>
         <div class="trading-grid">
           <section class="panel chart-panel">
             <div class="panel-heading">
-              <h2>Market activity</h2>
-              <span>5 minutes · Committed trades</span>
+              <h2>Price</h2>
+              <span>5 minutes · Executed trades</span>
             </div>
             <div id="chart" class="chart"><p class="empty">Loading market data</p></div>
             <div class="chart-footer">
@@ -207,24 +207,31 @@
       ><span id="revision"></span>
     </footer>
     <dialog id="market-picker" aria-labelledby="market-picker-title">
-      <div class="panel-heading">
-        <h2 id="market-picker-title">Markets</h2>
-        <button data-dismiss="market-picker" aria-label="Close market picker">×</button>
+      <h2 id="market-picker-title" class="sr-only">Markets</h2>
+      <div class="market-search-bar">
+        <span class="search-symbol" aria-hidden="true"></span
+        ><input
+          id="market-search"
+          type="search"
+          placeholder="Search markets"
+          aria-label="Search markets"
+          autocomplete="off"
+        /><button data-dismiss="market-picker" aria-label="Close market picker">×</button>
       </div>
-      <input
-        id="market-search"
-        type="search"
-        placeholder="Search BTC, ETH, SOL"
-        aria-label="Search markets"
-        autocomplete="off"
-      />
-      <div class="tabs market-filters">
-        <button data-market-filter="all" class="selected">All</button
-        ><button data-market-filter="perp">Perps</button
-        ><button data-market-filter="spot">Spot</button
-        ><button data-market-filter="favorites">Favorites</button>
+      <div class="tabs market-filters" aria-label="Filter markets">
+        <button data-market-filter="all" class="selected" aria-pressed="true">All</button
+        ><button data-market-filter="perp" aria-pressed="false">Perps</button
+        ><button data-market-filter="spot" aria-pressed="false">Spot</button
+        ><button data-market-filter="favorites" aria-pressed="false">Favorites</button>
       </div>
-      <div id="market-results"></div>
+      <div class="market-table-head">
+        <span>Market</span><span>Last price</span><span>Max lev.</span>
+      </div>
+      <div id="market-results" role="list"></div>
+      <div class="market-picker-footer">
+        <span><kbd>↑ ↓</kbd> Navigate <kbd>↵</kbd> Select <kbd>esc</kbd> Close</span
+        ><span id="market-prices-status">Snapshot prices</span>
+      </div>
     </dialog>
     <dialog id="wallet-dialog">
       <h2>Your demo wallet</h2>

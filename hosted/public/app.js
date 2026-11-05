@@ -1,6 +1,7 @@
 import { sizeFromMargin, closeOrder, decimalInput } from "./trade-math.mjs";
 import { transactionNotice } from "./notifications.mjs";
 import { subscribeMarket } from "./market-feed.mjs";
+import { createMarketPicker } from "./market-picker.mjs";
 
 const $ = (id) => document.getElementById(id),
   esc = (s) =>
@@ -28,7 +29,7 @@ let meta,
   lastDigest,
   closeMarketId,
   leverage = 1,
-  marketFilter = "all";
+  marketPicker;
 const charts = new Map(),
   transactions = [];
 function pendingKey() {
@@ -63,49 +64,6 @@ function name(m) {
 }
 function selected() {
   return meta.markets.find((m) => m.id === marketId);
-}
-function marketFavorites() {
-  try {
-    return new Set(JSON.parse(localStorage.getItem("ldex-market-favorites") || "[]"));
-  } catch {
-    return new Set();
-  }
-}
-function marketIcon(m) {
-  const symbol = symbols[m.config.base_asset];
-  return `<span class="asset-icon asset-${esc(symbol?.toLowerCase())}">${esc({ BTC: "₿", ETH: "Ξ", SOL: "◎" }[symbol] || symbol?.[0])}</span>`;
-}
-function updateMarketButton() {
-  const m = selected();
-  $("market-select").innerHTML =
-    `${marketIcon(m)}<span>${esc(name(m))}</span><span class="muted">⌄</span>`;
-  $("market-select").setAttribute("aria-label", `Choose market, ${name(m)}`);
-  $("market-select").disabled = false;
-}
-function renderMarketPicker() {
-  const favorites = marketFavorites();
-  const search = $("market-search").value.trim().toLowerCase();
-  const rows = meta.markets.filter(
-    (m) =>
-      name(m).toLowerCase().includes(search) &&
-      (marketFilter === "all" ||
-        (marketFilter === "favorites" && favorites.has(m.id)) ||
-        m.config.market_type.kind === marketFilter),
-  );
-  $("market-results").innerHTML =
-    rows
-      .map((m) => {
-        const perp = m.config.market_type.kind === "perp";
-        const favorite = favorites.has(m.id);
-        return `<div class="market-row ${m.id === marketId ? "current" : ""}"><button data-select-market="${m.id}" ${m.id === marketId ? 'aria-current="true"' : ""}>${marketIcon(m)}<span><strong>${esc(name(m))}</strong><small>${perp ? "Perpetual" : "Spot"}</small></span><span class="market-leverage">${perp ? `${m.config.market_type.max_leverage}×` : "Spot"}</span></button><button class="market-star ${favorite ? "favorite" : ""}" data-favorite-market="${m.id}" aria-pressed="${favorite}" aria-label="${favorite ? "Remove" : "Add"} ${esc(name(m))} ${favorite ? "from" : "to"} favorites">${favorite ? "★" : "☆"}</button></div>`;
-      })
-      .join("") || '<p class="empty">No matching markets</p>';
-}
-function openMarketPicker() {
-  $("market-search").value = "";
-  renderMarketPicker();
-  $("market-picker").showModal();
-  $("market-search").focus();
 }
 function atoms(text, unit) {
   if (!/^\d+(\.\d+)?$/.test(text)) throw Error("Enter a positive decimal number");
@@ -406,6 +364,7 @@ async function watchMarket() {
     onData(value) {
       if (marketId !== id) return;
       market = value;
+      marketPicker?.observeSnapshot(value);
       renderMarket();
     },
     onStatus(state) {
@@ -521,21 +480,40 @@ function drawChart() {
     $("chart").textContent = "Waiting for committed trades";
     return;
   }
-  const w = 800,
-    h = 350,
-    min = Math.min(...points.map((p) => p.price)),
-    max = Math.max(...points.map((p) => p.price)),
-    range = Math.max(max - min, selected().config.price.step),
+  const min = Math.min(...points.map((p) => p.price));
+  const max = Math.max(...points.map((p) => p.price));
+  const tick = selected().config.price.step;
+  const low = min === max ? Math.max(0, min - tick) : min;
+  const high = min === max ? max + tick : max;
+  const range = Math.max(high - low, tick),
     start = Date.now() - 300000;
-  const coords = points
-    .map(
-      (p) =>
-        `${30 + Math.max(0, (p.at - start) / 300000) * 740},${300 - ((p.price - min) / range) * 250}`,
-    )
-    .join(" ");
+  const width = Math.max(340, $("chart").clientWidth),
+    height = Math.max(240, $("chart").clientHeight);
+  const left = 14,
+    right = width - 88,
+    bottom = height - 38,
+    top = 22;
+  const x = (at) => left + Math.min(1, Math.max(0, (at - start) / 300000)) * (right - left);
+  const y = (value) => bottom - ((value - low) / range) * (bottom - top);
+  const coords = points.map((p) => `${x(p.at)},${y(p.price)}`).join(" ");
   const last = points.at(-1);
+  const time = (at) =>
+    new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  const grid = [0, 1, 2, 3, 4]
+    .map((i) => {
+      const py = top + (i * (bottom - top)) / 4,
+        value = high - (range * i) / 4;
+      return `<line x1="${left}" x2="${right}" y1="${py}" y2="${py}" stroke="#24292f" stroke-width=".6"/><text x="${right + 12}" y="${py + 3}" fill="#858e9a" font-size="11">${price(Math.round(value / tick) * tick)}</text>`;
+    })
+    .join("");
+  const times = [0, 1, 2, 3, 4, 5]
+    .map(
+      (i) =>
+        `<text x="${left + (i * (right - left)) / 5}" y="${height - 13}" text-anchor="${i === 0 ? "start" : i === 5 ? "end" : "middle"}" fill="#858e9a" font-size="11">${time(start + i * 60000)}</text>`,
+    )
+    .join("");
   $("chart").innerHTML =
-    `<svg viewBox="0 0 ${w} ${h}" role="img" aria-label="Committed execution prices over the last five minutes"><defs><linearGradient id="area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#72e3bd" stop-opacity=".2"/><stop offset="1" stop-color="#72e3bd" stop-opacity="0"/></linearGradient></defs>${[60, 140, 220, 300].map((y) => `<line x1="30" x2="770" y1="${y}" y2="${y}" stroke="#202934"/>`).join("")}<polygon points="30,320 ${coords} 770,320" fill="url(#area)"/><polyline points="${coords}" fill="none" stroke="#72e3bd" stroke-width="2"/><text x="35" y="30" fill="#8995a5" font-size="13">$${price(max)}</text><text x="35" y="335" fill="#8995a5" font-size="13">$${price(min)}</text></svg>`;
+    `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Committed execution prices over the last five minutes">${grid}<polygon points="${x(points[0].at)},${bottom} ${coords} ${x(last.at)},${bottom}" fill="#54d5b0" fill-opacity=".045"/><polyline points="${coords}" fill="none" stroke="#54d5b0" stroke-width="1.2" vector-effect="non-scaling-stroke"/><line x1="${left}" x2="${right + 6}" y1="${y(last.price)}" y2="${y(last.price)}" stroke="#54d5b0" stroke-width=".6" stroke-dasharray="3 3" opacity=".55"/><rect x="${right + 6}" y="${y(last.price) - 8}" width="78" height="16" rx="2" fill="#23584b"/><text x="${right + 10}" y="${y(last.price) + 3}" fill="#b0eedb" font-size="11">${price(last.price)}</text>${times}</svg>`;
   $("chart-range").textContent = `${points.length} fills · Last $${price(last.price)}`;
 }
 function table(head, rows, empty) {
@@ -583,6 +561,7 @@ function renderRisk() {
     : '<div class="risk-title"><strong>Perp collateral</strong><span>$0.00</span></div>';
 }
 function renderAccount() {
+  $("onboarding").hidden = !!account;
   syncPending();
   renderRisk();
   if (!wallet) {
@@ -661,7 +640,8 @@ async function networkRefresh() {
     $("network-state").textContent = `${n.status || "Connecting"} · Tokyo entry`;
     $("live-dot").style.background = n.status === "online" ? "#72e3bd" : "#dca85d";
     $("market-tps").textContent = n.successful_order_tps?.toFixed(1) || "-";
-    $("market-p95").textContent = ms(n.gateway_commit_p95_ms);
+    $("market-p95").textContent =
+      n.gateway_commit_p95_ms == null ? "-" : ms(n.gateway_commit_p95_ms);
     const metrics = [
       ["Successful order TPS · 60s", n.successful_order_tps?.toFixed(1)],
       ["Tokyo gateway p95 · 5m", ms(n.gateway_commit_p95_ms)],
@@ -865,38 +845,6 @@ $("wallet-file").onchange = action(async (event) => {
   $("wallet-dialog").close();
 });
 $("claim-assets").onclick = action(() => send("ClaimAirdrop", { account_id: wallet.address }));
-$("market-select").onclick = openMarketPicker;
-$("market-search").oninput = renderMarketPicker;
-$("market-picker").addEventListener("click", (event) => {
-  if (event.target === $("market-picker")) $("market-picker").close();
-});
-document.addEventListener("keydown", (event) => {
-  if (
-    event.key === "/" &&
-    !event.target.closest("input, textarea, select, [contenteditable]") &&
-    !document.querySelector("dialog[open]")
-  ) {
-    event.preventDefault();
-    openMarketPicker();
-  }
-  if (["ArrowDown", "ArrowUp"].includes(event.key) && $("market-picker").open) {
-    const rows = [...document.querySelectorAll("[data-select-market]")];
-    if (!rows.length) return;
-    const index = rows.indexOf(document.activeElement);
-    event.preventDefault();
-    rows[
-      index < 0
-        ? event.key === "ArrowDown"
-          ? 0
-          : rows.length - 1
-        : (index + (event.key === "ArrowDown" ? 1 : -1) + rows.length) % rows.length
-    ].focus();
-  }
-  if (event.key === "Enter" && event.target === $("market-search") && $("market-picker").open) {
-    event.preventDefault();
-    document.querySelector("[data-select-market]")?.click();
-  }
-});
 $("refresh-market").onclick = () => {
   void marketFeed?.refresh();
 };
@@ -957,32 +905,6 @@ document.addEventListener("click", async (e) => {
   try {
     const b = e.target.closest("button");
     if (!b) return;
-    if (b.dataset.marketFilter) {
-      marketFilter = b.dataset.marketFilter;
-      document
-        .querySelectorAll("[data-market-filter]")
-        .forEach((x) => x.classList.toggle("selected", x === b));
-      renderMarketPicker();
-    }
-    if (b.dataset.favoriteMarket !== undefined) {
-      const id = Number(b.dataset.favoriteMarket),
-        favorites = marketFavorites();
-      if (favorites.has(id)) favorites.delete(id);
-      else favorites.add(id);
-      try {
-        localStorage.setItem("ldex-market-favorites", JSON.stringify([...favorites]));
-      } catch {}
-      renderMarketPicker();
-    }
-    if (b.dataset.selectMarket !== undefined) {
-      const id = Number(b.dataset.selectMarket);
-      $("market-picker").close();
-      if (id !== marketId) {
-        marketId = id;
-        updateMarketButton();
-        await watchMarket();
-      }
-    }
     if (b.dataset.dismiss) $(b.dataset.dismiss).close();
     if (b.dataset.closePosition !== undefined) {
       closeMarketId = Number(b.dataset.closePosition);
@@ -1029,7 +951,19 @@ async function boot() {
   try {
     meta = await api("meta");
     $("revision").textContent = `${meta.revision.slice(0, 8)} · Protocol ${meta.protocol}`;
-    updateMarketButton();
+    marketPicker = createMarketPicker({
+      markets: meta.markets,
+      getSelected: () => marketId,
+      label: name,
+      price,
+      read: (id) => api(`rpc/markets/${id}`, { signal: AbortSignal.timeout(8000) }),
+      async select(id) {
+        if (id !== marketId) {
+          marketId = id;
+          await watchMarket();
+        }
+      },
+    });
     await watchMarket();
     await networkRefresh();
     setInterval(networkRefresh, 1000);
@@ -1037,7 +971,9 @@ async function boot() {
       if (page === "explorer") explorerRefresh();
     }, 3000);
     try {
-      const result = await WebAssembly.instantiateStreaming(fetch("/codec.wasm"));
+      const result = await WebAssembly.instantiateStreaming(
+        fetch(new URL("./codec.wasm", import.meta.url)),
+      );
       wasm = result.instance.exports;
       wallet = await loadWallet();
       await walletChanged();
