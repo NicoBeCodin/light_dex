@@ -64,6 +64,45 @@ pub fn create_session_with_mode(
     auto_view_change_blocks: Option<u64>,
     chained_hotstuff: bool,
 ) -> io::Result<SessionManifest> {
+    create_session_inner(
+        path,
+        consensus,
+        nodes,
+        terms,
+        auto_view_change_blocks,
+        chained_hotstuff,
+        None,
+    )
+}
+
+pub fn create_session_with_market_ids(
+    path: &Path,
+    consensus: &str,
+    nodes: u64,
+    terms: FaucetTerms,
+    auto_view_change_blocks: Option<u64>,
+    market_ids: Vec<u64>,
+) -> io::Result<SessionManifest> {
+    create_session_inner(
+        path,
+        consensus,
+        nodes,
+        terms,
+        auto_view_change_blocks,
+        consensus == "hotstuff",
+        Some(market_ids),
+    )
+}
+
+fn create_session_inner(
+    path: &Path,
+    consensus: &str,
+    nodes: u64,
+    terms: FaucetTerms,
+    auto_view_change_blocks: Option<u64>,
+    chained_hotstuff: bool,
+    market_ids: Option<Vec<u64>>,
+) -> io::Result<SessionManifest> {
     if nodes == 0 || nodes > 1_000 {
         return Err(invalid("invalid validator count"));
     }
@@ -87,6 +126,7 @@ pub fn create_session_with_mode(
         consensus: consensus.into(),
         chained_hotstuff,
         initial_state_root: String::new(),
+        market_ids,
         validators: BTreeMap::new(),
         accounts: BTreeSet::new(),
         faucet: FaucetConfig {
@@ -107,7 +147,8 @@ pub fn create_session_with_mode(
     }
     let wallet = BTreeMap::<u64, Address>::new();
     manifest.initial_state_root = hex_encode(
-        &ExchangeState::with_claim_faucet(manifest.faucet)
+        &manifest
+            .initial_exchange()
             .map_err(io::Error::other)?
             .state_digest(),
     );

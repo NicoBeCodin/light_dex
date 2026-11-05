@@ -361,11 +361,40 @@ impl ExchangeState {
     }
 
     pub fn with_claim_faucet(faucet: FaucetConfig) -> Result<Self, String> {
+        Self::with_claim_faucet_market_ids(faucet, None)
+    }
+
+    /// Session-selected subset of the compiled TOML catalog, committed by genesis.
+    pub fn with_claim_faucet_market_ids(
+        faucet: FaucetConfig,
+        market_ids: Option<&[MarketId]>,
+    ) -> Result<Self, String> {
         faucet.validate()?;
+        let catalog = catalog::genesis_markets()?;
+        if let Some(ids) = market_ids {
+            let unique = ids
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            if !unique.contains(&0)
+                || unique.len() != ids.len()
+                || ids
+                    .iter()
+                    .any(|id| !catalog.iter().any(|(known, _)| known == id))
+            {
+                return Err(
+                    "market selection must contain market 0, without duplicates or unknown IDs"
+                        .into(),
+                );
+            }
+        }
         let mut state = Self::empty();
         state.markets.clear();
         state.order_books.clear();
-        for (id, config) in catalog::genesis_markets()? {
+        for (id, config) in catalog {
+            if market_ids.is_some_and(|ids| !ids.contains(&id)) {
+                continue;
+            }
             state
                 .register_market(id, config)
                 .map_err(|error| format!("invalid genesis market: {error:?}"))?;

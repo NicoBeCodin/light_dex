@@ -51,6 +51,12 @@ pub struct Config {
     pub writes_enabled: bool,
     #[serde(default = "default_public_backlog")]
     pub max_public_backlog: u64,
+    /// Extra maker/taker wallet pairs per market; the fleet keeps its 20/s cap.
+    #[serde(default = "default_extra_agent_pairs")]
+    pub extra_agent_pairs_per_market: u8,
+}
+fn default_extra_agent_pairs() -> u8 {
+    1
 }
 fn default_public_backlog() -> u64 {
     128
@@ -237,7 +243,9 @@ async fn cached(app: &App, path: &str) -> Result<Value, Failure> {
     Ok(value)
 }
 async fn metadata(State(app): State<Shared>) -> Json<Value> {
-    let mut markets = light_dex::exchange::ExchangeState::with_claim_faucet(app.manifest.faucet)
+    let mut markets = app
+        .manifest
+        .initial_exchange()
         .unwrap()
         .markets()
         .iter()
@@ -249,7 +257,9 @@ async fn metadata(State(app): State<Shared>) -> Json<Value> {
     )
 }
 async fn network(State(app): State<Shared>) -> Json<Value> {
-    Json(app.network.read().await.clone())
+    let mut value = app.network.read().await.clone();
+    value["chain_id"] = json!(app.manifest.chain_id);
+    Json(value)
 }
 async fn rpc(
     State(app): State<Shared>,
@@ -415,7 +425,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             args.get(2)
                 .ok_or("usage: light-dex-hosted init DIRECTORY")?,
         );
-        let manifest = light_dex::crypto::create_session_with_options(
+        let manifest = light_dex::crypto::create_session_with_market_ids(
             &path,
             "hotstuff2",
             4,
@@ -425,6 +435,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 btc_per_claim: 10 * 10000,
             },
             Some(4),
+            vec![0, 1, 2, 3, 8, 9],
         )?;
         let secret = hex_encode(&rand::random::<[u8; 32]>());
         let mut options = std::fs::OpenOptions::new();

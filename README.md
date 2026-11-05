@@ -6,7 +6,7 @@ The question driving this project is how exchange execution, consensus, networki
 
 ## Try it
 
-[Open the live demo](https://light-dex.13.230.102.125.sslip.io). It uses test assets, four validators on two hosts, and one operator. The [hosting guide](hosted/README.md) explains persistence and deployment.
+[Open the live demo](https://light-dex.13.230.102.125.sslip.io). BTC, ETH and SOL spot/perps, test assets, four validators on two hosts, and one operator. The [hosting guide](hosted/README.md) explains persistence and deployment.
 
 Install Rust and Node.js, then run:
 

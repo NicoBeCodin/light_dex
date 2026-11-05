@@ -3,7 +3,7 @@
 Run from a trusted operator computer with the two SSH aliases configured.
 Never resets an existing chain; build release binaries before invoking.
 """
-import argparse, io, json, os, pathlib, shlex, subprocess, tarfile
+import argparse, io, json, os, pathlib, shlex, subprocess, tarfile, tomllib
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCAL = ROOT / 'hosted/.local'
 HOSTS = [('tokyo-ls', [0,1], 'Tokyo'), ('ideapad-home', [2,3], 'Home')]
@@ -66,7 +66,12 @@ def main():
     peers={str(i):f'{fact["ip"]}:{47000+i}' for fact in facts.values() for i in fact['ids']}
     nodes=[{'id':i,'region':fact['region'],'peer':peers[str(i)],'read':f'http://{("127.0.0.1" if i<2 else fact["ip"])}:{48000+i}'} for fact in facts.values() for i in fact['ids']]
     feeds=[]
+    manifest=json.loads((session/'manifest.json').read_text())
+    selected=manifest.get('market_ids')
+    catalog=tomllib.loads((ROOT/'config/markets.toml').read_text())['markets']
+    assets={market['base_asset'] for market in catalog if selected is None or market['id'] in selected}
     for base,symbol in [(1,'BTC'),(2,'ETH'),(4,'BNB'),(5,'XRP'),(3,'SOL')]:
+        if base not in assets:continue
         for venue,pair,url in [('binance',symbol+'USDT',f'wss://data-stream.binance.vision/ws/{symbol.lower()}usdt@bookTicker'),('okx',symbol+'-USDT','wss://wseea.okx.com/ws/v5/public'),('coinbase',symbol+'-USD','wss://ws-feed.exchange.coinbase.com')]:
             if symbol=='BNB' and venue=='coinbase':continue
             feeds.append({'base_asset':base,'venue':venue,'symbol':pair,'upstream_url':url})
@@ -101,7 +106,7 @@ def main():
             content=unit(f'Light DEX validator {i}',base,shlex.join(argv),'384M').replace('EnvironmentFile='+base+'/runtime.env','EnvironmentFile='+base+'/runtime.env\nEnvironmentFile='+nodeenv)
             put(host,service_dir+f'/light-dex-validator-{i}.service',content);services.append(f'light-dex-validator-{i}')
         if host=='tokyo-ls':
-            config={'manifest':base+'/session/manifest.json','auth_key_file':base+'/auth.key','database':base+'/public.sqlite','frontend_dir':base+'/public','public_origin':origin,'nodes':nodes,'writes_enabled':args.enable_writes}
+            config={'manifest':base+'/session/manifest.json','auth_key_file':base+'/auth.key','database':base+'/public.sqlite','frontend_dir':base+'/public','public_origin':origin,'nodes':nodes,'writes_enabled':args.enable_writes,'extra_agent_pairs_per_market':1}
             put(host,base+'/gateway.json',json.dumps(config))
             for name,cmd,mem in [('gateway',base+'/bin/light-dex-hosted '+base+'/gateway.json','256M'),('liquidity',base+'/bin/light-dex-hosted '+base+'/gateway.json bots','192M')]:
                 put(host,service_dir+f'/light-dex-{name}.service',unit('Light DEX '+name,base,cmd,mem));services.append('light-dex-'+name)

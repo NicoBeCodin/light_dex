@@ -39,9 +39,18 @@
         </div>
       </section>
       <div id="message" role="status" aria-live="polite"></div>
+      <button id="reload-network" hidden>Reconnect to new testnet</button>
       <section id="page-markets">
         <div class="market-banner">
-          <label>Market<select id="market-select" aria-label="Market"></select></label>
+          <button
+            id="market-select"
+            class="market-select"
+            aria-haspopup="dialog"
+            aria-controls="market-picker"
+            disabled
+          >
+            Choose market <span>⌄</span>
+          </button>
           <div><small>Last trade</small><strong id="last-price">-</strong></div>
           <div><small>Committed mark</small><strong id="mark-price">-</strong></div>
           <div><small>Spread</small><strong id="spread">-</strong></div>
@@ -54,10 +63,12 @@
               <h2>Market activity</h2>
               <span>5 minutes · Committed trades</span>
             </div>
-            <div id="chart" class="chart"></div>
+            <div id="chart" class="chart"><p class="empty">Loading market data</p></div>
             <div class="chart-footer">
-              <span id="chart-range">Waiting for trades</span
+              <span id="chart-range">Loading market</span
               ><span id="source-label">Source validator: - · via Tokyo</span>
+              <span id="market-feed-state" role="status">Connecting</span
+              ><button id="refresh-market" hidden>Retry market data</button>
             </div>
           </section>
           <section class="panel book-panel">
@@ -65,7 +76,7 @@
               <button data-book="book" class="selected">Order book</button
               ><button data-book="trades">Recent trades</button>
             </div>
-            <div id="book-content"></div>
+            <div id="book-content"><p class="empty">Loading order book</p></div>
           </section>
           <section class="panel order-panel">
             <div class="panel-heading">
@@ -195,6 +206,26 @@
       ><a href="https://nicobecodin.github.io/" target="_blank" rel="noreferrer">Build logs ↗</a
       ><span id="revision"></span>
     </footer>
+    <dialog id="market-picker" aria-labelledby="market-picker-title">
+      <div class="panel-heading">
+        <h2 id="market-picker-title">Markets</h2>
+        <button data-dismiss="market-picker" aria-label="Close market picker">×</button>
+      </div>
+      <input
+        id="market-search"
+        type="search"
+        placeholder="Search BTC, ETH, SOL"
+        aria-label="Search markets"
+        autocomplete="off"
+      />
+      <div class="tabs market-filters">
+        <button data-market-filter="all" class="selected">All</button
+        ><button data-market-filter="perp">Perps</button
+        ><button data-market-filter="spot">Spot</button
+        ><button data-market-filter="favorites">Favorites</button>
+      </div>
+      <div id="market-results"></div>
+    </dialog>
     <dialog id="wallet-dialog">
       <h2>Your demo wallet</h2>
       <p>Key stored in this browser. Export a backup to keep it.</p>

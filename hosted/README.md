@@ -5,6 +5,10 @@ plane remains a separate application. No operator command is routed here.
 
 The hosted configuration uses four fixed HotStuff2 validators, two on each host,
 with a three-vote quorum and leader rotation every four blocks.
+New hosted sessions select BTC, ETH and SOL spot/perpetual markets (IDs
+0, 1, 2, 3, 8 and 9). The selection is saved in the session manifest and bound
+by its genesis state root. The full research catalog remains in
+`config/markets.toml`; older manifests without a selection retain that catalog.
 Hosted validators use full proposals with certificate-backed handoff. Compact
 proposals remain opt-in through `deploy.py --compact-proposals`: the current
 compact-body recovery path had worse tail latency in the hosted load tests. All votes have
@@ -28,6 +32,13 @@ history, signed submissions and receipt lookup. Read streams share a short cache
 rather than multiplying upstream subscriptions for every visitor. Caddy terminates
 HTTPS in front of the loopback gateway. Validator transport and read endpoints
 stay on the private host network.
+
+The market picker has search, Spot/Perps/Favorites filters and keyboard navigation.
+It uses the existing catalog without opening extra market subscriptions.
+The selected market loads an HTTP snapshot immediately, then streams changes.
+If the stream stops updating, a five-second snapshot fallback keeps the book
+visible. Reconnecting does not clear order inputs. Market reads start before
+wallet storage or signing initialization, so a wallet error does not hide books.
 
 Positions can be closed with a reduce-only IOC and a selected slippage bound;
 unfilled quantity remains open. The leverage control sizes a new order from a
@@ -71,6 +82,8 @@ Both machines need an authenticated private network, user systemd with lingering
 and compatible Linux binaries. Only the public ingress host needs Caddy and
 ports 80/443. Keep personal endpoints out of tracked configuration.
 
+The installer requires Python 3.11 or newer.
+
 From the repository root:
 
 ```sh
@@ -98,7 +111,11 @@ journalctl --user -u light-dex-validator-0 --since '-10 minutes'
 systemctl --user restart light-dex-validator-0
 ```
 
-Use those commands on the appropriate host. The fleet has a maximum of 20
+Use those commands on the appropriate host. The six-market fleet has 33 wallets:
+three makers and two takers per market, plus one keeper per perpetual market.
+`extra_agent_pairs_per_market` adds maker/taker pairs (default one, maximum two)
+without replacing existing keys. Quote widths vary so price priority is not
+permanently assigned to one maker. The fleet has a maximum of 20
 submission attempts per second, cancels stale oracle quotes, and persists its
 pending signed intentions so restarts retry the same transaction and nonce.
 

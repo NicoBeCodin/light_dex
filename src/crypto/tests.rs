@@ -5,6 +5,32 @@ use crate::{
 };
 use std::sync::Arc;
 
+#[test]
+fn selected_markets_are_bound_by_genesis_and_survive_manifest_reload() {
+    let path =
+        std::env::temp_dir().join(format!("ldex-market-selection-{}", rand::random::<u64>()));
+    let manifest = create_session_with_market_ids(
+        &path,
+        "hotstuff2",
+        4,
+        FaucetTerms::default(),
+        Some(4),
+        vec![0, 1, 2, 3, 8, 9],
+    )
+    .unwrap();
+    let loaded = SessionManifest::load(&path.join("manifest.json")).unwrap();
+    assert_eq!(loaded.chain_id, manifest.chain_id);
+    assert_eq!(loaded.initial_exchange().unwrap().markets().len(), 6);
+    let mut changed = loaded.clone();
+    changed.market_ids = Some(vec![0, 1]);
+    assert!(changed.validate().is_err());
+    changed.market_ids = None;
+    assert!(changed.validate().is_err());
+    assert!(ExchangeState::with_claim_faucet_market_ids(manifest.faucet, Some(&[0, 0])).is_err());
+    assert!(ExchangeState::with_claim_faucet_market_ids(manifest.faucet, Some(&[0, 999])).is_err());
+    fs::remove_dir_all(path).unwrap();
+}
+
 fn session() -> (std::path::PathBuf, SessionManifest) {
     let path = std::env::temp_dir().join(format!(
         "light-dex-signature-test-{}",

@@ -64,7 +64,10 @@ async function send(kind, fields) {
 }
 await send("ClaimAirdrop", {});
 let account = await get("rpc/accounts/" + address);
-if (account.nonce !== 1 || account.balances.length < 6) throw Error("Faucet balances missing");
+const assetCount = new Set(meta.markets.flatMap((m) => [m.config.base_asset, m.config.quote_asset]))
+  .size;
+if (account.nonce !== 1 || account.balances.length < assetCount)
+  throw Error("Faucet balances missing");
 const market = await get("rpc/markets/0");
 const mark = Number(market.committed_mark_e8) / 1e8;
 const bid = Math.floor(mark * 0.9 * 10);

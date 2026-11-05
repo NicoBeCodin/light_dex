@@ -38,8 +38,8 @@ mod signatures;
 use encoding::{encode_value, invalid, signing_bytes, verify};
 pub use manifest::{FaucetTerms, SessionManifest};
 pub use session::{
-    create_session, create_session_with_faucet, create_session_with_mode,
-    create_session_with_options, new_key, read_secret, write_secret,
+    create_session, create_session_with_faucet, create_session_with_market_ids,
+    create_session_with_mode, create_session_with_options, new_key, read_secret, write_secret,
 };
 pub use signatures::{
     PeerHandshake, SignedConsensusMessage, SignedTransaction, random_nonce, sign_consensus,

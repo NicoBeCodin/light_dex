@@ -1,7 +1,7 @@
 //! Opt-in process regression for fixed-peer startup and same-identity restart.
 use light_dex::{
     blockchain::BlockchainState,
-    crypto::{FaucetTerms, SessionManifest, create_session_with_options},
+    crypto::{FaucetTerms, SessionManifest, create_session_with_market_ids},
 };
 use std::{
     fs,
@@ -138,12 +138,13 @@ fn fixed_peer_validator_restarts_without_creating_a_new_chain() {
     .unwrap();
     drop(listeners);
     let manifest = Arc::new(
-        create_session_with_options(
+        create_session_with_market_ids(
             &directory.join("session"),
             "hotstuff2",
             4,
             FaucetTerms::default(),
             Some(4),
+            vec![0, 1, 2, 3, 8, 9],
         )
         .unwrap(),
     );

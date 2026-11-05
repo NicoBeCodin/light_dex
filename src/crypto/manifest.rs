@@ -25,6 +25,10 @@ pub struct SessionManifest {
     /// Selects the chained protocol; included in the signed session identity.
     pub chained_hotstuff: bool,
     pub initial_state_root: String,
+    /// None preserves the original full catalog. A selection is authenticated
+    /// through its genesis market leaves in `initial_state_root`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_ids: Option<Vec<u64>>,
     pub validators: BTreeMap<u64, String>,
     pub accounts: BTreeSet<Address>,
     pub faucet: FaucetConfig,
@@ -33,6 +37,9 @@ pub struct SessionManifest {
 }
 
 impl SessionManifest {
+    pub fn initial_exchange(&self) -> Result<ExchangeState, String> {
+        ExchangeState::with_claim_faucet_market_ids(self.faucet, self.market_ids.as_deref())
+    }
     pub fn chain_id_bytes(&self) -> io::Result<[u8; 32]> {
         hex_decode(&self.chain_id)
     }
@@ -72,6 +79,17 @@ impl SessionManifest {
             return Err(invalid("invalid session manifest"));
         }
         self.faucet.validate().map_err(io::Error::other)?;
+        if hex_encode(
+            &self
+                .initial_exchange()
+                .map_err(io::Error::other)?
+                .state_digest(),
+        ) != self.initial_state_root
+        {
+            return Err(invalid(
+                "session market selection differs from genesis root",
+            ));
+        }
         if self.auto_view_change_blocks == Some(0) {
             return Err(invalid("automatic view-change interval must be positive"));
         }

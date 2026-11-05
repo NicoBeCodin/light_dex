@@ -1,5 +1,6 @@
 import { sizeFromMargin, closeOrder, decimalInput } from "./trade-math.mjs";
 import { transactionNotice } from "./notifications.mjs";
+import { subscribeMarket } from "./market-feed.mjs";
 
 const $ = (id) => document.getElementById(id),
   esc = (s) =>
@@ -20,13 +21,14 @@ let meta,
   accountTab = "orders",
   bookTab = "book",
   page = "markets",
-  marketSocket,
+  marketFeed,
   accountSocket,
   busy = false,
   nextNonce = 0,
   lastDigest,
   closeMarketId,
-  leverage = 1;
+  leverage = 1,
+  marketFilter = "all";
 const charts = new Map(),
   transactions = [];
 function pendingKey() {
@@ -61,6 +63,49 @@ function name(m) {
 }
 function selected() {
   return meta.markets.find((m) => m.id === marketId);
+}
+function marketFavorites() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem("ldex-market-favorites") || "[]"));
+  } catch {
+    return new Set();
+  }
+}
+function marketIcon(m) {
+  const symbol = symbols[m.config.base_asset];
+  return `<span class="asset-icon asset-${esc(symbol?.toLowerCase())}">${esc({ BTC: "₿", ETH: "Ξ", SOL: "◎" }[symbol] || symbol?.[0])}</span>`;
+}
+function updateMarketButton() {
+  const m = selected();
+  $("market-select").innerHTML =
+    `${marketIcon(m)}<span>${esc(name(m))}</span><span class="muted">⌄</span>`;
+  $("market-select").setAttribute("aria-label", `Choose market, ${name(m)}`);
+  $("market-select").disabled = false;
+}
+function renderMarketPicker() {
+  const favorites = marketFavorites();
+  const search = $("market-search").value.trim().toLowerCase();
+  const rows = meta.markets.filter(
+    (m) =>
+      name(m).toLowerCase().includes(search) &&
+      (marketFilter === "all" ||
+        (marketFilter === "favorites" && favorites.has(m.id)) ||
+        m.config.market_type.kind === marketFilter),
+  );
+  $("market-results").innerHTML =
+    rows
+      .map((m) => {
+        const perp = m.config.market_type.kind === "perp";
+        const favorite = favorites.has(m.id);
+        return `<div class="market-row ${m.id === marketId ? "current" : ""}"><button data-select-market="${m.id}" ${m.id === marketId ? 'aria-current="true"' : ""}>${marketIcon(m)}<span><strong>${esc(name(m))}</strong><small>${perp ? "Perpetual" : "Spot"}</small></span><span class="market-leverage">${perp ? `${m.config.market_type.max_leverage}×` : "Spot"}</span></button><button class="market-star ${favorite ? "favorite" : ""}" data-favorite-market="${m.id}" aria-pressed="${favorite}" aria-label="${favorite ? "Remove" : "Add"} ${esc(name(m))} ${favorite ? "from" : "to"} favorites">${favorite ? "★" : "☆"}</button></div>`;
+      })
+      .join("") || '<p class="empty">No matching markets</p>';
+}
+function openMarketPicker() {
+  $("market-search").value = "";
+  renderMarketPicker();
+  $("market-picker").showModal();
+  $("market-search").focus();
 }
 function atoms(text, unit) {
   if (!/^\d+(\.\d+)?$/.test(text)) throw Error("Enter a positive decimal number");
@@ -331,12 +376,14 @@ async function refreshAccount() {
   }
 }
 async function watchMarket() {
-  if (marketSocket) {
-    marketSocket.onmessage = null;
-    marketSocket.onclose = null;
-    marketSocket.close();
-  }
+  marketFeed?.stop();
   market = null;
+  $("book-content").innerHTML = '<p class="empty">Loading order book</p>';
+  $("chart").textContent = "Loading market";
+  $("last-price").textContent = "-";
+  $("mark-price").textContent = "-";
+  $("spread").textContent = "-";
+  $("source-label").textContent = "Connecting to market data";
   const m = selected();
   $("base-symbol").textContent = symbols[m.config.base_asset];
   $("collateral").hidden = m.config.market_type.kind !== "perp";
@@ -348,19 +395,34 @@ async function watchMarket() {
   loadLeverage();
   $("order-price").value = "";
   $("order-quantity").value = "";
-  marketSocket = new WebSocket(
-    `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/v1/stream/markets/${marketId}`,
-  );
-  marketSocket.onmessage = (e) => {
-    const v = JSON.parse(e.data);
-    if (v.error) return;
-    market = v;
-    renderMarket();
-  };
   const id = marketId;
-  marketSocket.onclose = () => {
-    if (id === marketId) setTimeout(watchMarket, 3000);
-  };
+  marketFeed = subscribeMarket({
+    id,
+    read: () => api(`rpc/markets/${id}`, { signal: AbortSignal.timeout(8000) }),
+    connect: () =>
+      new WebSocket(
+        `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/v1/stream/markets/${id}`,
+      ),
+    onData(value) {
+      if (marketId !== id) return;
+      market = value;
+      renderMarket();
+    },
+    onStatus(state) {
+      if (marketId !== id) return;
+      $("market-feed-state").textContent = {
+        connecting: "Connecting",
+        live: "Live",
+        snapshot: "Snapshot · reconnecting",
+        unavailable: "Market data unavailable · retrying",
+      }[state];
+      $("refresh-market").hidden = state !== "unavailable";
+      if (state === "unavailable" && !market)
+        $("book-content").innerHTML =
+          '<p class="empty">Market data unavailable. Retrying automatically.</p>';
+    },
+  });
+  const ready = marketFeed.ready;
   try {
     const h = await api(`history/${id}`);
     if (id === marketId) {
@@ -368,6 +430,7 @@ async function watchMarket() {
       drawChart();
     }
   } catch {}
+  await ready;
 }
 function rememberTrades(trades = []) {
   let points = charts.get(marketId);
@@ -589,6 +652,12 @@ function renderAccount() {
 async function networkRefresh() {
   try {
     const n = await api("network");
+    if (n.chain_id && n.chain_id !== meta.chain_id) {
+      meta.writes_enabled = false;
+      syncPending();
+      message("The testnet restarted. Reconnect, then claim test assets again.");
+      $("reload-network").hidden = false;
+    }
     $("network-state").textContent = `${n.status || "Connecting"} · Tokyo entry`;
     $("live-dot").style.background = n.status === "online" ? "#72e3bd" : "#dca85d";
     $("market-tps").textContent = n.successful_order_tps?.toFixed(1) || "-";
@@ -677,7 +746,10 @@ function leverageKey() {
 function loadLeverage() {
   if (!meta) return;
   const limit = selected()?.config.market_type.max_leverage || 1;
-  const saved = Number(localStorage.getItem(leverageKey()) || 1);
+  let saved = 1;
+  try {
+    saved = Number(localStorage.getItem(leverageKey()) || 1);
+  } catch {}
   leverage = Number.isInteger(saved) ? Math.max(1, Math.min(saved, limit)) : 1;
   $("leverage-button").textContent = `Leverage · ${leverage}×`;
 }
@@ -741,6 +813,7 @@ $("close-position-form").onsubmit = action(async () => {
   await send("PlacePerpOrder", { account_id: wallet.address, market_id: id, ...order });
 });
 $("create-wallet").onclick = createWallet;
+$("reload-network").onclick = () => location.reload();
 $("wallet-menu").onclick = () => $("wallet-dialog").showModal();
 $("close-wallet").onclick = () => $("wallet-dialog").close();
 $("copy-address").onclick = action(() => navigator.clipboard.writeText(wallet.address));
@@ -792,10 +865,41 @@ $("wallet-file").onchange = action(async (event) => {
   $("wallet-dialog").close();
 });
 $("claim-assets").onclick = action(() => send("ClaimAirdrop", { account_id: wallet.address }));
-$("market-select").onchange = action(async () => {
-  marketId = Number($("market-select").value);
-  await watchMarket();
+$("market-select").onclick = openMarketPicker;
+$("market-search").oninput = renderMarketPicker;
+$("market-picker").addEventListener("click", (event) => {
+  if (event.target === $("market-picker")) $("market-picker").close();
 });
+document.addEventListener("keydown", (event) => {
+  if (
+    event.key === "/" &&
+    !event.target.closest("input, textarea, select, [contenteditable]") &&
+    !document.querySelector("dialog[open]")
+  ) {
+    event.preventDefault();
+    openMarketPicker();
+  }
+  if (["ArrowDown", "ArrowUp"].includes(event.key) && $("market-picker").open) {
+    const rows = [...document.querySelectorAll("[data-select-market]")];
+    if (!rows.length) return;
+    const index = rows.indexOf(document.activeElement);
+    event.preventDefault();
+    rows[
+      index < 0
+        ? event.key === "ArrowDown"
+          ? 0
+          : rows.length - 1
+        : (index + (event.key === "ArrowDown" ? 1 : -1) + rows.length) % rows.length
+    ].focus();
+  }
+  if (event.key === "Enter" && event.target === $("market-search") && $("market-picker").open) {
+    event.preventDefault();
+    document.querySelector("[data-select-market]")?.click();
+  }
+});
+$("refresh-market").onclick = () => {
+  void marketFeed?.refresh();
+};
 $("order-form").onsubmit = action(async () => {
   const m = selected();
   sizeOrder();
@@ -853,6 +957,32 @@ document.addEventListener("click", async (e) => {
   try {
     const b = e.target.closest("button");
     if (!b) return;
+    if (b.dataset.marketFilter) {
+      marketFilter = b.dataset.marketFilter;
+      document
+        .querySelectorAll("[data-market-filter]")
+        .forEach((x) => x.classList.toggle("selected", x === b));
+      renderMarketPicker();
+    }
+    if (b.dataset.favoriteMarket !== undefined) {
+      const id = Number(b.dataset.favoriteMarket),
+        favorites = marketFavorites();
+      if (favorites.has(id)) favorites.delete(id);
+      else favorites.add(id);
+      try {
+        localStorage.setItem("ldex-market-favorites", JSON.stringify([...favorites]));
+      } catch {}
+      renderMarketPicker();
+    }
+    if (b.dataset.selectMarket !== undefined) {
+      const id = Number(b.dataset.selectMarket);
+      $("market-picker").close();
+      if (id !== marketId) {
+        marketId = id;
+        updateMarketButton();
+        await watchMarket();
+      }
+    }
     if (b.dataset.dismiss) $(b.dataset.dismiss).close();
     if (b.dataset.closePosition !== undefined) {
       closeMarketId = Number(b.dataset.closePosition);
@@ -899,19 +1029,22 @@ async function boot() {
   try {
     meta = await api("meta");
     $("revision").textContent = `${meta.revision.slice(0, 8)} · Protocol ${meta.protocol}`;
-    $("market-select").innerHTML = meta.markets
-      .map((m) => `<option value="${m.id}">${esc(name(m))}</option>`)
-      .join("");
-    const result = await WebAssembly.instantiateStreaming(fetch("/codec.wasm"));
-    wasm = result.instance.exports;
-    wallet = await loadWallet();
-    await walletChanged();
+    updateMarketButton();
     await watchMarket();
     await networkRefresh();
     setInterval(networkRefresh, 1000);
     setInterval(() => {
       if (page === "explorer") explorerRefresh();
     }, 3000);
+    try {
+      const result = await WebAssembly.instantiateStreaming(fetch("/codec.wasm"));
+      wasm = result.instance.exports;
+      wallet = await loadWallet();
+      await walletChanged();
+    } catch (error) {
+      message(`Wallet unavailable: ${error.message}`);
+      return; // Market data and the explorer remain available.
+    }
     if (wallet) {
       const saved = localStorage.getItem(`ldex-pending:${meta.chain_id}:${wallet.address}`);
       if (saved) {

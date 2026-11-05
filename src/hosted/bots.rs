@@ -13,8 +13,25 @@ struct Agent {
     key: ed25519_dalek::SigningKey,
     market: u64,
     role: u8,
+    copy: u8,
     pending: Option<SignedTransaction>,
     path: PathBuf,
+}
+fn agent_layout(perp: bool, extra_pairs: u8) -> Vec<(u8, u8)> {
+    let mut layout = (0..if perp { 4 } else { 3 })
+        .map(|role| (role, 0))
+        .collect::<Vec<_>>();
+    for copy in 1..=extra_pairs.min(2) {
+        layout.extend([(0, copy), (2, copy)]);
+    }
+    layout
+}
+fn key_name(market: u64, role: u8, copy: u8) -> String {
+    if copy == 0 {
+        format!("market-{market}-role-{role}.key")
+    } else {
+        format!("market-{market}-role-{role}-copy-{copy}.key")
+    }
 }
 async fn query(
     client: &reqwest::Client,
@@ -72,15 +89,14 @@ pub async fn run(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
-    let exchange = light_dex::exchange::ExchangeState::with_claim_faucet(manifest.faucet)?;
+    let exchange = manifest.initial_exchange()?;
     let mut agents = Vec::new();
     for (&market, info) in exchange.markets() {
-        for role in 0..if matches!(info.market_type, MarketType::Perp { .. }) {
-            4
-        } else {
-            3
-        } {
-            let path = directory.join(format!("market-{market}-role-{role}.key"));
+        for (role, copy) in agent_layout(
+            matches!(info.market_type, MarketType::Perp { .. }),
+            config.extra_agent_pairs_per_market,
+        ) {
+            let path = directory.join(key_name(market, role, copy));
             if !path.exists() {
                 write_secret(&path, &new_key()?)?;
             }
@@ -94,6 +110,7 @@ pub async fn run(
                 key,
                 market,
                 role,
+                copy,
                 pending,
                 path: intent,
             });
@@ -242,13 +259,12 @@ pub async fn run(
                             .filter(|o| o["side"] == "Sell")
                             .filter_map(|o| o["remaining_quantity"].as_u64())
                             .sum::<u64>();
+                        // Vary the tightest quote so the same wallet does not
+                        // permanently win price priority over every other maker.
+                        let width = 2 + rand::random_range(0..5u64);
                         for (side, multiplier) in [(Side::Buy, -1i64), (Side::Sell, 1)] {
                             let mut last = 0;
-                            for bps in [
-                                2 + u64::from(agent.role),
-                                5 + u64::from(agent.role),
-                                10 + u64::from(agent.role),
-                            ] {
+                            for bps in [width, width + 3, width + 8] {
                                 let offset = (midpoint * bps / 10000).max(info.price.step);
                                 let raw = if multiplier < 0 {
                                     midpoint.saturating_sub(offset)
@@ -264,7 +280,7 @@ pub async fn run(
                                     continue;
                                 }
                                 last = price;
-                                let target = (100u128
+                                let target = (u128::from(100 + 25 * agent.copy)
                                     * u128::from(info.quantity.scale())
                                     * u128::from(info.price.scale())
                                     / u128::from(price))
@@ -319,7 +335,7 @@ pub async fn run(
                     if let Some(level) = level {
                         let price = level["price"].as_u64().unwrap_or(0);
                         if price > 0 {
-                            let mut quantity = ((25u128
+                            let mut quantity = ((u128::from(25 + 10 * agent.copy)
                                 * u128::from(info.quantity.scale())
                                 * u128::from(info.price.scale())
                                 / u128::from(price))
@@ -416,5 +432,25 @@ pub async fn run(
             let _ = tokio::task::spawn_blocking(move || admit(&nodes, &signed, &auth)).await;
         }
         tokio::time::sleep(Duration::from_millis(50).saturating_sub(started.elapsed())).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extra_agents_preserve_existing_wallets_and_a_single_keeper() {
+        assert_eq!(key_name(1, 3, 0), "market-1-role-3.key");
+        assert_ne!(key_name(1, 0, 0), key_name(1, 0, 1));
+        let spot = agent_layout(false, 1);
+        let perp = agent_layout(true, 1);
+        assert_eq!(spot.len(), 5);
+        assert_eq!(perp.len(), 6);
+        assert_eq!(perp.iter().filter(|(role, _)| *role == 3).count(), 1);
+        assert_eq!(spot.iter().filter(|(role, _)| *role < 2).count(), 3);
+        assert_eq!(spot.iter().filter(|(role, _)| *role == 2).count(), 2);
+        assert_eq!(agent_layout(true, 255).len(), 8);
+        assert_eq!(5 * spot.len() + 5 * perp.len(), 55);
     }
 }

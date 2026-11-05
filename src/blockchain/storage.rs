@@ -46,8 +46,9 @@ impl BlockchainState {
 
     pub fn new_signed(manifest: Arc<SessionManifest>) -> Self {
         let mut state = Self::new();
-        state.exchange_state =
-            ExchangeState::with_claim_faucet(manifest.faucet).expect("validated session faucet");
+        state.exchange_state = manifest
+            .initial_exchange()
+            .expect("validated session market catalog and faucet");
         state.manifest = Some(manifest);
         state
     }
@@ -61,7 +62,8 @@ impl BlockchainState {
     pub fn load_signed(path: PathBuf, manifest: Arc<SessionManifest>) -> Result<Self, String> {
         if manifest.initial_state_root
             != crate::message::hex_encode(
-                &ExchangeState::with_claim_faucet(manifest.faucet)
+                &manifest
+                    .initial_exchange()
                     .map_err(|error| error.to_string())?
                     .state_digest(),
             )
