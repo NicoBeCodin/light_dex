@@ -7,7 +7,7 @@ import argparse, io, json, os, pathlib, shlex, subprocess, tarfile, tomllib
 from frontend import frontend_files
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCAL = ROOT / 'hosted/.local'
-HOSTS = [('tokyo-ls', [0,1], 'Tokyo'), ('ideapad-home', [2,3], 'Home')]
+HOSTS = [('tokyo-ls', [0,1], 'Tokyo'), ('ideapad-home', [2,3], 'Paris')]
 def ssh(host, command, data=None):
     result = subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=15',host,command], input=data, capture_output=True)
     if result.returncode:
