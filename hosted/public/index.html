@@ -26,9 +26,11 @@
     <div class="notice">
       <span><i id="live-dot"></i><span id="network-state">Connecting to Tokyo</span></span
       ><span>Test assets · 4 validators · 2 regions</span
-      ><a href="https://github.com/NicoBeCodin/light_dex" target="_blank" rel="noreferrer"
-        >Source code ↗</a
-      >
+      ><div class="project-links">
+        <a href="https://nicobecodin.github.io/" target="_blank" rel="noreferrer">Blog ↗</a>
+        <a href="https://github.com/NicoBeCodin/light_dex" target="_blank" rel="noreferrer">Source ↗</a>
+        <a href="https://github.com/NicoBeCodin" target="_blank" rel="noreferrer" aria-label="Author on GitHub">@nicobecodin</a>
+      </div>
     </div>
     <main>
       <section id="onboarding" class="welcome">
@@ -84,6 +86,7 @@
               <button id="leverage-button" hidden>Leverage · 1×</button>
             </div>
             <p id="wallet-label" class="muted">Create a wallet to start trading.</p>
+            <button id="collateral" class="collateral-button" hidden>Deposit collateral</button>
             <form id="order-form">
               <div class="sides">
                 <label><input type="radio" name="side" value="Buy" checked /> Buy / Long</label
@@ -120,23 +123,7 @@
               <div id="order-estimate" class="muted"></div>
               <button class="primary" id="submit-order" disabled>Submit order</button>
             </form>
-            <details id="collateral" hidden>
-              <summary>Collateral &amp; margin mode</summary>
-              <hr />
-              <h3>Perpetual collateral</h3>
-              <label
-                >Margin mode<select id="margin-mode">
-                  <option value="Cross">Cross</option>
-                  <option value="Isolated">Isolated</option>
-                </select></label
-              ><button id="set-margin">Set margin mode</button
-              ><label
-                >Amount (USD)<input id="collateral-amount" inputmode="decimal" value="1000"
-              /></label>
-              <div class="buttons">
-                <button id="deposit">Deposit</button><button id="withdraw">Withdraw</button>
-              </div>
-            </details>
+
           </section>
         </div>
         <section class="panel account-panel">
@@ -203,7 +190,6 @@
     </main>
     <footer>
       <span>Light DEX</span
-      ><a href="https://nicobecodin.github.io/" target="_blank" rel="noreferrer">Build logs ↗</a
       ><span id="revision"></span>
     </footer>
     <dialog id="market-picker" aria-labelledby="market-picker-title">
@@ -248,6 +234,23 @@
         Close
       </button>
     </dialog>
+            <dialog id="collateral-dialog" aria-labelledby="collateral-title">
+              <div class="panel-heading"><h2 id="collateral-title">Perpetual collateral</h2><button type="button" data-dismiss="collateral-dialog" aria-label="Close">×</button></div>
+              <p id="collateral-balance" class="muted"></p>
+              <label
+                >Margin mode<select id="margin-mode">
+                  <option value="Cross">Cross</option>
+                  <option value="Isolated">Isolated</option>
+                </select></label
+              ><button id="set-margin">Set margin mode</button
+              ><label
+                >Amount (USD)<input id="collateral-amount" inputmode="decimal" value="1000"
+              /></label>
+              <div class="buttons">
+                <button id="deposit" class="primary">Deposit collateral</button><button id="withdraw">Withdraw</button>
+              </div>
+            <p data-form-error class="sell" role="alert" hidden></p>
+            </dialog>
     <dialog id="leverage-dialog">
       <form id="leverage-form">
         <div class="panel-heading">

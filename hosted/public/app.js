@@ -564,6 +564,7 @@ function renderAccount() {
   $("onboarding").hidden = !!account;
   syncPending();
   renderRisk();
+  renderCollateral();
   if (!wallet) {
     $("account-content").innerHTML =
       '<p class="empty">Create a demo wallet to see your balances and orders.</p>';
@@ -862,6 +863,20 @@ $("order-form").onsubmit = action(async () => {
   if (m.config.market_type.kind === "perp") fields.reduce_only = $("reduce-only").checked;
   await send(m.config.market_type.kind === "perp" ? "PlacePerpOrder" : "PlaceOrder", fields);
 });
+function renderCollateral() {
+  const usd = account?.balances?.find(b => b.asset_id === 0)?.available || 0;
+  const mode = $("margin-mode").value;
+  const risk = account?.risk?.find(r => r.mode === mode && (mode === "Cross" || r.market_id === marketId));
+  $("collateral-balance").textContent = !wallet ? "Create a wallet, then claim test assets to deposit USD." : !account ? "Claim test assets before depositing USD." : `Available USD: ${dollars(usd)} · ${mode} collateral: ${dollars(risk?.collateral_usd_atoms || 0)}`;
+}
+$("collateral").onclick = () => {
+  const risk = account?.risk?.find(r => r.mode === "Cross" || r.market_id === marketId);
+  $("margin-mode").value = risk?.mode || "Cross";
+  $("collateral-dialog").querySelector("[data-form-error]").hidden = true;
+  renderCollateral();
+  $("collateral-dialog").showModal();
+};
+$("margin-mode").onchange = renderCollateral;
 $("set-margin").onclick = action(() =>
   send("SetMarginMode", { account_id: wallet.address, mode: $("margin-mode").value }),
 );

@@ -255,8 +255,7 @@ label select {
   grid-row: span 1;
 }
 .order-panel form,
-.order-panel > p,
-#collateral {
+.order-panel > p {
   padding: 0 18px;
 }
 .order-panel label {
@@ -650,14 +649,6 @@ dialog::backdrop {
 }
 .risk-grid strong {
   font-size: 14px;
-}
-#collateral {
-  margin-top: 18px;
-}
-#collateral summary {
-  color: var(--muted);
-  cursor: pointer;
-  padding: 10px 0;
 }
 #leverage-button {
   padding: 4px 8px;
@@ -1190,3 +1181,8 @@ footer {
 #market-p95 {
   min-width: 75px;
 }
+
+.project-links { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; }
+.notice { flex-wrap: wrap; gap: 6px 16px; }
+
+.collateral-button { width: calc(100% - 36px); margin: 4px 18px 14px; border-color: var(--green); color: var(--green); }
