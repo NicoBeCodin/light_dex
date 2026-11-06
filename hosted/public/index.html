@@ -62,23 +62,26 @@
         <div class="trading-grid">
           <section class="panel chart-panel">
             <div class="panel-heading">
-              <h2>Price</h2>
+              <h2 id="chart-title">Price</h2>
               <div id="chart-controls" class="chart-controls" role="group" aria-label="Candle interval">
                 <button data-interval="1" aria-pressed="false">1s</button>
                 <button data-interval="5" class="selected" aria-pressed="true">5s</button>
                 <button data-interval="15" aria-pressed="false">15s</button>
                 <button data-interval="60" aria-pressed="false">1m</button>
-                <button data-chart-reset title="Reset chart to the last five minutes">Reset</button>
+                <button data-chart-reset title="Reset chart to the last five minutes">5 min</button>
               </div>
             </div>
-            <div id="chart-legend" class="chart-legend" aria-label="Candle prices and volume">Loading trades</div>
+            <div id="chart-legend" class="chart-legend" aria-label="Candle prices and volume"></div>
             <div id="chart" class="chart" aria-label="Light DEX execution candlesticks and volume"></div>
             <div class="chart-footer">
               <span id="chart-range">Loading market</span
               ><span id="source-label">Source validator: - · via Tokyo</span>
               <span id="market-feed-state" role="status">Connecting</span
               ><button id="refresh-market" hidden>Retry market data</button>
-              <a id="chart-attribution" href="https://www.tradingview.com/" target="_blank" rel="noreferrer">TradingView Lightweight Charts™</a>
+              <details class="chart-credits">
+                <summary>TradingView</summary>
+                <a id="chart-attribution" href="https://www.tradingview.com/" target="_blank" rel="noreferrer">TradingView Lightweight Charts™</a>
+              </details>
             </div>
           </section>
           <section class="panel book-panel">

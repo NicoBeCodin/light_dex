@@ -346,9 +346,9 @@ async function watchMarket() {
   const m = selected();
   marketChart ??= createMarketChart({
     container: $("chart"), legend: $("chart-legend"), rangeLabel: $("chart-range"),
-    controls: $("chart-controls"), attribution: $("chart-attribution"),
+    controls: $("chart-controls"), attribution: $("chart-attribution"), title: $("chart-title"),
   });
-  marketChart.select(m);
+  marketChart.select({ ...m, title: name(m), baseSymbol: symbols[m.config.base_asset] });
   $("base-symbol").textContent = symbols[m.config.base_asset];
   $("collateral").hidden = m.config.market_type.kind !== "perp";
   $("reduce-row").hidden = m.config.market_type.kind !== "perp";
@@ -586,7 +586,8 @@ async function networkRefresh() {
     $("live-dot").style.background = n.status === "online" ? "#72e3bd" : "#dca85d";
     $("market-tps").textContent = n.successful_order_tps?.toFixed(1) || "-";
     $("market-p95").textContent =
-      n.gateway_commit_p95_ms == null ? "-" : ms(n.gateway_commit_p95_ms);
+      n.gateway_commit_p95_ms == null ? "Collecting" : ms(n.gateway_commit_p95_ms);
+    $("market-p95").title = `${n.latency_boundary || "Tokyo submission to observed durable commit"} · ${n.latency_samples || 0} samples in the last 5 minutes`;
     const metrics = [
       ["Successful order TPS · 60s", n.successful_order_tps?.toFixed(1)],
       ["Tokyo gateway p95 · 5m", ms(n.gateway_commit_p95_ms)],

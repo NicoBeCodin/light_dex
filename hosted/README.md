@@ -50,7 +50,18 @@ are 1s, 5s, 15s and 1m; empty periods remain gaps. Times are gateway observation
 times, not consensus-authenticated execution timestamps. The dashed line is the
 committed oracle mark. A bounded per-market cache deduplicates fill identities;
 market switching retains history and chart position without extra subscriptions.
-Chart rendering runs in the browser and does not add validator polling.
+Chart rendering runs in the browser and does not add validator polling. Price
+and volume have separate panes, and the initial viewport explicitly covers five
+minutes even when history arrives after an empty first snapshot.
+
+Commit p95 covers public transactions and the supervised demo fleet, measured
+from Tokyo submission to the gateway observing a durable commit. Demo agents
+register only transaction digests over a private Unix datagram socket beside the
+gateway database (mode 0600). The gateway matches these monotonic clocks against
+its existing commit stream; no additional node requests or per-sample disk writes
+are needed. Registration is best effort, bounded and does not block trading.
+The UI shows the sample count and boundary on hover; without recent measurements
+it says Collecting. This is not a round-trip latency from the visitor's browser.
 
 Positions can be closed with a reduce-only IOC and a selected slippage bound;
 unfilled quantity remains open. The leverage control sizes a new order from a

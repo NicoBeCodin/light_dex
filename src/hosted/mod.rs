@@ -6,6 +6,7 @@ use observer::{observe, observe_commits, observe_trades, retry_submissions};
 mod benchmark;
 mod bots;
 mod store;
+mod telemetry;
 use axum::{
     Json, Router,
     extract::{
@@ -530,8 +531,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .fallback_service(tower_http::services::ServeDir::new(
             &app.config.frontend_dir,
         ))
-        .with_state(app);
+        .with_state(app.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:1422").await?;
+    telemetry::start(app.clone())?;
     println!("Public gateway listening on loopback port 1422");
     axum::serve(
         listener,

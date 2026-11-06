@@ -428,6 +428,10 @@ pub async fn run(
             let signed = sign_transaction(transaction, &manifest, &agent.key)?;
             save_intent(&agent.path, &signed)?;
             agent.pending = Some(signed.clone());
+            super::telemetry::announce(
+                &config.database,
+                &hex_encode(&signed.transaction.to_digest()),
+            );
             let nodes = config.nodes.clone();
             let _ = tokio::task::spawn_blocking(move || admit(&nodes, &signed, &auth)).await;
         }
