@@ -2,6 +2,7 @@ import { sizeFromMargin, closeOrder, decimalInput } from "./trade-math.mjs";
 import { transactionNotice } from "./notifications.mjs";
 import { subscribeMarket } from "./market-feed.mjs";
 import { createMarketPicker } from "./market-picker.mjs";
+import { createMarketChart } from "./market-chart.mjs";
 
 const $ = (id) => document.getElementById(id),
   esc = (s) =>
@@ -29,9 +30,9 @@ let meta,
   lastDigest,
   closeMarketId,
   leverage = 1,
-  marketPicker;
-const charts = new Map(),
-  transactions = [];
+  marketPicker,
+  marketChart;
+const transactions = [];
 function pendingKey() {
   return wallet && meta ? `ldex-pending:${meta.chain_id}:${wallet.address}` : null;
 }
@@ -337,12 +338,17 @@ async function watchMarket() {
   marketFeed?.stop();
   market = null;
   $("book-content").innerHTML = '<p class="empty">Loading order book</p>';
-  $("chart").textContent = "Loading market";
+
   $("last-price").textContent = "-";
   $("mark-price").textContent = "-";
   $("spread").textContent = "-";
   $("source-label").textContent = "Connecting to market data";
   const m = selected();
+  marketChart ??= createMarketChart({
+    container: $("chart"), legend: $("chart-legend"), rangeLabel: $("chart-range"),
+    controls: $("chart-controls"), attribution: $("chart-attribution"),
+  });
+  marketChart.select(m);
   $("base-symbol").textContent = symbols[m.config.base_asset];
   $("collateral").hidden = m.config.market_type.kind !== "perp";
   $("reduce-row").hidden = m.config.market_type.kind !== "perp";
@@ -384,28 +390,9 @@ async function watchMarket() {
   const ready = marketFeed.ready;
   try {
     const h = await api(`history/${id}`);
-    if (id === marketId) {
-      rememberTrades(h.trades);
-      drawChart();
-    }
+    marketChart.ingest(id, h.trades);
   } catch {}
   await ready;
-}
-function rememberTrades(trades = []) {
-  let points = charts.get(marketId);
-  if (!points) {
-    points = new Map();
-    charts.set(marketId, points);
-  }
-  for (const t of trades) {
-    const key = `${t.block_sequence}:${t.transaction_index}:${t.fill_index}`;
-    if (!points.has(key))
-      points.set(key, { ...t, at: (t.observed_at || Date.now() / 1000) * 1000 });
-  }
-  for (const [k, v] of points) {
-    if (v.at < Date.now() - 300000) points.delete(k);
-  }
-  while (points.size > 10000) points.delete(points.keys().next().value);
 }
 function renderMarket() {
   const m = selected(),
@@ -442,8 +429,7 @@ function renderMarket() {
       $("order-quantity").value = quantity(q).replaceAll(",", "");
     }
   }
-  rememberTrades(trades);
-  drawChart();
+  marketChart.update(market);
   renderBook();
 }
 function renderBook() {
@@ -473,48 +459,6 @@ function renderBook() {
   };
   $("book-content").innerHTML =
     `<table><thead><tr><th>Price (USD)</th><th>Size</th><th>Total size</th></tr></thead><tbody>${levels(asks, false)}<tr class="spread-row"><td colspan="3">Spread ${esc($("spread").textContent)}</td></tr>${levels(bids, true)}</tbody></table>`;
-}
-function drawChart() {
-  const points = [...(charts.get(marketId)?.values() || [])].sort((a, b) => a.at - b.at);
-  if (!points.length) {
-    $("chart").textContent = "Waiting for committed trades";
-    return;
-  }
-  const min = Math.min(...points.map((p) => p.price));
-  const max = Math.max(...points.map((p) => p.price));
-  const tick = selected().config.price.step;
-  const low = min === max ? Math.max(0, min - tick) : min;
-  const high = min === max ? max + tick : max;
-  const range = Math.max(high - low, tick),
-    start = Date.now() - 300000;
-  const width = Math.max(340, $("chart").clientWidth),
-    height = Math.max(240, $("chart").clientHeight);
-  const left = 14,
-    right = width - 88,
-    bottom = height - 38,
-    top = 22;
-  const x = (at) => left + Math.min(1, Math.max(0, (at - start) / 300000)) * (right - left);
-  const y = (value) => bottom - ((value - low) / range) * (bottom - top);
-  const coords = points.map((p) => `${x(p.at)},${y(p.price)}`).join(" ");
-  const last = points.at(-1);
-  const time = (at) =>
-    new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-  const grid = [0, 1, 2, 3, 4]
-    .map((i) => {
-      const py = top + (i * (bottom - top)) / 4,
-        value = high - (range * i) / 4;
-      return `<line x1="${left}" x2="${right}" y1="${py}" y2="${py}" stroke="#24292f" stroke-width=".6"/><text x="${right + 12}" y="${py + 3}" fill="#858e9a" font-size="11">${price(Math.round(value / tick) * tick)}</text>`;
-    })
-    .join("");
-  const times = [0, 1, 2, 3, 4, 5]
-    .map(
-      (i) =>
-        `<text x="${left + (i * (right - left)) / 5}" y="${height - 13}" text-anchor="${i === 0 ? "start" : i === 5 ? "end" : "middle"}" fill="#858e9a" font-size="11">${time(start + i * 60000)}</text>`,
-    )
-    .join("");
-  $("chart").innerHTML =
-    `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Committed execution prices over the last five minutes">${grid}<polygon points="${x(points[0].at)},${bottom} ${coords} ${x(last.at)},${bottom}" fill="#54d5b0" fill-opacity=".045"/><polyline points="${coords}" fill="none" stroke="#54d5b0" stroke-width="1.2" vector-effect="non-scaling-stroke"/><line x1="${left}" x2="${right + 6}" y1="${y(last.price)}" y2="${y(last.price)}" stroke="#54d5b0" stroke-width=".6" stroke-dasharray="3 3" opacity=".55"/><rect x="${right + 6}" y="${y(last.price) - 8}" width="78" height="16" rx="2" fill="#23584b"/><text x="${right + 10}" y="${y(last.price) + 3}" fill="#b0eedb" font-size="11">${price(last.price)}</text>${times}</svg>`;
-  $("chart-range").textContent = `${points.length} fills · Last $${price(last.price)}`;
 }
 function table(head, rows, empty) {
   return `<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.join("") || `<tr><td colspan="${head.length}" class="empty">${esc(empty)}</td></tr>`}</tbody></table>`;

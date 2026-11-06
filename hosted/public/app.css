@@ -1186,3 +1186,10 @@ footer {
 .notice { flex-wrap: wrap; gap: 6px 16px; }
 
 .collateral-button { width: calc(100% - 36px); margin: 4px 18px 14px; border-color: var(--green); color: var(--green); }
+
+.chart { display: block; min-width: 0; overflow: hidden; }
+.chart-controls { display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }
+.chart-controls button { padding: 4px 7px; font-size: 11px; background: transparent; border-color: transparent; }
+.chart-controls button.selected { background: #1b2927; }
+.chart-legend { min-height: 24px; padding: 0 12px 5px; font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
+#chart-attribution { color: var(--muted); font-size: 9px; white-space: normal; }

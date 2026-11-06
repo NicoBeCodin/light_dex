@@ -43,6 +43,15 @@ If the stream stops updating, a five-second snapshot fallback keeps the book
 visible. Reconnecting does not clear order inputs. Market reads start before
 wallet storage or signing initialization, so a wallet error does not hide books.
 
+The price chart uses locally served TradingView Lightweight Charts (version and
+license in `vendor/lightweight-charts/`). The existing five-minute history and
+selected-market stream feed OHLC candles and base-asset volume. Candle intervals
+are 1s, 5s, 15s and 1m; empty periods remain gaps. Times are gateway observation
+times, not consensus-authenticated execution timestamps. The dashed line is the
+committed oracle mark. A bounded per-market cache deduplicates fill identities;
+market switching retains history and chart position without extra subscriptions.
+Chart rendering runs in the browser and does not add validator polling.
+
 Positions can be closed with a reduce-only IOC and a selected slippage bound;
 unfilled quantity remains open. The leverage control sizes a new order from a
 USD margin amount, within the market limit. It does not change existing positions
